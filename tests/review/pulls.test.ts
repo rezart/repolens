@@ -38,6 +38,7 @@ function makeDeps(pulls: PullRequest[] = PULLS): AppDeps {
     listOpenPulls: async () => pulls,
     getPull: async (_o: string, _r: string, n: number) => pulls.find((p) => p.number === n)!,
     getPullDiff: async () => '',
+    getFileContent: async () => null,
     listReviewComments: async () => [],
     createReview: async () => ({ id: 1, htmlUrl: 'https://github.com/o/n/pull/1#review-1' }),
   } as unknown as GitHubClient;

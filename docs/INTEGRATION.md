@@ -88,6 +88,21 @@ Verify:
 gh api "repos/$REPO/rulesets" --jq '.[] | {id, name, enforcement}'
 ```
 
+### Security note
+
+A commit status is not proof that RepoLens ran. When RepoLens authenticates with a personal access token, the `repolens/review` status it sets is an ordinary status that **anyone with write access to the repository can also set** — a green check can be posted by hand with `gh api -X POST repos/$REPO/statuses/$SHA -f state=success -f context=repolens/review`. The required check is therefore only as trustworthy as the set of people (and tokens) with write access.
+
+For stricter enforcement:
+
+- Run RepoLens under a dedicated GitHub App, or at least a bot account, whose credentials are used for nothing else and which holds only the permissions it needs (`Contents: read`, `Pull requests: read & write`, `Commit statuses: write`).
+- With a GitHub App, pin the required check to that app so a status from any other actor does not satisfy the rule. Add the app's `integration_id` (from `gh api /apps/<app-slug> --jq .id`) to the required check:
+
+  ```json
+  "required_status_checks": [ { "context": "repolens/review", "integration_id": 123456 } ]
+  ```
+
+  A status with the same context set by a user or a different app then no longer counts, so the rule can only be satisfied by RepoLens itself.
+
 ## Step 3: prove it on a pull request
 
 1. Open a PR with a real change. Within one poll interval the PR shows a `repolens/review` status as `pending`, then the review lands and the status becomes `success` or `failure`. Until the status exists, GitHub shows "Expected — Waiting for status to be reported" and blocks merging.

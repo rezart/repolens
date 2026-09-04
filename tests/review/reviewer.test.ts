@@ -115,6 +115,10 @@ interface FakeGithubOptions {
   diffError?: Error;
   /** Make createCommitStatus reject. */
   statusError?: Error;
+  /** Post-change content by path, as returned by getFileContent (missing path → null). */
+  headFiles?: Record<string, string>;
+  /** Make getFileContent reject for the given path. */
+  fileContentError?: (path: string) => Error | null;
 }
 
 interface StatusCall {
@@ -128,6 +132,7 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
   const reviews: Array<{ owner: string; repo: string; number: number; input: CreateReviewInput }> = [];
   const listCalls: Array<{ owner: string; repo: string; number: number }> = [];
   const statuses: StatusCall[] = [];
+  const contentCalls: Array<{ path: string; ref: string }> = [];
   const github: ReviewDeps['github'] = {
     async getPull() {
       return pr;
@@ -135,6 +140,12 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
     async getPullDiff() {
       if (opts.diffError) throw opts.diffError;
       return diff;
+    },
+    async getFileContent(_owner: string, _repo: string, path: string, ref: string) {
+      contentCalls.push({ path, ref });
+      const err = opts.fileContentError?.(path);
+      if (err) throw err;
+      return opts.headFiles?.[path] ?? null;
     },
     async createCommitStatus(owner: string, repo: string, sha: string, input: CommitStatusInput) {
       statuses.push({ owner, repo, sha, input });
@@ -152,7 +163,7 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
       return { id: 7, htmlUrl: 'https://github.com/o/r/pull/42#pullrequestreview-7' };
     },
   };
-  return { reviews, listCalls, statuses, github };
+  return { reviews, listCalls, statuses, contentCalls, github };
 }
 
 const retrieveOne: RetrieveFn = async () => [CHUNK];
@@ -360,7 +371,9 @@ describe('reviewPullRequest', () => {
     const seen: string[] = [];
     const retrieve: RetrieveFn = async (req) => {
       seen.push(req.query);
-      expect(req.excludePath).toBe('src/app.ts');
+      // Every changed path, including the ones that are not reviewed: their index
+      // chunks describe the base branch, not this PR.
+      expect(req.excludePaths).toEqual(['src/app.ts', 'package-lock.json', 'assets/logo.png']);
       expect(req.limit).toBe(8);
       expect(req.repoIds).toEqual([REPO_ID]);
       return [];
@@ -489,6 +502,145 @@ describe('reviewPullRequest', () => {
 
   it('throws for an unknown repo', async () => {
     await expect(reviewPullRequest(makeDeps(db), { repoId: 'github:nope/nope', prNumber: 1 })).rejects.toThrow(/Unknown repo/);
+  });
+});
+
+describe('reviewPullRequest PR-head context', () => {
+  let db: Db;
+  beforeEach(() => {
+    db = openDb(':memory:');
+    db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+  });
+  afterEach(() => db.close());
+
+  // a.ts uses a helper that b.ts adds in this same PR: the index still has the old b.ts.
+  const TWO_FILE_DIFF = [
+    'diff --git a/src/a.ts b/src/a.ts',
+    '--- a/src/a.ts',
+    '+++ b/src/a.ts',
+    '@@ -1,2 +1,3 @@',
+    " import { helper } from './b.js';",
+    ' ',
+    '+export const value = helper(2);',
+    'diff --git a/src/b.ts b/src/b.ts',
+    '--- a/src/b.ts',
+    '+++ b/src/b.ts',
+    '@@ -1,1 +1,3 @@',
+    ' export const base = 1;',
+    '+',
+    '+export function helper(n: number) { return n + base; }',
+    '',
+  ].join('\n');
+
+  const A_HEAD = "import { helper } from './b.js';\n\nexport const value = helper(2);\n";
+  const B_HEAD = 'export const base = 1;\n\nexport function helper(n: number) { return n + base; }\n';
+  const HEAD_FILES = { 'src/a.ts': A_HEAD, 'src/b.ts': B_HEAD };
+
+  const AUTHORITATIVE = '## Files changed in this pull request (post-change content, authoritative)';
+  const INDEXED = "## Related code from the base-branch index (may not reflect this PR's changes)";
+
+  /** A stale chunk for a changed path plus an unrelated one, filtered like the real retriever. */
+  function stalyRetrieve(seen: string[][]): RetrieveFn {
+    const chunks: RetrievedChunk[] = [
+      { chunkId: 1, repoId: REPO_ID, path: 'src/b.ts', startLine: 1, endLine: 1, content: 'export const base = 1; // STALE b.ts', score: 1 },
+      { chunkId: 2, repoId: REPO_ID, path: 'src/other.ts', startLine: 1, endLine: 1, content: 'export const other = 2;', score: 0.5 },
+    ];
+    return async (req) => {
+      seen.push(req.excludePaths ?? []);
+      const excluded = new Set(req.excludePaths ?? []);
+      return chunks.filter((c) => !excluded.has(c.path));
+    };
+  }
+
+  it('gives the reviewer the post-change content of the files a change references', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(TWO_FILE_DIFF, PR, { headFiles: HEAD_FILES });
+    const excludes: string[][] = [];
+    await reviewPullRequest(
+      { db, llm: llm.provider, retrieve: stalyRetrieve(excludes), github: gh.github },
+      { repoId: REPO_ID, prNumber: 42 },
+    );
+
+    expect(gh.contentCalls.map((c) => c.path).sort()).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(gh.contentCalls.every((c) => c.ref === PR.headSha)).toBe(true);
+
+    const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
+    // b.ts's new content is present, under the authoritative heading and before the index one.
+    expect(msg).toContain(AUTHORITATIVE);
+    expect(msg).toContain('### src/b.ts (content after this pull request)');
+    expect(msg).toContain('export function helper(n: number) { return n + base; }');
+    expect(msg.indexOf(AUTHORITATIVE)).toBeLessThan(msg.indexOf('### src/b.ts (content after this pull request)'));
+    expect(msg.indexOf('### src/b.ts (content after this pull request)')).toBeLessThan(msg.indexOf(INDEXED));
+    // The reviewed file's own new content is there too, so the model sees past the hunk.
+    expect(msg).toContain('### src/a.ts (content after this pull request)');
+
+    // Every changed path is excluded from retrieval, so no stale chunk survives.
+    for (const paths of excludes) expect(paths).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(msg).not.toContain('STALE b.ts');
+    expect(msg).toContain('export const other = 2;');
+  });
+
+  it('matches an added identifier to the changed file that exports it', async () => {
+    // c.ts has no import of b.ts at all; only the added line mentions `helper`.
+    const diff = [
+      'diff --git a/src/c.ts b/src/c.ts',
+      '--- a/src/c.ts',
+      '+++ b/src/c.ts',
+      '@@ -1,1 +1,2 @@',
+      ' const n = 1;',
+      '+const out = helper(n);',
+      'diff --git a/src/b.ts b/src/b.ts',
+      '--- a/src/b.ts',
+      '+++ b/src/b.ts',
+      '@@ -1,1 +1,3 @@',
+      ' export const base = 1;',
+      '+',
+      '+export function helper(n: number) { return n + base; }',
+      '',
+    ].join('\n');
+    const llm = fakeLlm();
+    const gh = fakeGithub(diff, PR, { headFiles: { 'src/c.ts': 'const n = 1;\nconst out = helper(n);\n', 'src/b.ts': B_HEAD } });
+    await reviewPullRequest({ db, llm: llm.provider, retrieve: async () => [], github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+
+    const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/c.ts'))!.messages[0]!.content;
+    expect(msg).toContain('### src/b.ts (content after this pull request)');
+    expect(msg).toContain('export function helper(n: number) { return n + base; }');
+  });
+
+  it('warns but completes when head content is oversized, missing or fails to fetch', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(TWO_FILE_DIFF, PR, {
+      headFiles: { 'src/a.ts': 'x'.repeat(60_001) },
+      fileContentError: (p) => (p === 'src/b.ts' ? new Error('GitHub 502 GET contents') : null),
+    });
+    const res = await reviewPullRequest(
+      { db, llm: llm.provider, retrieve: async () => [], github: gh.github },
+      { repoId: REPO_ID, prNumber: 42 },
+    );
+
+    expect(res.findings).toEqual([]);
+    expect(llm.fileCalls()).toHaveLength(2);
+    expect(res.warnings.some((w) => w.includes('src/a.ts: post-change content skipped'))).toBe(true);
+    expect(res.warnings.some((w) => w.includes('src/b.ts: fetching post-change content failed: GitHub 502'))).toBe(true);
+    const msg = llm.fileCalls()[0]!.messages[0]!.content;
+    expect(msg).not.toContain('content after this pull request');
+  });
+
+  it('logs, but does not warn, when a changed file has no content at the head sha', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(TWO_FILE_DIFF, PR, { headFiles: { 'src/a.ts': A_HEAD } });
+    const logs: string[] = [];
+    const res = await reviewPullRequest(
+      { db, llm: llm.provider, retrieve: async () => [], github: gh.github, log: (m) => logs.push(m) },
+      { repoId: REPO_ID, prNumber: 42 },
+    );
+    expect(res.warnings).toEqual([]);
+    expect(logs.some((l) => l.includes('src/b.ts: no post-change content at head-sh'))).toBe(true);
+    // a.ts still gets its own content; b.ts is simply not quoted.
+    const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
+    expect(msg).toContain('### src/a.ts (content after this pull request)');
+    expect(msg).not.toContain('### src/b.ts');
   });
 });
 

@@ -98,6 +98,26 @@ describe('GitHubClient.getPullDiff', () => {
   });
 });
 
+describe('GitHubClient.getFileContent', () => {
+  it('requests the raw media type at the given ref and encodes the path segments', async () => {
+    const { f, gh } = client([textResponse('export const a = 1;\n')]);
+    const content = await gh.getFileContent('o', 'r', 'src/my dir/a b.ts', 'headsha');
+    expect(content).toBe('export const a = 1;\n');
+    expect(f.calls[0]!.url).toBe('https://api.github.com/repos/o/r/contents/src/my%20dir/a%20b.ts?ref=headsha');
+    expect(f.calls[0]!.headers['Accept']).toBe('application/vnd.github.raw+json');
+  });
+
+  it('returns null when the file does not exist at the ref', async () => {
+    const { gh } = client([jsonResponse({ message: 'Not Found' }, 404)]);
+    expect(await gh.getFileContent('o', 'r', 'src/new.ts', 'headsha')).toBeNull();
+  });
+
+  it('throws on any other error status', async () => {
+    const { gh } = client([textResponse('boom', 500)]);
+    await expect(gh.getFileContent('o', 'r', 'src/a.ts', 'headsha')).rejects.toThrow(/GitHub 500 GET/);
+  });
+});
+
 describe('GitHubClient.createReview', () => {
   it('posts commit_id, event and RIGHT-side comments', async () => {
     const { f, gh } = client([jsonResponse({ id: 99, html_url: 'https://github.com/o/r/pull/1#r99' })]);

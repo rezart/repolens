@@ -122,6 +122,21 @@ describe('createRetriever', () => {
     const one = await retrieve({ repoIds: [REPO], query: 'verifyToken openDatabase handle', limit: 1 });
     expect(one).toHaveLength(1);
   });
+
+  it('honours excludePaths, on top of excludePath', async () => {
+    seed(db);
+    const retrieve = createRetriever({ db });
+    const query = 'verifyToken openDatabase handle';
+
+    const hits = await retrieve({ repoIds: [REPO], query, excludePaths: ['src/auth.ts'] });
+    expect(hits.map((h) => h.path)).toEqual(['src/storage.ts']);
+
+    const none = await retrieve({ repoIds: [REPO], query, excludePaths: ['src/auth.ts', 'src/storage.ts'] });
+    expect(none).toEqual([]);
+
+    const both = await retrieve({ repoIds: [REPO], query, excludePath: 'src/storage.ts', excludePaths: ['src/auth.ts'] });
+    expect(both).toEqual([]);
+  });
 });
 
 describe('formatContext', () => {

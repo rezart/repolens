@@ -155,7 +155,10 @@ async function apiStream(path, body, onEvent, onJson) {
 
   for (;;) {
     const { value, done } = await reader.read();
+    // `stream: true` holds back a multi-byte character split across chunks; the
+    // final flush releases whatever is still buffered when the stream ends.
     if (value) buffer += decoder.decode(value, { stream: true });
+    if (done) buffer += decoder.decode();
     for (;;) {
       const sep = FRAME_SEP.exec(buffer);
       if (!sep) break;

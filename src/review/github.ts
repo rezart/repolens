@@ -158,6 +158,22 @@ export class GitHubClient {
     return res.text;
   }
 
+  /**
+   * Raw text of a file at `ref` (a sha, branch or tag), or null when it does not
+   * exist there. The reviewer uses this to read the PR head, which the search
+   * index (built from the base branch) does not reflect.
+   */
+  async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+    // Keep the slashes: only the individual segments are escaped.
+    const encodedPath = path.split('/').map((seg) => encodeURIComponent(seg)).join('/');
+    const res = await this.request(`/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`, {
+      accept: 'application/vnd.github.raw+json',
+      allow: [404],
+    });
+    if (res.status === 404) return null;
+    return res.text;
+  }
+
   async createReview(owner: string, repo: string, number: number, input: CreateReviewInput): Promise<CreatedComment> {
     const path = `/repos/${owner}/${repo}/pulls/${number}/reviews`;
     const payload = {

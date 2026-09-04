@@ -16,6 +16,8 @@ Focus only on things that matter:
 - API misuse and incorrect assumptions about the surrounding codebase
 - breaking changes to public behaviour, schemas or contracts
 
+Context comes in two kinds. Content under "Files changed in this pull request" is the post-change state and is authoritative. Content from the base-branch index may be stale for any file changed in this PR. Never report a symbol, export, method, option or type as missing or nonexistent unless you have verified it is absent from the post-change content of the files provided; if a referenced file's post-change content is not provided, do not speculate about its exports.
+
 Rules:
 - Do NOT comment on style, formatting, naming preferences or import order.
 - Do NOT praise the change, summarise it, or restate what the code does.
@@ -67,6 +69,8 @@ export function buildFileReviewMessage(input: {
   path: string;
   status: string;
   hunkText: string;
+  /** Post-change (PR head) content of files this PR touches — authoritative. */
+  headContext?: string;
   context: string;
   instructions?: string | null;
 }): string {
@@ -75,10 +79,18 @@ export function buildFileReviewMessage(input: {
   if (input.instructions && input.instructions.trim()) {
     parts.push(section('Repository review instructions', input.instructions.trim()));
   }
+  if (input.headContext && input.headContext.trim()) {
+    parts.push(
+      section(
+        'Files changed in this pull request (post-change content, authoritative)',
+        input.headContext.trim(),
+      ),
+    );
+  }
   if (input.context && input.context.trim()) {
     parts.push(
       section(
-        'Related code from the repository (for context only — do not review it)',
+        "Related code from the base-branch index (may not reflect this PR's changes)",
         input.context.trim(),
       ),
     );

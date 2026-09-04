@@ -242,6 +242,7 @@ describe('API', () => {
         listOpenPulls: async () => openPulls,
         getPull: async (_o: string, _r: string, n: number) => openPulls.find((p) => p.number === n),
         getPullDiff: async () => '',
+        getFileContent: async () => null,
         listReviewComments: async () => [],
         createReview: async () => ({ id: 1, htmlUrl: 'u' }),
       } as unknown as GitHubClient;
@@ -386,6 +387,7 @@ describe('API', () => {
       deps.github = {
         getPull: async () => ({ number: 3, title: 'T', body: 'B', headSha: 'h', baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft: false }),
         getPullDiff: async () => 'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n line\n+added\n',
+        getFileContent: async () => null,
         createIssueComment: async (_o: string, _r: string, _n: number, text: string) => {
           posted.push(text);
           return { id: 1, htmlUrl: 'https://github.com/o/n/pull/3#issuecomment-1' };
@@ -443,6 +445,7 @@ describe('API', () => {
       d.github = {
         getPull: async () => ({ number: 3, title: 'T', body: 'B', headSha: 'h', baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft: false }),
         getPullDiff: async () => '',
+        getFileContent: async () => null,
         createIssueComment: async () => ({ id: 1, htmlUrl: 'u' }),
       } as unknown as GitHubClient;
       const body = JSON.stringify({
