@@ -290,6 +290,20 @@ describe('API', () => {
     });
   });
 
+  describe('dashboard', () => {
+    it('tells browsers to revalidate static files on every load', async () => {
+      // No build step, no hashed filenames: without this a browser keeps a
+      // pre-deploy app.js from heuristic caching and never sees a new feature.
+      for (const path of ['/', '/app.js', '/style.css']) {
+        const res = await app.request(path);
+        expect(res.status, path).toBe(200);
+        expect(res.headers.get('cache-control'), path).toBe('no-cache');
+      }
+      const api = await app.request('/api/health');
+      expect(api.headers.get('cache-control')).toBeNull();
+    });
+  });
+
   describe('pull requests', () => {
     const openPulls = [
       { number: 1, title: 'Add auth', body: '', headSha: 'h1', baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'octocat', htmlUrl: 'https://github.com/o/n/pull/1', draft: false, updatedAt: '2026-01-02T03:04:05Z' },
