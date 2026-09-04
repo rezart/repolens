@@ -4,6 +4,7 @@ import { ClaudeCliProvider } from './claude-cli.js';
 import { CodexCliProvider } from './codex-cli.js';
 import type { LLMProvider } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
+import type { UsageSink } from '../usage/types.js';
 
 export { OpenRouterProvider } from './openrouter.js';
 export { ClaudeCliProvider, flattenMessages, withJsonInstruction, JSON_INSTRUCTION } from './claude-cli.js';
@@ -20,6 +21,8 @@ export interface CreateProviderOptions {
   model?: string;
   /** Thinking budget; omitted means LLM_REASONING_EFFORT, `''` leaves the backend default alone. */
   reasoningEffort?: ReasoningEffort | '';
+  /** Where the backend reports each call's tokens; one sink per role. */
+  onUsage?: UsageSink;
 }
 
 /**
@@ -47,6 +50,7 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
         baseUrl: llm.openrouterBaseUrl,
         timeoutMs: llm.timeoutMs,
         reasoningEffort,
+        onUsage: opts.onUsage,
       });
     case 'claude-cli':
       return new ClaudeCliProvider({
@@ -54,6 +58,7 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
         bin: llm.claudeBin,
         timeoutMs: llm.timeoutMs,
         reasoningEffort,
+        onUsage: opts.onUsage,
       });
     case 'codex-cli':
       return new CodexCliProvider({
@@ -61,6 +66,7 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
         bin: llm.codexBin,
         timeoutMs: llm.timeoutMs,
         reasoningEffort,
+        onUsage: opts.onUsage,
       });
     default: {
       const exhaustive: never = provider;

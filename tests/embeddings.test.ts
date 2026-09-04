@@ -274,6 +274,12 @@ describe('createEmbeddings', () => {
     const e = createEmbeddings(cfg)!;
     expect((e as unknown as { timeoutMs: number }).timeoutMs).toBe(4321);
   });
+
+  it('forwards the usage sink so embedding batches are accounted for', () => {
+    const onUsage = () => {};
+    const e = createEmbeddings(baseConfig({ embedding: { baseUrl: 'http://x/v1', apiKey: 'k', model: 'm1' } }), { onUsage })!;
+    expect((e as unknown as { onUsage?: unknown }).onUsage).toBe(onUsage);
+  });
 });
 
 describe('createProvider', () => {

@@ -8,6 +8,7 @@ import { JobQueue } from '../src/jobs.js';
 import type { AppDeps } from '../src/app.js';
 import type { GitHubClient, PullRequest } from '../src/review/github.js';
 import { pollOnce } from '../src/poller.js';
+import { UsageTracker } from '../src/usage/tracker.js';
 
 function pr(number: number, headSha: string, draft = false): PullRequest {
   return { number, title: 't', body: '', headSha, baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft, updatedAt: null };
@@ -27,6 +28,7 @@ function makeDeps(github: Partial<GitHubClient>): AppDeps {
     retrieve: async () => [],
     github: github as GitHubClient,
     jobs: new JobQueue(db),
+    usage: new UsageTracker({ db, pricing: null }),
   };
 }
 

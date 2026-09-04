@@ -180,12 +180,13 @@ async function safeText(res: Response): Promise<string> {
 }
 
 /** Build the configured embedding backend, or null when embeddings are disabled. */
-export function createEmbeddings(config: Config): EmbeddingProvider | null {
+export function createEmbeddings(config: Config, opts: { onUsage?: UsageSink } = {}): EmbeddingProvider | null {
   if (!config.embedding) return null;
   return new OpenAIEmbeddings({
     baseUrl: config.embedding.baseUrl,
     apiKey: config.embedding.apiKey,
     model: config.embedding.model,
     timeoutMs: config.llm.timeoutMs,
+    onUsage: opts.onUsage,
   });
 }
