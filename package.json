@@ -1,0 +1,33 @@
+{
+  "name": "repolens",
+  "version": "0.1.0",
+  "description": "Self-hosted Greptile clone: codebase Q&A and PR review with pluggable LLM backends (OpenRouter, Claude CLI, Codex CLI)",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "repolens": "./bin/repolens.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli.ts serve",
+    "start": "tsx src/cli.ts serve",
+    "cli": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "better-sqlite3": "^13.0.3",
+    "hono": "^4.13.5",
+    "simple-git": "^3.36.0",
+    "sqlite-vec": "^0.1.9",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.4.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.7"
+  }
+}
