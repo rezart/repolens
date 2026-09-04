@@ -98,6 +98,26 @@ describe('GitHubClient.getPullDiff', () => {
   });
 });
 
+describe('GitHubClient.getFileContent', () => {
+  it('requests the raw media type at the given ref and encodes the path segments', async () => {
+    const { f, gh } = client([textResponse('export const a = 1;\n')]);
+    const content = await gh.getFileContent('o', 'r', 'src/my dir/a b.ts', 'headsha');
+    expect(content).toBe('export const a = 1;\n');
+    expect(f.calls[0]!.url).toBe('https://api.github.com/repos/o/r/contents/src/my%20dir/a%20b.ts?ref=headsha');
+    expect(f.calls[0]!.headers['Accept']).toBe('application/vnd.github.raw+json');
+  });
+
+  it('returns null when the file does not exist at the ref', async () => {
+    const { gh } = client([jsonResponse({ message: 'Not Found' }, 404)]);
+    expect(await gh.getFileContent('o', 'r', 'src/new.ts', 'headsha')).toBeNull();
+  });
+
+  it('throws on any other error status', async () => {
+    const { gh } = client([textResponse('boom', 500)]);
+    await expect(gh.getFileContent('o', 'r', 'src/a.ts', 'headsha')).rejects.toThrow(/GitHub 500 GET/);
+  });
+});
+
 describe('GitHubClient.createReview', () => {
   it('posts commit_id, event and RIGHT-side comments', async () => {
     const { f, gh } = client([jsonResponse({ id: 99, html_url: 'https://github.com/o/r/pull/1#r99' })]);
@@ -119,10 +139,35 @@ describe('GitHubClient.createReview', () => {
     });
   });
 
-  it('retries without inline comments when GitHub answers 422', async () => {
+  it('keeps the inline comments on the first 422 retry, only downgrading the event', async () => {
+    const { f, gh } = client([
+      jsonResponse({ message: 'Can not request changes on your own pull request' }, 422),
+      jsonResponse({ id: 100, html_url: 'https://x/100' }),
+    ]);
+    const comments = [
+      { path: 'src/a.ts', line: 12, body: 'boom' },
+      { path: 'src/b.ts', line: 3, body: 'bang' },
+    ];
+    const res = await gh.createReview('o', 'r', 1, { commitId: 'abc123', body: 'summary here', event: 'REQUEST_CHANGES', comments });
+    expect(res.id).toBe(100);
+    expect(f.calls).toHaveLength(2);
+    const retry = f.calls[1]!.body as { comments: unknown[]; body: string; event: string };
+    expect(retry.event).toBe('COMMENT');
+    expect(retry.comments).toEqual([
+      { path: 'src/a.ts', line: 12, side: 'RIGHT', body: 'boom' },
+      { path: 'src/b.ts', line: 3, side: 'RIGHT', body: 'bang' },
+    ]);
+    expect(retry.body).toContain('summary here');
+    expect(retry.body).toContain('request_changes');
+    // Nothing was dropped, so the findings are not repeated in the body.
+    expect(retry.body).not.toContain('- **src/a.ts:12** — boom');
+  });
+
+  it('drops the inline comments into the body only when the second attempt 422s too', async () => {
     const { f, gh } = client([
       jsonResponse({ message: 'line must be part of the diff' }, 422),
-      jsonResponse({ id: 100, html_url: 'https://x/100' }),
+      jsonResponse({ message: 'line must be part of the diff' }, 422),
+      jsonResponse({ id: 101, html_url: 'https://x/101' }),
     ]);
     const res = await gh.createReview('o', 'r', 1, {
       commitId: 'abc123',
@@ -133,32 +178,15 @@ describe('GitHubClient.createReview', () => {
         { path: 'src/b.ts', line: 3, body: 'bang' },
       ],
     });
-    expect(res.id).toBe(100);
-    expect(f.calls).toHaveLength(2);
-    const retry = f.calls[1]!.body as { comments: unknown[]; body: string; event: string };
-    expect(retry.comments).toEqual([]);
-    expect(retry.event).toBe('COMMENT');
-    expect(retry.body).toContain('summary here');
-    expect(retry.body).toContain('- **src/a.ts:12** — boom');
-    expect(retry.body).toContain('- **src/b.ts:3** — bang');
-  });
-
-  it('downgrades REQUEST_CHANGES to COMMENT on the 422 retry and says so in the body', async () => {
-    const { f, gh } = client([
-      jsonResponse({ message: 'Can not request changes on your own pull request' }, 422),
-      jsonResponse({ id: 101, html_url: 'https://x/101' }),
-    ]);
-    const res = await gh.createReview('o', 'r', 1, {
-      commitId: 'abc123',
-      body: 'summary here',
-      event: 'REQUEST_CHANGES',
-      comments: [{ path: 'src/a.ts', line: 12, body: 'boom' }],
-    });
     expect(res.id).toBe(101);
-    expect((f.calls[0]!.body as { event: string }).event).toBe('REQUEST_CHANGES');
-    const retry = f.calls[1]!.body as { event: string; body: string };
-    expect(retry.event).toBe('COMMENT');
-    expect(retry.body).toContain('request_changes');
+    expect(f.calls).toHaveLength(3);
+    expect((f.calls[1]!.body as { comments: unknown[] }).comments).toHaveLength(2);
+    const last = f.calls[2]!.body as { comments: unknown[]; body: string; event: string };
+    expect(last.comments).toEqual([]);
+    expect(last.event).toBe('COMMENT');
+    expect(last.body).toContain('summary here');
+    expect(last.body).toContain('- **src/a.ts:12** — boom');
+    expect(last.body).toContain('- **src/b.ts:3** — bang');
   });
 
   it('reports both failures when the 422 retry also fails', async () => {
@@ -175,6 +203,26 @@ describe('GitHubClient.createReview', () => {
       }),
     ).rejects.toThrow(/line must be part of the diff[\s\S]*server exploded/);
     expect(f.calls).toHaveLength(2);
+  });
+
+  it('reports every body when all three attempts fail', async () => {
+    const { f, gh } = client([
+      textResponse('first failure', 422),
+      textResponse('second failure', 422),
+      textResponse('third failure', 422),
+    ]);
+    const err = await gh
+      .createReview('o', 'r', 1, {
+        commitId: 'a',
+        body: 'b',
+        event: 'REQUEST_CHANGES',
+        comments: [{ path: 'src/a.ts', line: 12, body: 'boom' }],
+      })
+      .then(() => null, (e: unknown) => e as Error);
+    expect(f.calls).toHaveLength(3);
+    expect(err!.message).toContain('first failure');
+    expect(err!.message).toContain('second failure');
+    expect(err!.message).toContain('third failure');
   });
 
   it('does not retry a 422 when there were no comments to drop', async () => {
@@ -208,6 +256,49 @@ describe('GitHubClient.createIssueComment / listReviewComments', () => {
       { path: 'src/b.ts', line: null, body: 'outdated', user: '' },
     ]);
     expect(f.calls[0]!.url).toBe('https://api.github.com/repos/o/r/pulls/3/comments?per_page=100');
+  });
+});
+
+describe('GitHubClient.createCommitStatus', () => {
+  it('posts the status to the commit', async () => {
+    const { f, gh } = client([jsonResponse({ id: 1, state: 'failure' }, 201)]);
+    await gh.createCommitStatus('o', 'r', 'headsha', {
+      state: 'failure',
+      context: 'repolens/review',
+      description: '1 critical, 2 warnings',
+      targetUrl: 'https://github.com/o/r/pull/42',
+    });
+    const call = f.calls[0]!;
+    expect(call.url).toBe('https://api.github.com/repos/o/r/statuses/headsha');
+    expect(call.method).toBe('POST');
+    expect(call.headers['Authorization']).toBe('Bearer tok');
+    expect(call.body).toEqual({
+      state: 'failure',
+      context: 'repolens/review',
+      description: '1 critical, 2 warnings',
+      target_url: 'https://github.com/o/r/pull/42',
+    });
+  });
+
+  it('omits target_url when there is none and truncates the description to 140 chars', async () => {
+    const { f, gh } = client([jsonResponse({ id: 1 }, 201)]);
+    await gh.createCommitStatus('o', 'r', 'sha', {
+      state: 'pending',
+      context: 'repolens/review',
+      description: 'x'.repeat(200),
+    });
+    const body = f.calls[0]!.body as Record<string, unknown>;
+    expect(body.target_url).toBeUndefined();
+    expect(body.state).toBe('pending');
+    expect(String(body.description)).toHaveLength(140);
+    expect(String(body.description).endsWith('…')).toBe(true);
+  });
+
+  it('throws when GitHub rejects the status', async () => {
+    const { gh } = client([textResponse('Bad credentials', 403)]);
+    await expect(
+      gh.createCommitStatus('o', 'r', 'sha', { state: 'success', context: 'c', description: 'ok' }),
+    ).rejects.toThrow('GitHub 403 POST /repos/o/r/statuses/sha: Bad credentials');
   });
 });
 

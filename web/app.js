@@ -103,6 +103,74 @@ async function api(path, options = {}) {
   return data;
 }
 
+/**
+ * POST that consumes a text/event-stream response. `onEvent(name, data)` is
+ * called per SSE frame. Returns false when the server answered with plain JSON
+ * instead, so the caller can fall back; the parsed body is handed to `onJson`.
+ *
+ * EventSource cannot be used here: it does not send an Authorization header.
+ */
+async function apiStream(path, body, onEvent, onJson) {
+  const headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
+  if (state.token) headers.Authorization = 'Bearer ' + state.token;
+  const res = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) });
+
+  if (!res.ok) {
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch { /* not JSON */ }
+    const err = new Error((data && data.error) || res.statusText || ('HTTP ' + res.status));
+    err.status = res.status;
+    throw err;
+  }
+
+  const type = res.headers.get('content-type') || '';
+  if (!type.includes('text/event-stream') || !res.body) {
+    const raw = await res.text();
+    let data = null;
+    if (raw) { try { data = JSON.parse(raw); } catch { data = null; } }
+    onJson(data);
+    return false;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  // SSE frames are separated by a blank line; a chunk can split one anywhere, and
+  // line ends may be CRLF as well as LF.
+  const FRAME_SEP = /\r?\n\r?\n/;
+  const flushFrame = (frame) => {
+    let name = 'message';
+    const dataLines = [];
+    for (const raw of frame.split('\n')) {
+      const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+      if (line.startsWith('event:')) name = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (!dataLines.length) return;
+    let payload = null;
+    try { payload = JSON.parse(dataLines.join('\n')); } catch { return; }
+    onEvent(name, payload);
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    // `stream: true` holds back a multi-byte character split across chunks; the
+    // final flush releases whatever is still buffered when the stream ends.
+    if (value) buffer += decoder.decode(value, { stream: true });
+    if (done) buffer += decoder.decode();
+    for (;;) {
+      const sep = FRAME_SEP.exec(buffer);
+      if (!sep) break;
+      flushFrame(buffer.slice(0, sep.index));
+      buffer = buffer.slice(sep.index + sep[0].length);
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) flushFrame(buffer);
+  return true;
+}
+
 function handleError(err) {
   if (err && err.status === 401) {
     dom.tokenHint.textContent = 'Unauthorized — enter a valid API token to continue.';
@@ -163,7 +231,7 @@ function selectedRepo() {
 }
 
 function chatFor(repoId) {
-  if (!state.chats[repoId]) state.chats[repoId] = { messages: [], busy: false };
+  if (!state.chats[repoId]) state.chats[repoId] = { messages: [], busy: false, stream: null };
   return state.chats[repoId];
 }
 
@@ -298,11 +366,18 @@ function renderHealth() {
     return;
   }
   const llm = hp.llm || {};
+  const chat = hp.chat || {};
+  const label = (m) => [m.provider, m.model].filter(Boolean).join(' · ');
   box.appendChild(h('span', { class: 'dot ' + (hp.ok ? 'dot-ok' : 'dot-error') }));
   box.appendChild(h('span', {
     class: 'health-text',
-    text: [llm.provider, llm.model].filter(Boolean).join(' · ') || 'llm unknown',
+    text: (label(llm) || 'llm unknown') + (llm.effort ? ' (' + llm.effort + ')' : ''),
   }));
+  // Only worth a line of its own when chat runs on something else.
+  const chatLabel = label(chat);
+  if (chatLabel && chatLabel !== label(llm)) {
+    box.appendChild(h('span', { class: 'health-sub', text: 'chat ' + chatLabel }));
+  }
   box.appendChild(h('span', {
     class: 'health-sub',
     text: 'embeddings ' + (hp.embeddings ? 'on (' + hp.embeddings + ')' : 'off'),
@@ -450,28 +525,65 @@ function renderChatLog() {
       continue;
     }
     const body = h('div', { class: 'msg-body' }, [markdown(msg.content)]);
-    if (msg.sources && msg.sources.length) {
-      body.appendChild(h('div', { class: 'sources' }, [
-        h('div', { class: 'sources-head', text: 'Sources (' + msg.sources.length + ')' }),
-        h('ul', { class: 'sources-list' }, msg.sources.map((s) => h('li', {}, [
-          h('a', {
-            class: 'src-link', href: sourceUrl(repo, s), target: '_blank', rel: 'noopener noreferrer',
-            text: s.filepath + (s.linestart ? ':' + s.linestart + '-' + (s.lineend || s.linestart) : ''),
-          }),
-          s.summary ? h('span', { class: 'src-summary', text: s.summary }) : null,
-        ]))),
-      ]));
-    }
+    if (msg.sources && msg.sources.length) body.appendChild(sourcesBlock(repo, msg.sources));
     log.appendChild(bubble('assistant', body));
   }
 
+  live.md = null;
   if (chat.busy) {
-    log.appendChild(bubble('assistant', h('div', { class: 'msg-body' }, [h('div', { class: 'spinner-row' }, [
+    const stream = chat.stream || { text: '', sources: [], phase: 'searching' };
+    const md = markdown(stream.text);
+    const body = h('div', { class: 'msg-body' }, [md]);
+    if (stream.sources && stream.sources.length) body.appendChild(sourcesBlock(repo, stream.sources));
+    body.appendChild(h('div', { class: 'spinner-row spinner-row-sm' }, [
       h('span', { class: 'spinner' }),
-      h('span', { text: 'Searching the codebase and drafting an answer… this can take 30–120 s.' }),
-    ])])));
+      h('span', { text: stream.phase === 'searching' ? 'Searching…' : 'Answering…' }),
+    ]));
+    log.appendChild(bubble('assistant', body));
+    // Deltas are appended to this node directly; a full re-render is throttled.
+    live.repoId = repo.id;
+    live.md = md;
   }
   log.scrollTop = log.scrollHeight;
+}
+
+/** DOM handle for the message currently streaming, so deltas skip a full re-render. */
+const live = { repoId: null, md: null, timer: null };
+const MD_RERENDER_MS = 300;
+
+function sourcesBlock(repo, sources) {
+  return h('div', { class: 'sources' }, [
+    h('div', { class: 'sources-head', text: 'Sources (' + sources.length + ')' }),
+    h('ul', { class: 'sources-list' }, sources.map((s) => h('li', {}, [
+      h('a', {
+        class: 'src-link', href: sourceUrl(repo, s), target: '_blank', rel: 'noopener noreferrer',
+        text: s.filepath + (s.linestart ? ':' + s.linestart + '-' + (s.lineend || s.linestart) : ''),
+      }),
+      s.summary ? h('span', { class: 'src-summary', text: s.summary }) : null,
+    ]))),
+  ]);
+}
+
+function stopLiveTimer() {
+  if (live.timer) { clearTimeout(live.timer); live.timer = null; }
+}
+
+/** Append a delta cheaply, then reformat the whole answer as Markdown on a timer. */
+function appendDelta(repoId, chat, text) {
+  chat.stream.text += text;
+  if (live.repoId !== repoId || !live.md || !live.md.isConnected) return;
+  live.md.appendChild(document.createTextNode(text));
+  const log = $('chat-log');
+  if (log) log.scrollTop = log.scrollHeight;
+  if (live.timer) return;
+  live.timer = setTimeout(() => {
+    live.timer = null;
+    if (live.repoId !== repoId || !live.md || !live.md.isConnected) return;
+    const fresh = markdown(chat.stream.text);
+    live.md.replaceChildren(...fresh.childNodes);
+    const el = $('chat-log');
+    if (el) el.scrollTop = el.scrollHeight;
+  }, MD_RERENDER_MS);
 }
 
 async function askQuestion(repoId, question) {
@@ -479,18 +591,61 @@ async function askQuestion(repoId, question) {
   if (chat.busy) return;
   chat.messages.push({ role: 'user', content: question });
   chat.busy = true;
+  chat.stream = { text: '', sources: [], phase: 'searching' };
   renderChatLog();
+
+  let failure = null;
+  const finish = (content, sources) => {
+    chat.messages.push({ role: 'assistant', content: content || '', sources: sources || [] });
+  };
+
   try {
-    const payload = { messages: chat.messages.map((m) => ({ role: m.role, content: m.content })), repositories: [repoId] };
-    const data = await api('/api/query', { method: 'POST', body: payload });
-    chat.messages.push({ role: 'assistant', content: (data && data.message) || '', sources: (data && data.sources) || [] });
+    const payload = {
+      messages: chat.messages.map((m) => ({ role: m.role, content: m.content })),
+      repositories: [repoId],
+      stream: true,
+    };
+    let settled = false;
+    const streamed = await apiStream(
+      '/api/query',
+      payload,
+      (name, data) => {
+        if (name === 'sources') {
+          chat.stream.sources = data || [];
+          chat.stream.phase = 'answering';
+          renderChatLog();
+        } else if (name === 'delta') {
+          if (data && data.text) appendDelta(repoId, chat, data.text);
+        } else if (name === 'message') {
+          // The server's full text wins: some backends stream a preview only.
+          settled = true;
+          finish(data && data.content, chat.stream.sources);
+        } else if (name === 'error') {
+          failure = new Error((data && data.error) || 'The answer failed');
+        }
+      },
+      (data) => {
+        settled = true;
+        finish(data && data.message, (data && data.sources) || []);
+      },
+    );
+    if (failure) throw failure;
+    // A stream that ended without a `message` event still has the text we saw.
+    if (streamed && !settled) finish(chat.stream.text, chat.stream.sources);
   } catch (err) {
     handleError(err);
-    chat.messages.pop(); // drop the unanswered turn and hand the question back for a clean retry
-    const input = $('chat-input');
-    if (input && !input.value.trim()) input.value = question;
+    // Drop the unanswered turn and hand the question back for a clean retry.
+    // If an answer already landed, the question is answered — leave both.
+    const last = chat.messages[chat.messages.length - 1];
+    if (last && last.role === 'user') {
+      chat.messages.pop();
+      const input = $('chat-input');
+      if (input && !input.value.trim()) input.value = question;
+    }
   } finally {
+    stopLiveTimer();
     chat.busy = false;
+    chat.stream = null;
     renderChatLog();
   }
 }

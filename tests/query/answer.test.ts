@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import type { ChatMessage, CompleteRequest, LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrieveRequest, RetrievedChunk } from '../../src/search/types.js';
-import { answerQuestion } from '../../src/query/answer.js';
-import { ANSWER_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT, buildAnswerUserMessage } from '../../src/query/prompts.js';
+import { answerQuestion, buildFollowUpQuery } from '../../src/query/answer.js';
+import { ANSWER_SYSTEM_PROMPT, ANSWER_MAX_TOKENS, buildAnswerUserMessage } from '../../src/query/prompts.js';
 
 const REPO = 'github:acme/app';
 
@@ -61,6 +61,8 @@ describe('answerQuestion', () => {
 
     expect(llm.calls).toHaveLength(1);
     expect(llm.calls[0].system).toBe(ANSWER_SYSTEM_PROMPT);
+    expect(llm.calls[0].maxTokens).toBe(ANSWER_MAX_TOKENS);
+    expect(ANSWER_MAX_TOKENS).toBe(1000);
     expect(res.query).toBe('How does token verification work?');
     expect(retrieve.calls[0]).toMatchObject({ repoIds: [REPO], query: 'How does token verification work?' });
 
@@ -76,72 +78,113 @@ describe('answerQuestion', () => {
     ]);
   });
 
-  it('rewrites a follow-up into a standalone retrieval query', async () => {
-    const llm = fakeLlm(['token verification in the auth module', 'It decodes the JWT.']);
+  it('widens a follow-up with terms from the previous turns, without a second LLM call', async () => {
+    const llm = fakeLlm(['It decodes the JWT.']);
     const retrieve = fakeRetrieve();
     const messages: ChatMessage[] = [
       { role: 'system', content: 'ignored' },
       { role: 'user', content: 'How does token verification work?' },
-      { role: 'assistant', content: 'It uses verifyToken.' },
+      { role: 'assistant', content: 'It uses `verifyToken` in `src/auth.ts:12-40`.' },
       { role: 'user', content: 'And what about expiry?' },
     ];
 
     const res = await answerQuestion({ llm, retrieve, repoIds: [REPO], messages });
 
-    expect(llm.calls).toHaveLength(2);
-    expect(llm.calls[0].system).toBe(REWRITE_SYSTEM_PROMPT);
-    expect(llm.calls[0].messages.at(-1)!.content).toContain('And what about expiry?');
-    // Prior turns are forwarded, system messages are dropped.
+    // The rewrite round-trip is gone: one call, for the answer itself.
+    expect(llm.calls).toHaveLength(1);
+    expect(llm.calls[0].system).toBe(ANSWER_SYSTEM_PROMPT);
+
+    // The retrieval query keeps the question and borrows context from before it.
+    expect(res.query.startsWith('And what about expiry?')).toBe(true);
+    expect(res.query).toContain('verifyToken');
+    expect(res.query).toContain('src/auth.ts');
+    expect(res.query).toContain('verification');
+    expect(retrieve.calls[0].query).toBe(res.query);
+
+    // Prior turns are still forwarded to the model; system messages are dropped.
     expect(llm.calls[0].messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
-
-    expect(res.query).toBe('token verification in the auth module');
-    expect(retrieve.calls[0].query).toBe('token verification in the auth module');
-
-    expect(llm.calls[1].system).toBe(ANSWER_SYSTEM_PROMPT);
-    expect(llm.calls[1].messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
-    expect(llm.calls[1].messages.at(-1)!.content).toContain('And what about expiry?');
+    expect(llm.calls[0].messages.at(-1)!.content).toContain('And what about expiry?');
     expect(res.message).toBe('It decodes the JWT.');
   });
 
-  it('falls back to the raw question when the rewrite is empty', async () => {
-    const llm = fakeLlm(['   ', 'answer']);
-    const retrieve = fakeRetrieve();
-    const messages: ChatMessage[] = [
-      { role: 'user', content: 'first' },
-      { role: 'assistant', content: 'reply' },
-      { role: 'user', content: 'second' },
-    ];
-    const res = await answerQuestion({ llm, retrieve, repoIds: [REPO], messages });
-    expect(res.query).toBe('second');
-    expect(retrieve.calls[0].query).toBe('second');
+  it('leaves a single-turn question unwidened', () => {
+    expect(buildFollowUpQuery([], 'where is the router?')).toBe('where is the router?');
   });
 
-  it('falls back to the raw question when the rewrite call throws', async () => {
-    const calls: CompleteRequest[] = [];
+  it('does not repeat terms the question already contains', () => {
+    const query = buildFollowUpQuery(
+      [
+        { role: 'user', content: 'how does verifyToken work?' },
+        { role: 'assistant', content: 'verifyToken decodes the JWT.' },
+      ],
+      'is verifyToken cached?',
+    );
+    expect(query.match(/verifyToken/g)).toHaveLength(1);
+  });
+
+  it('caps how much context a follow-up borrows', () => {
+    const answer = Array.from({ length: 60 }, (_, i) => `identifierNumber${i}`).join(' ');
+    const query = buildFollowUpQuery([{ role: 'assistant', content: answer }], 'and then?');
+    // 15 from the answer + 10 from the previous question, at most.
+    expect(query.split(/\s+/).length).toBeLessThanOrEqual(2 + 25);
+  });
+
+  it('streams the answer through onDelta when the provider supports it', async () => {
+    const deltas: string[] = [];
     const llm: LLMProvider = {
-      name: 'flaky',
-      model: 'flaky-1',
+      name: 'streamy',
+      model: 's1',
       concurrency: 1,
-      async complete(req) {
-        calls.push(req);
-        if (req.system === REWRITE_SYSTEM_PROMPT) throw new Error('boom');
+      complete: async () => 'not used',
+      async stream(_req, onDelta) {
+        onDelta('Tokens are ');
+        onDelta('verified.');
+        return 'Tokens are verified.';
+      },
+    };
+    const res = await answerQuestion({
+      llm,
+      retrieve: fakeRetrieve(),
+      repoIds: [REPO],
+      messages: [{ role: 'user', content: 'verifyToken?' }],
+      onDelta: (t) => deltas.push(t),
+    });
+    expect(deltas).toEqual(['Tokens are ', 'verified.']);
+    expect(res.message).toBe('Tokens are verified.');
+  });
+
+  it('emits the whole answer as one delta when the provider cannot stream', async () => {
+    const deltas: string[] = [];
+    const llm = fakeLlm(['the whole answer']);
+    await answerQuestion({
+      llm,
+      retrieve: fakeRetrieve(),
+      repoIds: [REPO],
+      messages: [{ role: 'user', content: 'verifyToken?' }],
+      onDelta: (t) => deltas.push(t),
+    });
+    expect(deltas).toEqual(['the whole answer']);
+  });
+
+  it('reports sources as soon as retrieval finishes, before generation', async () => {
+    const order: string[] = [];
+    const llm: LLMProvider = {
+      name: 'slow',
+      model: 's',
+      concurrency: 1,
+      async complete() {
+        order.push('complete');
         return 'answer';
       },
     };
-    const retrieve = fakeRetrieve();
-    const res = await answerQuestion({
+    await answerQuestion({
       llm,
-      retrieve,
+      retrieve: fakeRetrieve(),
       repoIds: [REPO],
-      messages: [
-        { role: 'user', content: 'first' },
-        { role: 'assistant', content: 'reply' },
-        { role: 'user', content: 'second' },
-      ],
+      messages: [{ role: 'user', content: 'verifyToken?' }],
+      onSources: (s) => order.push(`sources:${s.length}`),
     });
-    expect(res.query).toBe('second');
-    expect(res.message).toBe('answer');
-    expect(calls).toHaveLength(2);
+    expect(order).toEqual(['sources:1', 'complete']);
   });
 
   it('throws when there is no user message', async () => {

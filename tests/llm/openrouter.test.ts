@@ -179,3 +179,137 @@ describe('OpenRouterProvider', () => {
     await expect(p.complete({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toBeInstanceOf(ProviderError);
   });
 });
+
+/** An SSE response body delivered in chunks that split frames arbitrarily. */
+function sseResponse(chunks: string[]): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enc = new TextEncoder();
+      for (const c of chunks) controller.enqueue(enc.encode(c));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+function dataFrame(content: string): string {
+  return 'data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n';
+}
+
+describe('OpenRouterProvider.stream', () => {
+  it('parses SSE deltas and resolves with the joined text', async () => {
+    const body = dataFrame('Hello ') + dataFrame('world') + 'data: [DONE]\n\n';
+    // Split mid-frame to prove the buffer survives chunk boundaries.
+    const f = fakeFetch([sseResponse([body.slice(0, 20), body.slice(20, 55), body.slice(55)])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const deltas: string[] = [];
+    const out = await p.stream({ messages: [{ role: 'user', content: 'hi' }], maxTokens: 100 }, (t) => deltas.push(t));
+
+    expect(deltas).toEqual(['Hello ', 'world']);
+    expect(out).toBe('Hello world');
+    const sent = JSON.parse(String(f.calls[0]!.init.body));
+    expect(sent.stream).toBe(true);
+    expect(sent.max_tokens).toBe(100);
+  });
+
+  it('does not drop a multi-byte character split across the final chunks', async () => {
+    // Last frame carries "é" (2 bytes) with no trailing newline after the [DONE]-less finish_reason frame.
+    const last = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'caf\u00e9' }, finish_reason: 'stop' }] });
+    const bytes = new TextEncoder().encode(dataFrame('ok ') + last);
+    const cut = bytes.length - 3; // split inside the 2-byte "é" near the end
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(bytes.slice(0, cut));
+        c.enqueue(bytes.slice(cut));
+        c.close();
+      },
+    });
+    const res = new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    const f = fakeFetch([res]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const out = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {});
+    expect(out).toBe('ok caf\u00e9');
+  });
+
+  it('ignores keep-alive comments and blank lines', async () => {
+    const body = ': ping\n\n' + '\n' + dataFrame('ok') + 'data: [DONE]\n\n';
+    const f = fakeFetch([sseResponse([body])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const deltas: string[] = [];
+    expect(await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t))).toBe('ok');
+    expect(deltas).toEqual(['ok']);
+  });
+
+  it('throws on a malformed data frame instead of truncating the answer', async () => {
+    const body = dataFrame('ok') + 'data: {not json}\n\n' + 'data: [DONE]\n\n';
+    const f = fakeFetch([sseResponse([body])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const err = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {}).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).message).toContain('malformed stream frame: {not json}');
+  });
+
+  it('bounds the malformed frame it reports to 200 characters', async () => {
+    const f = fakeFetch([sseResponse(['data: {' + 'x'.repeat(500) + '\n\n'])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const err = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {}).then(
+      () => null,
+      (e: unknown) => e as ProviderError,
+    );
+    expect(err!.message.length).toBeLessThan(260);
+  });
+
+  it('throws when the body ends before [DONE]', async () => {
+    const f = fakeFetch([sseResponse([dataFrame('half an ans')])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toThrow(
+      /stream ended before \[DONE\]/,
+    );
+  });
+
+  it('accepts a stream that ends after a finish_reason but without [DONE]', async () => {
+    const finish = 'data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\n\n';
+    const f = fakeFetch([sseResponse([dataFrame('all of it'), finish])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    expect(await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).toBe('all of it');
+  });
+
+  it('retries a 429 before the stream starts', async () => {
+    const f = fakeFetch([jsonResponse({ error: 'slow down' }, 429), sseResponse([dataFrame('hi'), 'data: [DONE]\n\n'])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, sleep: async () => {} });
+    expect(await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).toBe('hi');
+    expect(f.calls).toHaveLength(2);
+  });
+
+  it('throws a ProviderError on a non-retryable status', async () => {
+    const f = fakeFetch([jsonResponse({ error: 'nope' }, 401)]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('does not send stream:true for a plain complete()', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).stream).toBeUndefined();
+  });
+});
+
+describe('OpenRouterProvider reasoning effort', () => {
+  it('sends reasoning.effort when configured', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, reasoningEffort: 'medium' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).reasoning).toEqual({ effort: 'medium' });
+  });
+
+  it('omits reasoning when blank', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, reasoningEffort: '' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).reasoning).toBeUndefined();
+  });
+});

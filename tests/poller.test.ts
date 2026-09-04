@@ -13,13 +13,16 @@ function pr(number: number, headSha: string, draft = false): PullRequest {
   return { number, title: 't', body: '', headSha, baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft, updatedAt: null };
 }
 
+const fake: AppDeps['llm'] = { name: 'fake', model: 'x', concurrency: 1, complete: async () => '{"findings":[]}' };
+
 function makeDeps(github: Partial<GitHubClient>): AppDeps {
   const config = loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-poll-')) });
   const db = openDb(':memory:');
   return {
     config,
     db,
-    llm: { name: 'fake', model: 'x', concurrency: 1, complete: async () => '{"findings":[]}' },
+    llm: fake,
+    chatLlm: fake,
     embeddings: null,
     retrieve: async () => [],
     github: github as GitHubClient,

@@ -38,13 +38,21 @@ function makeDeps(pulls: PullRequest[] = PULLS): AppDeps {
     listOpenPulls: async () => pulls,
     getPull: async (_o: string, _r: string, n: number) => pulls.find((p) => p.number === n)!,
     getPullDiff: async () => '',
+    getFileContent: async () => null,
     listReviewComments: async () => [],
     createReview: async () => ({ id: 1, htmlUrl: 'https://github.com/o/n/pull/1#review-1' }),
   } as unknown as GitHubClient;
+  const llm: AppDeps['llm'] = {
+    name: 'fake',
+    model: 'x',
+    concurrency: 1,
+    complete: async () => '{"summary":"ok","verdict":"comment","findings":[]}',
+  };
   const deps: AppDeps = {
     config,
     db,
-    llm: { name: 'fake', model: 'x', concurrency: 1, complete: async () => '{"summary":"ok","verdict":"comment","findings":[]}' },
+    llm,
+    chatLlm: llm,
     embeddings: null,
     retrieve: async () => [],
     github,

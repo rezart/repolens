@@ -15,4 +15,10 @@ describe('loadConfig', () => {
     const c = loadConfig({ LLM_PROVIDER: 'codex-cli', EMBEDDING_MODEL: 'm', EMBEDDING_API_KEY: 'k' });
     expect(c.embedding?.model).toBe('m');
   });
+  it('validates OpenRouter credentials when only chat uses it', () => {
+    expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', CHAT_PROVIDER: 'openrouter' })).toThrow(/OPENROUTER_API_KEY/);
+    expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', CHAT_PROVIDER: 'openrouter', OPENROUTER_API_KEY: 'k' })).toThrow(/CHAT_MODEL/);
+    const c = loadConfig({ LLM_PROVIDER: 'claude-cli', CHAT_PROVIDER: 'openrouter', OPENROUTER_API_KEY: 'k', CHAT_MODEL: 'openai/gpt-4o-mini' });
+    expect(c.chatProvider).toBe('openrouter');
+  });
 });

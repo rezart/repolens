@@ -12,12 +12,24 @@ import { startPoller } from './poller.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
   const db = openDb(join(config.dataDir, 'repolens.db'));
-  const llm = createProvider(config);
+  // Reviews get the configured reasoning budget.
+  const llm = createProvider(config, { reasoningEffort: config.llm.reasoningEffort });
+  // Chat always gets its own provider so it pins effort to 'low' rather than
+  // inheriting the review budget, even when it runs on the same provider/model.
+  // Measured on the Claude CLI with haiku, the default budget spends ~17s thinking
+  // before the first token; 'low' cuts that to ~7s. CLI providers serialise on a
+  // semaphore shared per binary, so the second instance cannot double the
+  // concurrency of the underlying CLI.
+  const chatLlm = createProvider(config, {
+    provider: config.chatProvider || undefined,
+    model: config.chatModel || undefined,
+    reasoningEffort: 'low',
+  });
   const embeddings = createEmbeddings(config);
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token: config.github.token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, embeddings, retrieve, github, jobs, log };
+  return { config, db, llm, chatLlm, embeddings, retrieve, github, jobs, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {
@@ -35,7 +47,9 @@ export function startServer(config: Config, log: (msg: string) => void = console
 
   const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
     log(`RepoLens listening on http://localhost:${info.port}`);
-    log(`LLM: ${deps.llm.name} (${deps.llm.model}); embeddings: ${deps.embeddings?.model ?? 'off (lexical retrieval only)'}`);
+    const effort = config.llm.reasoningEffort ? `, effort ${config.llm.reasoningEffort}` : '';
+    log(`LLM: ${deps.llm.name} (${deps.llm.model}${effort}); chat: ${deps.chatLlm.name} (${deps.chatLlm.model})`);
+    log(`Embeddings: ${deps.embeddings?.model ?? 'off (lexical retrieval only)'}`);
     if (!config.apiToken) {
       log('*'.repeat(72));
       log('*** WARNING: REPOLENS_API_TOKEN is empty. The API is UNAUTHENTICATED and');

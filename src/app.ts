@@ -13,6 +13,7 @@ import { JobQueue } from './jobs.js';
 import { parseRemote, repoIdFor, repoIdOf, RepoCheckout } from './indexer/git.js';
 import { indexRepo } from './indexer/indexer.js';
 import { answerQuestion } from './query/answer.js';
+import type { AnswerOptions, AnswerResult } from './query/answer.js';
 import { reviewPullRequest } from './review/reviewer.js';
 import { formatContext } from './search/retrieve.js';
 import { identifiersFromCode } from './search/tokenize.js';
@@ -23,7 +24,10 @@ import { listPullStatuses, reviewPulls } from './review/pulls.js';
 export interface AppDeps {
   config: Config;
   db: Db;
+  /** Backend used for pull request reviews. */
   llm: LLMProvider;
+  /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
+  chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
   retrieve: RetrieveFn;
   github: GitHubClient;
@@ -131,6 +135,9 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           github: deps.github,
           identifiers: identifiersFromCode,
           formatContext: (chunks) => formatContext(chunks, 16000),
+          statusContext: deps.config.review.statusContext,
+          failOn: deps.config.review.failOn,
+          publicUrl: deps.config.publicUrl,
           log: (m) => ctx.progress(m),
         },
         { repoId, prNumber, post: opts.post ?? true, force: opts.force },
@@ -139,6 +146,49 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
     },
     { prNumber },
   );
+}
+
+/** The part of hono's SSE stream this module uses, so the pump is testable on its own. */
+export interface SSEWriter {
+  writeSSE(message: { event: string; data: string }): Promise<void>;
+}
+
+type AnswerHooks = Pick<AnswerOptions, 'onDelta' | 'onSources'>;
+
+/**
+ * Stream one answer as SSE events. Writes are queued rather than awaited inline:
+ * the provider callbacks are synchronous, and a delta must never be dropped or
+ * reordered. The first write failure (usually a disconnected client) is kept and
+ * stops every later write, so a dead connection is not written to for the rest of
+ * the generation.
+ */
+export async function streamAnswer(stream: SSEWriter, run: (hooks: AnswerHooks) => Promise<AnswerResult>): Promise<void> {
+  let pending: Promise<void> = Promise.resolve();
+  let writeFailed = false;
+  const send = (event: string, data: unknown) => {
+    if (writeFailed) return;
+    pending = pending
+      // Checked again here: events queued before the failure surfaced must not be written.
+      .then(() => (writeFailed ? undefined : stream.writeSSE({ event, data: JSON.stringify(data) })))
+      .catch(() => {
+        writeFailed = true;
+      });
+  };
+  try {
+    const result = await run({
+      onSources: (sources) => send('sources', sources),
+      onDelta: (text) => send('delta', { text }),
+    });
+    // Queued writes may still be in flight; a failure among them must be seen
+    // before the closing events are queued.
+    await pending;
+    send('message', { content: result.message });
+    send('done', {});
+  } catch (err) {
+    await pending;
+    send('error', { error: (err as Error).message });
+  }
+  await pending;
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -167,7 +217,8 @@ export function createApp(deps: AppDeps): Hono {
     c.json({
       ok: true,
       version: VERSION,
-      llm: { provider: deps.llm.name, model: deps.llm.model },
+      llm: { provider: deps.llm.name, model: deps.llm.model, effort: config.llm.reasoningEffort || null },
+      chat: { provider: deps.chatLlm.name, model: deps.chatLlm.model },
       embeddings: deps.embeddings?.model ?? null,
     }),
   );
@@ -257,25 +308,17 @@ export function createApp(deps: AppDeps): Hono {
     const repoIds = body.data.repositories.map(normalizeRepoId);
     const missing = repoIds.filter((id) => !db.getRepo(id));
     if (missing.length) return c.json({ error: `Unknown repositories: ${missing.join(', ')}` }, 404);
-    const run = () =>
+    const run = (hooks: AnswerHooks = {}) =>
       answerQuestion({
-        llm: deps.llm,
+        llm: deps.chatLlm,
         retrieve: deps.retrieve,
         repoIds,
         messages: body.data.messages,
         limit: body.data.limit,
+        ...hooks,
       });
     if (body.data.stream) {
-      return streamSSE(c, async (stream) => {
-        try {
-          const result = await run();
-          await stream.writeSSE({ event: 'sources', data: JSON.stringify(result.sources) });
-          await stream.writeSSE({ event: 'message', data: JSON.stringify({ content: result.message }) });
-          await stream.writeSSE({ event: 'done', data: '{}' });
-        } catch (err) {
-          await stream.writeSSE({ event: 'error', data: JSON.stringify({ error: (err as Error).message }) });
-        }
-      });
+      return streamSSE(c, (stream) => streamAnswer(stream, run));
     }
     return c.json(await run());
   });

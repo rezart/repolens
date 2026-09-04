@@ -71,6 +71,33 @@ LLM_MODEL=              # blank = CLI default
 
 CLI providers run one completion at a time to stay within subscription rate limits. Reviews of large PRs take a few minutes.
 
+### Chat vs. review backends
+
+Reviews want depth; chat wants first tokens on screen fast. RepoLens runs them on separate backends when you ask it to:
+
+```env
+LLM_PROVIDER=codex-cli          # reviews
+LLM_REASONING_EFFORT=medium     # reviews only; chat never inherits this
+CHAT_PROVIDER=claude-cli        # chat (blank = same as LLM_PROVIDER)
+CHAT_MODEL=haiku                # blank = same as LLM_MODEL
+```
+
+`CHAT_MODEL` takes whatever the chat provider understands: `haiku` for the Claude CLI, `gpt-5-mini` for the Codex CLI, `openai/gpt-4o-mini` or `anthropic/claude-haiku-4.5` for OpenRouter. `GET /api/health` reports both backends. Chat always runs at low reasoning effort: on the Claude CLI the default thinking budget costs about 17 s before the first token.
+
+### Streaming answers
+
+`POST /api/query` with `"stream": true` returns `text/event-stream`:
+
+| event | payload | when |
+| --- | --- | --- |
+| `sources` | `Source[]` | retrieval finished (about 0.1 s) |
+| `delta` | `{ "text": "…" }` | repeatedly, as the model writes |
+| `message` | `{ "content": "…" }` | the complete answer, authoritative |
+| `done` | `{}` | end of stream |
+| `error` | `{ "error": "…" }` | failure; the response stays 200 |
+
+Prefer `message` over concatenating deltas: the Codex CLI can only stream a preview. The dashboard streams by default and `repolens ask` writes deltas straight to stdout. Providers without streaming support fall back to one completion emitted as a single delta, so the SSE shape never changes.
+
 ## Using it
 
 Set `REPOLENS_API_TOKEN` in `.env`; the API and dashboard use it as a bearer token.
@@ -106,7 +133,7 @@ npm run cli -- review github:owner/name --all --post  # every unreviewed open PR
 
 RepoLens can learn about new changes two ways. **Polling** (default, every 5 minutes) needs no inbound network access: it reindexes when the tracked branch moves and reviews any open, non-draft PR whose head commit hasn't been reviewed. **Webhooks** react instantly but need the server reachable from the internet (a reverse proxy or a Cloudflare Tunnel). Both can be on at once; reviews are deduped by head commit.
 
-1. Create a token with `repo` scope (classic PAT) or a fine-grained token with *Contents: read* and *Pull requests: read & write*. Put it in `GITHUB_TOKEN`. Private repos are cloned with this token.
+1. Create a token with `repo` scope (classic PAT) or a fine-grained token with *Contents: read*, *Pull requests: read & write* and *Commit statuses: read & write* (the last one for the [blocking check](#blocking-merges-on-the-review)). Put it in `GITHUB_TOKEN`. Private repos are cloned with this token.
 2. (Webhooks only) In the repository (or org) settings add a webhook:
    - Payload URL: `https://<your host>/webhooks/github`
    - Content type: `application/json`
@@ -155,6 +182,9 @@ See `.env.example` for every variable. The important ones:
 | `GITHUB_WEBHOOK_SECRET` | | Verifies webhook payloads. The webhook endpoint refuses requests until this is set |
 | `REVIEW_BOT_HANDLE` | `@repolens` | Mention that triggers PR chat |
 | `REPOLENS_POLL_INTERVAL` | `300` | Seconds between GitHub polls for new commits and PRs. `0` disables polling |
+| `CHAT_MODEL` | empty | Model for chat answers, e.g. `haiku` on the Claude CLI; blank = `LLM_MODEL` |
+| `REVIEW_STATUS_CONTEXT` | `repolens/review` | Name of the commit status reported on the PR head. Blank disables statuses |
+| `REVIEW_FAIL_ON` | `critical` | Which findings make that status fail: `critical`, `warning`, or `never` |
 
 ## Docker
 
@@ -172,6 +202,16 @@ The Docker image works with `LLM_PROVIDER=openrouter`. The CLI providers need th
 4. A summary and verdict are generated, then a single GitHub review is posted: the summary as the review body and each finding as an inline comment on the changed line. Findings already commented on a previous run are skipped, so `synchronize` events don't pile up duplicates.
 5. Reviews are deduped by head commit. Use `force: true` to re-run.
 
+### Blocking merges on the review
+
+RepoLens reports a commit status named `repolens/review` (`REVIEW_STATUS_CONTEXT`) on the PR's head commit: **pending** while the review is queued or running, **success** when there are no blocking findings, and **failure** when there are. `REVIEW_FAIL_ON` decides what blocks — `critical` (default) fails only on critical findings, `warning` also fails on warnings, and `never` keeps the check purely informational (always green). If the review itself fails (the model or GitHub is down), the status is set to **error** rather than left hanging on pending. The status description carries the counts (`2 critical, 3 warnings, 1 nit`) and links to the posted review.
+
+To actually block merges, require the check on the base branch: **Settings → Branches → branch protection rule** (or a repository ruleset) → *Require status checks to pass before merging* → add `repolens/review`. The check only appears in that list after RepoLens has reported it at least once, so run one review first.
+
+Pushing fixes moves the PR head, which triggers a fresh review of the new commit; when the blocking findings are gone the new head's status turns green and the PR becomes mergeable. Set `REVIEW_STATUS_CONTEXT=` (blank) to stop reporting statuses altogether.
+
+With a personal access token the status shows up under that token owner's account (their avatar and name); a GitHub App installation token reports as the app instead. The token needs write access to the repository's commit statuses (`repo` scope on a classic PAT, or *Commit statuses: read & write* on a fine-grained one).
+
 PR title, body and comments are treated as untrusted data in the prompts, but as with any LLM reviewer, a determined author can still influence the output. Never give RepoLens a token with more scope than it needs.
 
 ## Development
@@ -182,4 +222,4 @@ npm run typecheck
 npm run dev       # server with reload
 ```
 
-Design notes live in `docs/plans/`.
+Design notes live in `docs/plans/`. To wire another repository up as a merge-blocking check, follow `docs/INTEGRATION.md`.

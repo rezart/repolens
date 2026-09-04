@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { openDb, type Db } from '../src/db.js';
 import { loadConfig } from '../src/config.js';
 import { JobQueue } from '../src/jobs.js';
-import { createApp, type AppDeps } from '../src/app.js';
+import { createApp, streamAnswer, type AppDeps } from '../src/app.js';
+import { buildDeps } from '../src/server.js';
 import type { LLMProvider, CompleteRequest } from '../src/llm/types.js';
 import type { GitHubClient } from '../src/review/github.js';
 
@@ -35,7 +36,7 @@ function makeDeps(overrides: Partial<AppDeps> = {}, env: Record<string, string> 
   const db = openDb(':memory:');
   const jobs = new JobQueue(db);
   const github = {} as GitHubClient;
-  return {
+  const base = {
     config,
     db,
     llm: fakeLlm(),
@@ -45,6 +46,8 @@ function makeDeps(overrides: Partial<AppDeps> = {}, env: Record<string, string> 
     jobs,
     ...overrides,
   };
+  // Chat shares the review backend unless a test overrides it.
+  return { chatLlm: base.llm, ...base };
 }
 
 const auth = { authorization: 'Bearer secret', 'content-type': 'application/json' };
@@ -62,6 +65,7 @@ describe('API', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.llm.provider).toBe('fake');
+    expect(body.chat).toEqual({ provider: 'fake', model: 'fake-1' });
     expect(body.embeddings).toBeNull();
   });
 
@@ -127,6 +131,75 @@ describe('API', () => {
     expect(body.sources[0].filepath).toBe('src/auth.ts');
   });
 
+  it('streams an answer as SSE: sources first, then deltas, then the full message', async () => {
+    const streaming: LLMProvider = {
+      name: 'streamy',
+      model: 's1',
+      concurrency: 1,
+      complete: async () => 'unused',
+      async stream(_req, onDelta) {
+        onDelta('Auth lives in ');
+        onDelta('src/auth.ts:1-5.');
+        return 'Auth lives in src/auth.ts:1-5.';
+      },
+    };
+    const d = makeDeps({ chatLlm: streaming });
+    d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+    const res = await createApp(d).request('/api/query', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'how does auth work?' }], repositories: ['github:o/n'], stream: true }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const body = await res.text();
+
+    expect(body).toContain('event: sources');
+    expect(body.match(/event: delta/g)).toHaveLength(2);
+    expect(body).toContain('event: message');
+    expect(body).toContain('event: done');
+    // Sources must land before the first delta so the UI can show them early.
+    expect(body.indexOf('event: sources')).toBeLessThan(body.indexOf('event: delta'));
+    expect(body.indexOf('event: delta')).toBeLessThan(body.indexOf('event: message'));
+    expect(body).toContain('Auth lives in ');
+    expect(body).toContain('src/auth.ts');
+  });
+
+  it('reports the stream error instead of failing the response', async () => {
+    const boom: LLMProvider = {
+      name: 'boom',
+      model: 'b',
+      concurrency: 1,
+      complete: async () => {
+        throw new Error('model exploded');
+      },
+    };
+    const d = makeDeps({ chatLlm: boom });
+    d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+    const res = await createApp(d).request('/api/query', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }], repositories: ['github:o/n'], stream: true }),
+    });
+    const body = await res.text();
+    expect(body).toContain('event: error');
+    expect(body).toContain('model exploded');
+  });
+
+  it('answers chat with chatLlm, leaving the review backend untouched', async () => {
+    const chat = fakeLlm();
+    const d = makeDeps({ chatLlm: chat });
+    d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+    await createApp(d).request('/api/query', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }], repositories: ['github:o/n'] }),
+    });
+    expect(chat.calls).toHaveLength(1);
+    expect((d.llm as ReturnType<typeof fakeLlm>).calls).toHaveLength(0);
+  });
+
   it('rejects queries for unknown repositories', async () => {
     const res = await app.request('/api/query', {
       method: 'POST',
@@ -169,6 +242,7 @@ describe('API', () => {
         listOpenPulls: async () => openPulls,
         getPull: async (_o: string, _r: string, n: number) => openPulls.find((p) => p.number === n),
         getPullDiff: async () => '',
+        getFileContent: async () => null,
         listReviewComments: async () => [],
         createReview: async () => ({ id: 1, htmlUrl: 'u' }),
       } as unknown as GitHubClient;
@@ -313,6 +387,7 @@ describe('API', () => {
       deps.github = {
         getPull: async () => ({ number: 3, title: 'T', body: 'B', headSha: 'h', baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft: false }),
         getPullDiff: async () => 'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n line\n+added\n',
+        getFileContent: async () => null,
         createIssueComment: async (_o: string, _r: string, _n: number, text: string) => {
           posted.push(text);
           return { id: 1, htmlUrl: 'https://github.com/o/n/pull/3#issuecomment-1' };
@@ -370,6 +445,7 @@ describe('API', () => {
       d.github = {
         getPull: async () => ({ number: 3, title: 'T', body: 'B', headSha: 'h', baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft: false }),
         getPullDiff: async () => '',
+        getFileContent: async () => null,
         createIssueComment: async () => ({ id: 1, htmlUrl: 'u' }),
       } as unknown as GitHubClient;
       const body = JSON.stringify({
@@ -393,5 +469,83 @@ describe('API', () => {
       expect(prompt.messages.at(-1)?.content).toContain('why was this added?');
       expect(prompt.messages.at(-1)?.content).not.toContain('@repolens');
     });
+  });
+});
+
+describe('streamAnswer', () => {
+  /** A stream whose nth write rejects, as a disconnected client's would. */
+  function fakeStream(failOn: number) {
+    const written: string[] = [];
+    let n = 0;
+    return {
+      written,
+      attempts: () => n,
+      stream: {
+        async writeSSE(message: { event: string; data: string }) {
+          n++;
+          if (n === failOn) throw new Error('client went away');
+          written.push(message.event);
+        },
+      },
+    };
+  }
+
+  it('stops writing once a write fails', async () => {
+    const f = fakeStream(2);
+    await streamAnswer(f.stream, async (hooks) => {
+      hooks.onSources?.([]);
+      hooks.onDelta?.('a');
+      // Everything from here on must be dropped: the connection is gone.
+      for (const t of ['b', 'c', 'd']) hooks.onDelta?.(t);
+      await new Promise((r) => setTimeout(r, 0));
+      hooks.onDelta?.('e');
+      return { message: 'the whole answer', sources: [], query: 'q' };
+    });
+    expect(f.written).toEqual(['sources']);
+    expect(f.attempts()).toBe(2);
+  });
+
+  it('writes sources, deltas, message and done on a healthy stream', async () => {
+    const f = fakeStream(0);
+    await streamAnswer(f.stream, async (hooks) => {
+      hooks.onSources?.([]);
+      hooks.onDelta?.('a');
+      return { message: 'a', sources: [], query: 'q' };
+    });
+    expect(f.written).toEqual(['sources', 'delta', 'message', 'done']);
+  });
+
+  it('reports a failed answer as an error event', async () => {
+    const f = fakeStream(0);
+    await streamAnswer(f.stream, async () => {
+      throw new Error('model exploded');
+    });
+    expect(f.written).toEqual(['error']);
+  });
+});
+
+describe('buildDeps', () => {
+  // The effort is private on the provider; reading it is the only way to see it
+  // without spawning the CLI.
+  const effortOf = (p: LLMProvider): string | undefined => (p as unknown as { effort?: string }).effort;
+
+  it('always gives chat its own low-effort provider, even without CHAT_PROVIDER/CHAT_MODEL', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'claude-cli',
+      LLM_MODEL: 'sonnet',
+      LLM_REASONING_EFFORT: 'high',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.chatLlm).not.toBe(deps.llm);
+      expect(deps.chatLlm.name).toBe('claude-cli');
+      expect(deps.chatLlm.model).toBe('sonnet');
+      // Reviews keep the configured budget; chat must not inherit it.
+      expect(effortOf(deps.llm)).toBe('high');
+      expect(effortOf(deps.chatLlm)).toBe('low');
+    } finally {
+      deps.db.close();
+    }
   });
 });

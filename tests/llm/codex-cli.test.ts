@@ -22,7 +22,11 @@ function fakeRun(opts: { output?: string; result?: Partial<RunResult> } = {}) {
     calls.push({ cmd, args, opts: runOpts });
     const out = argValue(args, '-o');
     if (opts.output !== undefined && out) fs.writeFileSync(out, opts.output);
-    return { stdout: '', stderr: '', code: 0, timedOut: false, ...opts.result };
+    const res = { stdout: '', stderr: '', code: 0, timedOut: false, ...opts.result };
+    if (runOpts.onStdout && res.stdout) {
+      for (let i = 0; i < res.stdout.length; i += 11) runOpts.onStdout(res.stdout.slice(i, i + 11));
+    }
+    return res;
   };
   return { calls, run };
 }
@@ -151,5 +155,58 @@ describe('CodexCliProvider', () => {
     ]);
     expect(outs).toEqual(['ok', 'ok']);
     expect(maxActive).toBe(1);
+  });
+});
+
+describe('CodexCliProvider.stream', () => {
+  it('emits the final answer as a single delta', async () => {
+    const f = fakeRun({ output: 'the answer\n' });
+    const p = new CodexCliProvider({ run: f.run });
+    const deltas: string[] = [];
+    const out = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
+
+    expect(deltas).toEqual(['the answer']);
+    expect(out).toBe('the answer');
+  });
+
+  it('never forwards intermediate agent messages from the NDJSON', async () => {
+    // Codex reports whole assistant turns, and the intermediate ones are absent
+    // from the final `-o` file: forwarding them would show text that is not part
+    // of the answer.
+    const ndjson = [
+      JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'let me look…' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'i2', type: 'agent_message', text: 'the answer' } }),
+    ].join('\n') + '\n';
+    const f = fakeRun({ output: 'the answer', result: { stdout: ndjson } });
+    const p = new CodexCliProvider({ run: f.run });
+    const deltas: string[] = [];
+    await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
+    expect(deltas).toEqual(['the answer']);
+  });
+
+  it('never passes --json: the NDJSON stream is not consumed', async () => {
+    const f = fakeRun({ output: 'x' });
+    const p = new CodexCliProvider({ run: f.run });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {});
+    expect(f.calls[0]!.args).not.toContain('--json');
+    expect(f.calls[1]!.args).not.toContain('--json');
+  });
+});
+
+describe('CodexCliProvider reasoning effort', () => {
+  it('passes model_reasoning_effort as a quoted TOML string', async () => {
+    const f = fakeRun({ output: 'x' });
+    const p = new CodexCliProvider({ run: f.run, reasoningEffort: 'medium' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.args).toContain('-c');
+    expect(f.calls[0]!.args).toContain('model_reasoning_effort="medium"');
+  });
+
+  it('omits the config override when blank', async () => {
+    const f = fakeRun({ output: 'x' });
+    const p = new CodexCliProvider({ run: f.run, reasoningEffort: '' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.args.some((a) => a.startsWith('model_reasoning_effort'))).toBe(false);
   });
 });

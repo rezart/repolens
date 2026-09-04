@@ -41,6 +41,24 @@ export interface ExistingReviewComment {
   user: string;
 }
 
+export type CommitStatusState = 'pending' | 'success' | 'failure' | 'error';
+
+export interface CommitStatusInput {
+  state: CommitStatusState;
+  /** Status check name, e.g. `repolens/review`. Branch protection matches on this. */
+  context: string;
+  description: string;
+  targetUrl?: string;
+}
+
+/** GitHub rejects commit status descriptions longer than 140 characters. */
+export const STATUS_DESCRIPTION_MAX = 140;
+
+export function truncateDescription(text: string, max = STATUS_DESCRIPTION_MAX): string {
+  const s = text.replace(/\s+/g, ' ').trim();
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
 export interface GitHubClientOptions {
   token: string;
   baseUrl?: string;
@@ -140,6 +158,22 @@ export class GitHubClient {
     return res.text;
   }
 
+  /**
+   * Raw text of a file at `ref` (a sha, branch or tag), or null when it does not
+   * exist there. The reviewer uses this to read the PR head, which the search
+   * index (built from the base branch) does not reflect.
+   */
+  async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+    // Keep the slashes: only the individual segments are escaped.
+    const encodedPath = path.split('/').map((seg) => encodeURIComponent(seg)).join('/');
+    const res = await this.request(`/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`, {
+      accept: 'application/vnd.github.raw+json',
+      allow: [404],
+    });
+    if (res.status === 404) return null;
+    return res.text;
+  }
+
   async createReview(owner: string, repo: string, number: number, input: CreateReviewInput): Promise<CreatedComment> {
     const path = `/repos/${owner}/${repo}/pulls/${number}/reviews`;
     const payload = {
@@ -151,33 +185,59 @@ export class GitHubClient {
     const allow = input.comments.length > 0 ? [422] : [];
     const res = await this.request(path, { method: 'POST', body: payload, allow });
     if (res.status === 422) {
-      // A comment line was probably not part of the diff, or REQUEST_CHANGES was rejected
-      // because the token owns the PR. Post the body alone, as a plain COMMENT, with the
-      // inline findings inlined so nothing is lost.
-      const retryBody = [
-        input.body,
+      // Two likely causes: REQUEST_CHANGES was rejected because the token owns the PR,
+      // or a comment line was not part of the diff. Retry as a plain COMMENT with the
+      // inline comments intact first; only if that fails too are they folded into the
+      // body, because rendering them there loses their position in the diff.
+      const note =
         input.event === 'REQUEST_CHANGES'
           ? '_Verdict was **request_changes**; posted as a comment because the review could not be submitted as REQUEST_CHANGES._'
-          : null,
-        renderDroppedComments(input.comments),
-      ]
-        .filter((p): p is string => p !== null)
-        .join('\n\n');
+          : null;
+      const bodyWith = (extra: string | null): string =>
+        [input.body, note, extra].filter((p): p is string => p !== null).join('\n\n');
+      const failed = (reason: string): Error =>
+        new Error(`GitHub 422 POST ${path}: ${res.text.slice(0, 300)} — retry as a plain comment failed: ${reason}`);
+
       let retry: RawResponse;
       try {
         retry = await this.request(path, {
           method: 'POST',
-          body: { ...payload, event: 'COMMENT' as const, comments: [], body: retryBody },
+          body: { ...payload, event: 'COMMENT' as const, body: bodyWith(null) },
+          allow: [422],
         });
       } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        throw new Error(`GitHub 422 POST ${path}: ${res.text.slice(0, 300)} — retry as a plain comment failed: ${reason}`);
+        throw failed(errText(err));
+      }
+      if (retry.status === 422) {
+        // The inline comments themselves are the problem: drop them into the body.
+        const second = retry.text;
+        try {
+          retry = await this.request(path, {
+            method: 'POST',
+            body: { ...payload, event: 'COMMENT' as const, comments: [], body: bodyWith(renderDroppedComments(input.comments)) },
+          });
+        } catch (err) {
+          throw failed(`${second.slice(0, 300)} — retry without inline comments failed: ${errText(err)}`);
+        }
       }
       const created = JSON.parse(retry.text || 'null') as { id: number; html_url: string };
       return { id: created.id, htmlUrl: created.html_url };
     }
     const created = JSON.parse(res.text || 'null') as { id: number; html_url: string };
     return { id: created.id, htmlUrl: created.html_url };
+  }
+
+  /** Report a commit status (a CI check) on `sha`. */
+  async createCommitStatus(owner: string, repo: string, sha: string, input: CommitStatusInput): Promise<void> {
+    await this.request(`/repos/${owner}/${repo}/statuses/${sha}`, {
+      method: 'POST',
+      body: {
+        state: input.state,
+        context: input.context,
+        description: truncateDescription(input.description),
+        target_url: input.targetUrl,
+      },
+    });
   }
 
   async createIssueComment(owner: string, repo: string, number: number, body: string): Promise<CreatedComment> {
@@ -211,6 +271,10 @@ interface PullApiPayload {
   user: { login: string } | null;
   head: { sha: string; ref: string } | null;
   base: { sha: string; ref: string } | null;
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 export function renderDroppedComments(comments: ReviewComment[]): string {

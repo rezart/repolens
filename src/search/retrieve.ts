@@ -101,11 +101,14 @@ export function createRetriever({ db, embeddings }: { db: Db; embeddings?: Embed
 
     const fused = rrf([lexical.map((h) => h.chunk.id), semantic.map((h) => h.chunk.id)]);
 
+    const excluded = new Set(req.excludePaths ?? []);
+    if (req.excludePath) excluded.add(req.excludePath);
+
     return [...fused.entries()]
       .flatMap(([id, score]) => {
         const chunk = chunks.get(id);
         if (!chunk) return [];
-        if (req.excludePath && chunk.path === req.excludePath) return [];
+        if (excluded.has(chunk.path)) return [];
         return [toRetrieved(chunk, score * pathWeight(chunk.path, tokens))];
       })
       .sort((a, b) => b.score - a.score)

@@ -2,7 +2,8 @@ import type { Db, RepoRow } from '../db.js';
 import type { LLMProvider } from '../llm/types.js';
 import { extractJson } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
-import type { GitHubClient, PullRequest } from './github.js';
+import { truncateDescription } from './github.js';
+import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
@@ -13,6 +14,13 @@ import {
 
 export type Severity = 'critical' | 'warning' | 'nit';
 export type Verdict = 'approve' | 'comment' | 'request_changes';
+/** Which findings make the commit status fail. */
+export type FailOn = 'critical' | 'warning' | 'never';
+
+export interface ReviewStatus {
+  state: CommitStatusState;
+  description: string;
+}
 
 export interface Finding {
   path: string;
@@ -33,18 +41,29 @@ export interface ReviewResult {
   reviewUrl?: string;
   skippedFiles: string[];
   warnings: string[];
+  /** The commit status reported on the PR head, when statuses are enabled. */
+  status?: ReviewStatus;
 }
 
 export interface ReviewDeps {
   db: Db;
   llm: LLMProvider;
   retrieve: RetrieveFn;
-  github: Pick<GitHubClient, 'getPull' | 'getPullDiff' | 'createReview' | 'listReviewComments'>;
+  github: Pick<
+    GitHubClient,
+    'getPull' | 'getPullDiff' | 'getFileContent' | 'createReview' | 'listReviewComments' | 'createCommitStatus'
+  >;
   /** Injected from search/tokenize.ts in production. */
   identifiers?: (text: string) => string[];
   /** Injected from search/retrieve.ts in production. */
   formatContext?: (chunks: RetrievedChunk[]) => string;
   maxFiles?: number;
+  /** Commit status context reported on the PR head; blank/undefined disables statuses. */
+  statusContext?: string;
+  /** Which findings turn the commit status red (default `critical`). */
+  failOn?: FailOn;
+  /** Base URL of this RepoLens install, used as a status target when the PR has no URL. */
+  publicUrl?: string;
   log?: (msg: string) => void;
 }
 
@@ -121,6 +140,150 @@ export function defaultFormatContext(chunks: RetrievedChunk[]): string {
   return chunks.map((c) => `### ${c.path}:${c.startLine}-${c.endLine}\n\`\`\`\n${c.content}\n\`\`\``).join('\n\n');
 }
 
+/* ------------------------------------------------------------------ PR head context */
+
+/** How many changed files RepoLens fetches the post-change content of. */
+const HEAD_FILES_MAX = 60;
+/** Files larger than this are not worth a prompt slot. */
+const HEAD_FILE_CHARS_MAX = 60_000;
+/** Concurrent `contents` requests. */
+const HEAD_FETCH_CONCURRENCY = 4;
+/** Per referenced file, inside the head-context section. */
+const HEAD_SNIPPET_CHARS_MAX = 8_000;
+/** Total budget for referenced files (the reviewed file's own content is separate). */
+const HEAD_CONTEXT_CHARS_MAX = 24_000;
+/** The reviewed file's own content is included in full only up to this size. */
+const OWN_HEAD_CHARS_MAX = 12_000;
+
+/** Module specifiers of `import`, `import()`, `export ... from` and `require()`. */
+const SPECIFIER_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g;
+/** `export function|const|class|interface|type|enum <name>` (and the usual variants). */
+const EXPORT_DECL_RE =
+  /^[ \t]*export[ \t]+(?:declare[ \t]+)?(?:default[ \t]+)?(?:abstract[ \t]+)?(?:async[ \t]+)?(?:function\*?|const|let|var|class|interface|type|enum)[ \t]+([A-Za-z_$][\w$]*)/gm;
+/** `export { a, b as c }` — the exported name is the one after `as`. */
+const EXPORT_LIST_RE = /\bexport[ \t]*\{([^}]*)\}/g;
+const IDENTIFIER_RE = /[A-Za-z_$][\w$]*/g;
+/** Extensionless and `.js`-suffixed specifiers both resolve onto TypeScript sources. */
+const RESOLVE_SUFFIXES = ['', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '/index.ts', '/index.tsx', '/index.js'];
+
+/** Resolve `./a/../b` style segments; paths are repository-relative, so `..` above the root is dropped. */
+function normalizeRepoPath(path: string): string {
+  const out: string[] = [];
+  for (const seg of path.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') out.pop();
+    else out.push(seg);
+  }
+  return out.join('/');
+}
+
+/**
+ * Resolve a relative module specifier used inside `fromPath` onto one of `changed`.
+ * Handles the ESM `./x.js` → `x.ts` rewrite and directory `index` files.
+ * Returns null for bare (package) specifiers and for files this PR does not touch.
+ */
+export function resolveChangedImport(fromPath: string, specifier: string, changed: Set<string>): string | null {
+  if (!specifier.startsWith('.')) return null;
+  const dir = fromPath.slice(0, fromPath.lastIndexOf('/') + 1);
+  const base = normalizeRepoPath(dir + specifier);
+  if (!base) return null;
+  const bases = [base];
+  const stripped = base.replace(/\.(js|jsx|mjs|cjs)$/, '');
+  if (stripped !== base) bases.push(stripped);
+  for (const b of bases) {
+    for (const suffix of RESOLVE_SUFFIXES) {
+      const candidate = b + suffix;
+      if (changed.has(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/** Names `content` exports, as far as a regex can tell. */
+export function exportedNames(content: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of content.matchAll(EXPORT_DECL_RE)) names.add(m[1]!);
+  for (const m of content.matchAll(EXPORT_LIST_RE)) {
+    for (const part of m[1]!.split(',')) {
+      const name = part.trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) names.add(name);
+    }
+  }
+  return names;
+}
+
+/** Exported names per path, computed once per review rather than once per reviewed file. */
+export function buildExportIndex(headContents: Map<string, string>): Map<string, Set<string>> {
+  const index = new Map<string, Set<string>>();
+  for (const [path, content] of headContents) index.set(path, exportedNames(content));
+  return index;
+}
+
+function clipContent(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}\n... (truncated)` : text;
+}
+
+function headBlock(path: string, content: string, max: number): string {
+  return `### ${path} (content after this pull request)\n\`\`\`\n${clipContent(content, max)}\n\`\`\``;
+}
+
+/**
+ * The post-change content the model needs to judge `path`: its own new content plus
+ * the new content of the changed files it references — the ones a stale index would
+ * otherwise describe with their pre-change exports.
+ */
+export function buildHeadContext(input: {
+  path: string;
+  addedText: string;
+  headContents: Map<string, string>;
+  /** Precomputed `exportedNames` per path; recomputed here when absent. */
+  exportsByPath?: Map<string, Set<string>>;
+}): string {
+  const { path, addedText, headContents } = input;
+  const exportsByPath = input.exportsByPath ?? buildExportIndex(headContents);
+  const own = headContents.get(path);
+  const changed = new Set(headContents.keys());
+
+  // (i) files this one imports, in the order they appear.
+  const imported: string[] = [];
+  if (own) {
+    for (const m of own.matchAll(SPECIFIER_RE)) {
+      const target = resolveChangedImport(path, m[1]!, changed);
+      if (target && target !== path && !imported.includes(target)) imported.push(target);
+    }
+  }
+
+  // (ii) files that export an identifier the added lines mention.
+  const mentioned = new Set(addedText.match(IDENTIFIER_RE) ?? []);
+  const byExport: string[] = [];
+  for (const other of headContents.keys()) {
+    if (other === path || imported.includes(other)) continue;
+    for (const name of exportsByPath.get(other) ?? []) {
+      if (mentioned.has(name)) {
+        byExport.push(other);
+        break;
+      }
+    }
+  }
+
+  const blocks: string[] = [];
+  let used = 0;
+  for (const referenced of [...imported, ...byExport]) {
+    const content = headContents.get(referenced);
+    if (content === undefined) continue;
+    const block = headBlock(referenced, content, HEAD_SNIPPET_CHARS_MAX);
+    if (used + block.length > HEAD_CONTEXT_CHARS_MAX) break;
+    blocks.push(block);
+    used += block.length + 2;
+  }
+
+  // The diff alone hides the code around the hunks, so lead with the whole file.
+  if (own !== undefined && own.length <= OWN_HEAD_CHARS_MAX) {
+    blocks.unshift(headBlock(path, own, OWN_HEAD_CHARS_MAX));
+  }
+  return blocks.join('\n\n');
+}
+
 export function buildReviewBody(input: {
   summary: string;
   verdict: Verdict;
@@ -186,6 +349,29 @@ function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Findi
     out.push({ path, line, severity, title: title || body.slice(0, 60), body: body || title });
   }
   return out;
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * Map findings onto the commit status RepoLens reports on the PR head.
+ * `failOn: 'never'` keeps the check informational (always green).
+ */
+export function statusForFindings(findings: Finding[], failOn: FailOn = 'critical'): ReviewStatus {
+  const counts = { critical: 0, warning: 0, nit: 0 };
+  for (const f of findings) counts[f.severity]++;
+  const parts: string[] = [];
+  if (counts.critical) parts.push(`${counts.critical} critical`);
+  if (counts.warning) parts.push(plural(counts.warning, 'warning'));
+  if (counts.nit) parts.push(plural(counts.nit, 'nit'));
+  const blocking =
+    failOn === 'critical' ? counts.critical > 0 : failOn === 'warning' ? counts.critical + counts.warning > 0 : false;
+  return {
+    state: blocking ? 'failure' : 'success',
+    description: parts.length ? parts.join(', ') : 'No blocking findings',
+  };
 }
 
 function severityRank(s: Severity): number {
@@ -281,15 +467,48 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const formatContext = deps.formatContext ?? defaultFormatContext;
   const maxFiles = deps.maxFiles ?? 40;
   const post = opts.post ?? true;
+  const failOn = deps.failOn ?? 'critical';
+  const statusContext = (deps.statusContext ?? '').trim();
 
-  const repo = db.getRepo(opts.repoId);
-  if (!repo) throw new Error(`Unknown repo: ${opts.repoId}`);
+  const found = db.getRepo(opts.repoId);
+  if (!found) throw new Error(`Unknown repo: ${opts.repoId}`);
+  // Aliased so the type stays narrowed inside the nested runReview().
+  const repo: RepoRow = found;
 
   const pr = await github.getPull(repo.owner, repo.name, opts.prNumber);
   const postCtx: PostContext = { db, github, llm, repo, pr, log };
 
-  if (!opts.force) {
-    const cached = db.findReview(opts.repoId, opts.prNumber, pr.headSha);
+  // Commit statuses need a GitHub repository and a head commit to attach to.
+  const statusEnabled = Boolean(statusContext) && opts.repoId.startsWith('github:') && Boolean(repo.owner && repo.name && pr.headSha);
+  const dashboardUrl = deps.publicUrl ? `${deps.publicUrl.replace(/\/+$/, '')}/#/reviews/${opts.repoId}` : undefined;
+  /** Reporting a status must never fail a review: failures become warnings. */
+  const setStatus = async (status: ReviewStatus, targetUrl: string | undefined, warnings: string[]): Promise<void> => {
+    if (!statusEnabled) return;
+    try {
+      await github.createCommitStatus(repo.owner, repo.name, pr.headSha, {
+        state: status.state,
+        context: statusContext,
+        description: status.description,
+        targetUrl: targetUrl || dashboardUrl,
+      });
+      log(`review: commit status ${status.state} on ${pr.headSha} (${statusContext})`);
+    } catch (err) {
+      const msg = `posting commit status failed: ${errMessage(err)}`;
+      warnings.push(msg);
+      log(`review: ${msg}`);
+    }
+  };
+
+  const cached = opts.force ? null : db.findReview(opts.repoId, opts.prNumber, pr.headSha);
+  const statusWarnings: string[] = [];
+  // A cached, already-posted review is not "in progress": go straight to its final state.
+  if (!cached || cached.posted !== 1) {
+    await setStatus({ state: 'pending', description: 'RepoLens review in progress' }, pr.htmlUrl, statusWarnings);
+  }
+
+  // Everything below the `pending` status runs inside this try: any escape without a
+  // terminal status would leave a required check pending, blocking the PR forever.
+  try {
     if (cached) {
       log(`review: reusing review #${cached.id} for ${opts.repoId}#${opts.prNumber} @ ${pr.headSha}`);
       let findings: Finding[] = [];
@@ -308,150 +527,217 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         findings,
         posted: cached.posted === 1,
         skippedFiles: [],
-        warnings: [],
+        warnings: statusWarnings,
       };
       if (post && cached.posted === 0) {
         // A previous run stored the review but failed (or was asked not) to post it.
         log(`review: cached review #${cached.id} was never posted; posting it now`);
         await postReview(postCtx, cachedResult);
       }
+      const cachedStatus = statusForFindings(cachedResult.findings, failOn);
+      await setStatus(cachedStatus, cachedResult.reviewUrl ?? pr.htmlUrl, cachedResult.warnings);
+      if (statusEnabled) cachedResult.status = cachedStatus;
       return cachedResult;
     }
+
+    const result = await runReview();
+    const status = statusForFindings(result.findings, failOn);
+    await setStatus(status, result.reviewUrl ?? pr.htmlUrl, result.warnings);
+    if (statusEnabled) result.status = status;
+    return result;
+  } catch (err) {
+    // The check must not stay pending forever when the review itself blows up.
+    // Descriptions are capped at 140 characters, so a long message would make the
+    // status call fail too and leave the check pending.
+    await setStatus(
+      { state: 'error', description: truncateDescription(`RepoLens review failed: ${errMessage(err)}`) },
+      pr.htmlUrl,
+      statusWarnings,
+    );
+    throw err;
   }
 
-  const diffText = await github.getPullDiff(repo.owner, repo.name, opts.prNumber);
-  const parsed = parseUnifiedDiff(diffText);
+  async function runReview(): Promise<ReviewResult> {
+    const diffText = await github.getPullDiff(repo.owner, repo.name, opts.prNumber);
+    const parsed = parseUnifiedDiff(diffText);
 
-  const skippedFiles: string[] = [];
-  const reviewable: DiffFile[] = [];
-  for (const f of parsed) {
-    const path = f.newPath;
-    if (f.binary || f.status === 'deleted' || !path || !isReviewablePath(path)) {
-      const label = path ?? f.oldPath ?? '(unknown)';
-      skippedFiles.push(label);
-      continue;
+    const warnings: string[] = [...statusWarnings];
+
+    // Every path the PR touches. Index chunks for these are stale by construction,
+    // so they are excluded from retrieval even when the file itself is not reviewed.
+    const changedPaths: string[] = [];
+    for (const f of parsed) {
+      if (f.status !== 'deleted' && f.newPath) changedPaths.push(f.newPath);
     }
-    if (changedNewLines(f).size === 0) {
-      skippedFiles.push(path);
-      continue;
+
+    const skippedFiles: string[] = [];
+    const reviewable: DiffFile[] = [];
+    for (const f of parsed) {
+      const path = f.newPath;
+      if (f.binary || f.status === 'deleted' || !path || !isReviewablePath(path)) {
+        const label = path ?? f.oldPath ?? '(unknown)';
+        skippedFiles.push(label);
+        continue;
+      }
+      if (changedNewLines(f).size === 0) {
+        skippedFiles.push(path);
+        continue;
+      }
+      reviewable.push(f);
     }
-    reviewable.push(f);
-  }
 
-  const files = reviewable.slice(0, maxFiles);
-  for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
+    const files = reviewable.slice(0, maxFiles);
+    for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
 
-  const warnings: string[] = [];
-
-  const perFile = await mapPool(files, llm.concurrency, async (file) => {
-    const path = file.newPath!;
-    const allowed = changedNewLines(file);
-    const addedText = file.hunks
-      .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
-      .join('\n');
-    const query = [path, ...identifiers(addedText)].join(' ');
-    let context = '';
-    try {
-      const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePath: path });
-      context = formatContext(chunks);
-    } catch (err) {
-      warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
+    // Fetch the PR head once for the whole review: the search index only knows the
+    // base branch, so without this the model judges new code against old exports.
+    const headContents = new Map<string, string>();
+    const fetchable = parsed
+      .filter((f) => f.status !== 'deleted' && !f.binary && f.newPath && isReviewablePath(f.newPath))
+      .map((f) => f.newPath!);
+    const toFetch = fetchable.slice(0, HEAD_FILES_MAX);
+    if (fetchable.length > toFetch.length) {
+      warnings.push(
+        `Post-change content fetched for ${toFetch.length} of ${fetchable.length} changed files (limit ${HEAD_FILES_MAX}).`,
+      );
     }
+    await mapPool(toFetch, HEAD_FETCH_CONCURRENCY, async (path) => {
+      try {
+        const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
+        if (content === null) {
+          // Absence is not a failure (a path can be unreadable or gone at the head);
+          // the file is simply reviewed without its post-change content.
+          log(`review: ${path}: no post-change content at ${shortSha(pr.headSha)}`);
+          return;
+        }
+        if (content.length > HEAD_FILE_CHARS_MAX) {
+          warnings.push(`${path}: post-change content skipped (${content.length} chars over the ${HEAD_FILE_CHARS_MAX} limit)`);
+          return;
+        }
+        headContents.set(path, content);
+      } catch (err) {
+        const msg = `${path}: fetching post-change content failed: ${errMessage(err)}`;
+        warnings.push(msg);
+        log(`review: ${msg}`);
+      }
+    });
+
+    const exportsByPath = buildExportIndex(headContents);
+
+    const perFile = await mapPool(files, llm.concurrency, async (file) => {
+      const path = file.newPath!;
+      const allowed = changedNewLines(file);
+      const addedText = file.hunks
+        .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
+        .join('\n');
+      const query = [path, ...identifiers(addedText)].join(' ');
+      const headContext = buildHeadContext({ path, addedText, headContents, exportsByPath });
+      let context = '';
+      try {
+        // Excluding every changed path keeps pre-change chunks of this PR's files
+        // out of the prompt; their post-change content is in `headContext` instead.
+        const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePaths: changedPaths });
+        context = formatContext(chunks);
+      } catch (err) {
+        warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
+      }
+      try {
+        const raw = await llm.complete({
+          system: FILE_REVIEW_SYSTEM_PROMPT,
+          messages: [
+            {
+              role: 'user',
+              content: buildFileReviewMessage({
+                prTitle: pr.title,
+                prBody: pr.body,
+                path,
+                status: file.status,
+                hunkText: hunkText(file),
+                headContext,
+                context,
+                instructions: repo.instructions,
+              }),
+            },
+          ],
+          json: true,
+          maxTokens: 2000,
+        });
+        return parseFindings(raw, file, allowed);
+      } catch (err) {
+        const msg = `${path}: ${errMessage(err)}`;
+        warnings.push(msg);
+        log(`review: ${msg}`);
+        return [] as Finding[];
+      }
+    });
+
+    const findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    const hasCritical = findings.some((f) => f.severity === 'critical');
+
+    let summary = '';
+    let verdict: Verdict = 'comment';
     try {
       const raw = await llm.complete({
-        system: FILE_REVIEW_SYSTEM_PROMPT,
+        system: SUMMARY_SYSTEM_PROMPT,
         messages: [
           {
             role: 'user',
-            content: buildFileReviewMessage({
+            content: buildSummaryMessage({
               prTitle: pr.title,
               prBody: pr.body,
-              path,
-              status: file.status,
-              hunkText: hunkText(file),
-              context,
-              instructions: repo.instructions,
+              files: files.map((f) => ({ path: f.newPath!, status: f.status })),
+              findings,
             }),
           },
         ],
         json: true,
-        maxTokens: 2000,
+        maxTokens: 800,
       });
-      return parseFindings(raw, file, allowed);
+      const obj = extractJson(raw) as Record<string, unknown>;
+      summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
+      verdict = toVerdict(obj?.verdict) ?? 'comment';
+      if (!summary) throw new Error('summary missing from model output');
     } catch (err) {
-      const msg = `${path}: ${errMessage(err)}`;
+      const msg = `summary: ${errMessage(err)}`;
       warnings.push(msg);
       log(`review: ${msg}`);
-      return [] as Finding[];
+      summary = `Reviewed ${files.length} files, ${findings.length} findings.`;
+      verdict = 'comment';
     }
-  });
+    if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
 
-  const findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-  const hasCritical = findings.some((f) => f.severity === 'critical');
+    if (!repo.last_commit) {
+      warnings.push('Repository has not been indexed; review ran without codebase context.');
+    }
 
-  let summary = '';
-  let verdict: Verdict = 'comment';
-  try {
-    const raw = await llm.complete({
-      system: SUMMARY_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: buildSummaryMessage({
-            prTitle: pr.title,
-            prBody: pr.body,
-            files: files.map((f) => ({ path: f.newPath!, status: f.status })),
-            findings,
-          }),
-        },
-      ],
-      json: true,
-      maxTokens: 800,
+    const row = db.insertReview({
+      repo_id: opts.repoId,
+      pr_number: opts.prNumber,
+      head_sha: pr.headSha,
+      status: 'done',
+      summary,
+      verdict,
+      comments_json: JSON.stringify(findings),
+      posted: 0,
+      error: null,
     });
-    const obj = extractJson(raw) as Record<string, unknown>;
-    summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
-    verdict = toVerdict(obj?.verdict) ?? 'comment';
-    if (!summary) throw new Error('summary missing from model output');
-  } catch (err) {
-    const msg = `summary: ${errMessage(err)}`;
-    warnings.push(msg);
-    log(`review: ${msg}`);
-    summary = `Reviewed ${files.length} files, ${findings.length} findings.`;
-    verdict = 'comment';
+
+    const result: ReviewResult = {
+      reviewId: row.id,
+      prNumber: opts.prNumber,
+      headSha: pr.headSha,
+      summary,
+      verdict,
+      findings,
+      posted: false,
+      skippedFiles,
+      warnings,
+    };
+
+    if (post) await postReview(postCtx, result);
+
+    return result;
   }
-  if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
-
-  if (!repo.last_commit) {
-    warnings.push('Repository has not been indexed; review ran without codebase context.');
-  }
-
-  const row = db.insertReview({
-    repo_id: opts.repoId,
-    pr_number: opts.prNumber,
-    head_sha: pr.headSha,
-    status: 'done',
-    summary,
-    verdict,
-    comments_json: JSON.stringify(findings),
-    posted: 0,
-    error: null,
-  });
-
-  const result: ReviewResult = {
-    reviewId: row.id,
-    prNumber: opts.prNumber,
-    headSha: pr.headSha,
-    summary,
-    verdict,
-    findings,
-    posted: false,
-    skippedFiles,
-    warnings,
-  };
-
-  if (post) await postReview(postCtx, result);
-
-  return result;
 }
 
 function errMessage(err: unknown): string {
