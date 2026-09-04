@@ -12,6 +12,9 @@ deny() {
   exit 0
 }
 
+# One merge per command: with several, only the last PR would be checked and pinned.
+[ "$(grep -o 'gh pr merge' <<<"$cmd" | wc -l)" -eq 1 ] || deny "Merge one pull request per command so each head is checked."
+
 # First non-flag token after "merge" is the PR (number, URL or branch); none means the current branch.
 pr=$(printf '%s' "$cmd" | sed -n 's/.*gh pr merge//p' | tr -s ' ' '\n' | grep -v '^-' | grep -m1 .)
 info=$(gh pr view ${pr:+"$pr"} --json headRefOid,url --jq '.headRefOid + " " + .url' 2>/dev/null) || info=''
