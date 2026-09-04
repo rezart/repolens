@@ -3,6 +3,7 @@ import { OpenAIEmbeddings, createEmbeddings } from '../src/embeddings/index.js';
 import { createProvider } from '../src/llm/index.js';
 import { ProviderError } from '../src/llm/types.js';
 import type { Config } from '../src/config.js';
+import type { UsageRecord } from '../src/usage/types.js';
 
 interface Call {
   url: string;
@@ -14,7 +15,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** Responds with one vector per input, echoing the input's position. */
-function embeddingFetch(opts: { dim?: number; failures?: Response[]; shuffle?: boolean } = {}) {
+function embeddingFetch(
+  opts: { dim?: number; failures?: Response[]; shuffle?: boolean; tokensPerText?: number } = {},
+) {
   const calls: Call[] = [];
   const failures = opts.failures ?? [];
   const dim = opts.dim ?? 3;
@@ -29,7 +32,8 @@ function embeddingFetch(opts: { dim?: number; failures?: Response[]; shuffle?: b
       embedding: [Number(text.replace(/\D/g, '')) || 0, ...Array.from({ length: dim - 1 }, () => 0.5)],
     }));
     if (opts.shuffle) data.reverse();
-    return jsonResponse({ object: 'list', data, model: body.model });
+    const usage = opts.tokensPerText === undefined ? undefined : { prompt_tokens: input.length * opts.tokensPerText };
+    return jsonResponse({ object: 'list', data, model: body.model, usage });
   };
   return { calls, fetch: fn as unknown as typeof fetch };
 }
@@ -192,6 +196,58 @@ describe('OpenAIEmbeddings', () => {
     expect((err as ProviderError).provider).toBe('embeddings');
     expect((err as ProviderError).message).toContain('request failed: ECONNREFUSED');
     expect(calls).toBe(2);
+  });
+
+  it('reports one usage record per batch, carrying that batch prompt tokens', async () => {
+    const f = embeddingFetch({ tokensPerText: 10 });
+    const seen: UsageRecord[] = [];
+    const e = new OpenAIEmbeddings({
+      baseUrl: 'http://x/v1',
+      apiKey: 'k',
+      model: 'text-embed',
+      fetch: f.fetch,
+      onUsage: (r) => seen.push(r),
+    });
+    await e.embed(Array.from({ length: 130 }, (_, i) => `t${i}`));
+    expect(f.calls).toHaveLength(3);
+    expect(seen).toEqual([640, 640, 20].map((prompt) => ({
+      provider: 'embeddings',
+      model: 'text-embed',
+      inputTokens: prompt,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 0,
+      costUsd: null,
+    })));
+  });
+
+  it('reports nothing when the response carries no usage', async () => {
+    const f = embeddingFetch();
+    const seen: UsageRecord[] = [];
+    const e = new OpenAIEmbeddings({
+      baseUrl: 'http://x/v1',
+      apiKey: 'k',
+      model: 'm',
+      fetch: f.fetch,
+      onUsage: (r) => seen.push(r),
+    });
+    await e.embed(['a', 'b']);
+    expect(seen).toEqual([]);
+  });
+
+  it('still returns vectors when the sink throws', async () => {
+    const f = embeddingFetch({ tokensPerText: 3 });
+    const e = new OpenAIEmbeddings({
+      baseUrl: 'http://x/v1',
+      apiKey: 'k',
+      model: 'm',
+      fetch: f.fetch,
+      onUsage: () => {
+        throw new Error('sink is broken');
+      },
+    });
+    const v = await e.embed(['t7']);
+    expect(v[0]![0]).toBe(7);
   });
 
   it('throws when the batch returns the wrong number of vectors', async () => {
