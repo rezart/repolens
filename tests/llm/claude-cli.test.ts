@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { ClaudeCliProvider, flattenMessages } from '../../src/llm/claude-cli.js';
 import { ProviderError } from '../../src/llm/types.js';
 import type { RunOptions, RunResult } from '../../src/llm/spawn.js';
+import type { UsageRecord } from '../../src/usage/types.js';
 
 interface Recorded {
   cmd: string;
@@ -262,6 +263,147 @@ describe('ClaudeCliProvider.stream', () => {
     const f = fakeRun({ code: 2, stderr: 'boom' });
     const p = new ClaudeCliProvider({ run: f.run });
     await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toThrow(/exited with code 2/);
+  });
+});
+
+/** The usage fields of a real `result` object, captured from a live run. */
+const liveUsageFields = {
+  total_cost_usd: 0.016316,
+  usage: {
+    input_tokens: 10,
+    cache_creation_input_tokens: 7508,
+    cache_read_input_tokens: 0,
+    output_tokens: 258,
+  },
+  modelUsage: {
+    'claude-haiku-4-5-20251001': {
+      inputTokens: 10,
+      outputTokens: 258,
+      costUSD: 0.016316,
+      canonicalModel: 'claude-haiku-4-5',
+    },
+  },
+};
+
+describe('ClaudeCliProvider usage reporting', () => {
+  it('reports usage from a completion, with the canonical model and reported cost', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'pong', ...liveUsageFields }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'haiku', run: f.run, onUsage: (r) => seen.push(r) });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'ping' }] })).resolves.toBe('pong');
+    expect(seen).toEqual([
+      {
+        provider: 'claude-cli',
+        model: 'claude-haiku-4-5',
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 7508,
+        outputTokens: 258,
+        costUsd: 0.016316,
+      },
+    ]);
+  });
+
+  it('reports usage from the result event of a stream', async () => {
+    const f = fakeRun({ stdout: streamJson(['po', 'ng'], 'pong', liveUsageFields) });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'haiku', run: f.run, onUsage: (r) => seen.push(r) });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'ping' }] }, () => {})).resolves.toBe('pong');
+    expect(seen).toEqual([
+      {
+        provider: 'claude-cli',
+        model: 'claude-haiku-4-5',
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 7508,
+        outputTokens: 258,
+        costUsd: 0.016316,
+      },
+    ]);
+  });
+
+  it('counts cache reads separately from fresh input', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({
+        type: 'result',
+        result: 'ok',
+        usage: { input_tokens: 4, cache_read_input_tokens: 9000, output_tokens: 12 },
+      }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'sonnet', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen[0]).toMatchObject({ inputTokens: 4, cachedInputTokens: 9000, cacheWriteTokens: 0, costUsd: null });
+  });
+
+  it('falls back to the configured model when modelUsage is absent', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({
+        type: 'result',
+        result: 'ok',
+        usage: { input_tokens: 3, output_tokens: 5 },
+      }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'sonnet', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen[0]!.model).toBe('sonnet');
+  });
+
+  it('falls back to the modelUsage key when it carries no canonical model', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({
+        type: 'result',
+        result: 'ok',
+        usage: { input_tokens: 3, output_tokens: 5 },
+        modelUsage: { 'claude-opus-4-6-20260101': { inputTokens: 3, outputTokens: 5 } },
+      }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'sonnet', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen[0]!.model).toBe('claude-opus-4-6-20260101');
+  });
+
+  it('reports nothing when the result carries no usage', async () => {
+    const f = fakeRun({ stdout: okStdout });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([]);
+  });
+
+  it('reports nothing when the CLI reported an error', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({ type: 'result', is_error: true, subtype: 'error_max_turns', result: 'nope', ...liveUsageFields }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toBeInstanceOf(ProviderError);
+    expect(seen).toEqual([]);
+  });
+
+  it('reports nothing when the stream reported an error', async () => {
+    const f = fakeRun({ stdout: streamJson([], '', { is_error: true, subtype: 'error_max_turns', ...liveUsageFields }) });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toBeInstanceOf(ProviderError);
+    expect(seen).toEqual([]);
+  });
+
+  it('survives a sink that throws', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({ type: 'result', result: 'pong', ...liveUsageFields }),
+    });
+    const p = new ClaudeCliProvider({
+      run: f.run,
+      onUsage: () => {
+        throw new Error('sink exploded');
+      },
+    });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'ping' }] })).resolves.toBe('pong');
   });
 });
 

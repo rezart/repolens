@@ -5,6 +5,7 @@ import { runProcess, sharedSemaphore, childEnv, lineSplitter } from './spawn.js'
 import type { RunProcess, Semaphore } from './spawn.js';
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
+import type { UsageSink } from '../usage/types.js';
 
 export const JSON_INSTRUCTION = 'Respond with a single JSON object and nothing else.';
 
@@ -18,6 +19,8 @@ export interface CliProviderOptions {
   cwd?: string;
   /** Thinking budget. Blank/undefined leaves the CLI default alone. */
   reasoningEffort?: ReasoningEffort | '';
+  /** Called once per successful call with the tokens and cost the CLI reported. */
+  onUsage?: UsageSink;
 }
 
 /**
@@ -44,10 +47,25 @@ export function withJsonInstruction(system: string | undefined, json: boolean | 
   return system ? `${system}\n\n${JSON_INSTRUCTION}` : JSON_INSTRUCTION;
 }
 
+/**
+ * The token counts a `result` object carries. `input_tokens` is already the
+ * fresh (uncached) input; cache reads and writes are counted separately.
+ */
+interface ClaudeCliUsage {
+  input_tokens?: unknown;
+  cache_creation_input_tokens?: unknown;
+  cache_read_input_tokens?: unknown;
+  output_tokens?: unknown;
+}
+
 interface ClaudeCliResult {
   result?: unknown;
   is_error?: boolean;
   subtype?: string;
+  total_cost_usd?: unknown;
+  usage?: ClaudeCliUsage;
+  /** Keyed by the dated model id; the entry names the canonical model. */
+  modelUsage?: Record<string, { canonicalModel?: unknown } | undefined>;
 }
 
 /**
@@ -77,6 +95,7 @@ export class ClaudeCliProvider implements LLMProvider {
   private readonly run: RunProcess;
   private readonly cwdOption: string | undefined;
   private readonly effort: ReasoningEffort | undefined;
+  private readonly onUsage: UsageSink | undefined;
   private tempDir: string | undefined;
   /** Shared per binary: two providers on the same CLI still run one process at a time. */
   private readonly gate: Semaphore;
@@ -89,7 +108,40 @@ export class ClaudeCliProvider implements LLMProvider {
     this.run = opts.run ?? runProcess;
     this.cwdOption = opts.cwd;
     this.effort = opts.reasoningEffort || undefined;
+    this.onUsage = opts.onUsage;
     this.gate = sharedSemaphore(`${this.name}:${this.bin}`);
+  }
+
+  /**
+   * Report the token counts of a successful run. Anything missing or
+   * unexpectedly shaped is skipped rather than guessed at, and a sink that
+   * throws must never turn a good completion into a failure.
+   */
+  private emitUsage(final: ClaudeCliResult | undefined): void {
+    if (!this.onUsage || !final) return;
+    const usage = final.usage;
+    if (!usage) return;
+    const inputTokens = usage.input_tokens;
+    const outputTokens = usage.output_tokens;
+    if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') return;
+
+    const entry = Object.entries(final.modelUsage ?? {})[0];
+    const canonical = entry?.[1]?.canonicalModel;
+    const model = typeof canonical === 'string' ? canonical : (entry?.[0] ?? this.model);
+
+    try {
+      this.onUsage({
+        provider: this.name,
+        model,
+        inputTokens,
+        cachedInputTokens: typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0,
+        cacheWriteTokens: typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0,
+        outputTokens,
+        costUsd: typeof final.total_cost_usd === 'number' ? final.total_cost_usd : null,
+      });
+    } catch {
+      // A broken usage sink is not a reason to fail the call.
+    }
   }
 
   /** An empty scratch directory so the CLI has no project context to read. */
@@ -168,6 +220,7 @@ export class ClaudeCliProvider implements LLMProvider {
     if (final?.is_error) {
       throw new ProviderError('claude-cli', `CLI reported an error (${final.subtype ?? 'unknown'})`, undefined, detail);
     }
+    this.emitUsage(final);
     // The `result` event carries the authoritative text; the deltas are a
     // best-effort preview and are used only if the CLI never emitted one.
     if (typeof final?.result === 'string') return final.result;
@@ -212,6 +265,7 @@ export class ClaudeCliProvider implements LLMProvider {
     if (typeof parsed.result !== 'string') {
       throw new ProviderError('claude-cli', 'output JSON had no string result', undefined, detail);
     }
+    this.emitUsage(parsed);
     return parsed.result;
   }
 }
