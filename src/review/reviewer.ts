@@ -30,6 +30,16 @@ export interface Finding {
   body: string;
 }
 
+/** Thrown when a new push lands on the PR mid-review; the fresh head gets its own review. */
+export class ReviewSupersededError extends Error {
+  constructor(
+    public readonly staleSha: string,
+    public readonly newSha: string,
+  ) {
+    super(`review of ${shortSha(staleSha)} abandoned: PR head moved to ${shortSha(newSha)}`);
+  }
+}
+
 export interface ReviewResult {
   reviewId: number;
   prNumber: number;
@@ -546,6 +556,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (statusEnabled) result.status = status;
     return result;
   } catch (err) {
+    // A superseded review is not a failure; the stale sha's status is left as is
+    // (nobody merges it) and the new head is reviewed by the trigger that moved it.
+    if (err instanceof ReviewSupersededError) throw err;
     // The check must not stay pending forever when the review itself blows up.
     // Descriptions are capped at 140 characters, so a long message would make the
     // status call fail too and leave the check pending.
@@ -624,6 +637,17 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const exportsByPath = buildExportIndex(headContents);
 
+    // Each file review is an expensive inference call: bail before it if the PR moved on.
+    const assertHeadUnchanged = async () => {
+      let sha: string | undefined;
+      try {
+        sha = (await github.getPull(repo.owner, repo.name, opts.prNumber)).headSha;
+      } catch {
+        return; // a flaky API call must not abort a review that could still be posted
+      }
+      if (sha && sha !== pr.headSha) throw new ReviewSupersededError(pr.headSha, sha);
+    };
+
     const perFile = await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath!;
       const allowed = changedNewLines(file);
@@ -641,6 +665,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
       }
+      await assertHeadUnchanged();
       try {
         const raw = await llm.complete({
           system: FILE_REVIEW_SYSTEM_PROMPT,
@@ -674,6 +699,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     const hasCritical = findings.some((f) => f.severity === 'critical');
 
+    await assertHeadUnchanged();
     let summary = '';
     let verdict: Verdict = 'comment';
     try {

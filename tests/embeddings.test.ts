@@ -45,7 +45,7 @@ function baseConfig(overrides: Partial<Config> = {}): Config {
     pollIntervalSeconds: 0,
     chatProvider: '',
     chatModel: '',
-    review: { statusContext: 'repolens/review', failOn: 'critical' },
+    review: { statusContext: 'repolens/review', failOn: 'critical', settleSeconds: 0 },
     port: 3000,
     publicUrl: '',
     llm: {

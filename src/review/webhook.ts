@@ -1,5 +1,5 @@
 import type { AppDeps } from '../app.js';
-import { enqueueReview, enqueueIndex } from '../app.js';
+import { enqueueIndex, scheduleReview } from '../app.js';
 import { answerQuestion } from '../query/answer.js';
 import { parseUnifiedDiff, hunkText } from './diff.js';
 
@@ -65,8 +65,8 @@ function handlePullRequest(deps: AppDeps, p: PullRequestEvent): WebhookOutcome {
   if (!p.action || !REVIEW_ACTIONS.has(p.action)) return { action: 'ignored', reason: `action ${p.action}` };
   if (p.pull_request?.draft) return { action: 'ignored', reason: 'draft PR' };
   if (!deps.db.getRepo(repoId)) return { action: 'ignored', reason: `${repoId} is not indexed by RepoLens` };
-  const job = enqueueReview(deps, repoId, number, { post: true });
-  return { action: 'review', jobId: job.id, repository: repoId };
+  scheduleReview(deps, repoId, number);
+  return { action: 'review', repository: repoId };
 }
 
 /** A push to the indexed branch refreshes the index so reviews and answers see the new code. */

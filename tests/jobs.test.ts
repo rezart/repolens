@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { openDb, type Db } from '../src/db.js';
 import { JobQueue } from '../src/jobs.js';
 
@@ -54,5 +54,26 @@ describe('JobQueue', () => {
     expect(db.getJob(a.id)?.status).toBe('error');
     expect(db.getJob(a.id)?.error).toBe('boom');
     expect(db.getJob(b.id)?.status).toBe('done');
+  });
+});
+
+describe('JobQueue.schedule', () => {
+  it('debounces: the callback runs once, a delay after the last call', () => {
+    vi.useFakeTimers();
+    try {
+      const q = new JobQueue(openDb(':memory:'));
+      let runs = 0;
+      q.schedule('k', 1000, () => runs++);
+      vi.advanceTimersByTime(500);
+      q.schedule('k', 1000, () => runs++);
+      expect(q.scheduled('k')).toBe(true);
+      vi.advanceTimersByTime(900);
+      expect(runs).toBe(0);
+      vi.advanceTimersByTime(200);
+      expect(runs).toBe(1);
+      expect(q.scheduled('k')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

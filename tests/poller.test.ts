@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,8 +16,8 @@ function pr(number: number, headSha: string, draft = false): PullRequest {
 
 const fake: AppDeps['llm'] = { name: 'fake', model: 'x', concurrency: 1, complete: async () => '{"findings":[]}' };
 
-function makeDeps(github: Partial<GitHubClient>): AppDeps {
-  const config = loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-poll-')) });
+function makeDeps(github: Partial<GitHubClient>, env: Record<string, string> = {}): AppDeps {
+  const config = loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-poll-')), REVIEW_SETTLE_SECONDS: '0', ...env });
   const db = openDb(':memory:');
   return {
     config,
@@ -78,5 +78,24 @@ describe('pollOnce', () => {
     const out = await pollOnce(deps);
     expect(out.errors).toEqual(['github:o/n: GitHub 403']);
     expect(deps.db.listJobs()).toHaveLength(0);
+  });
+});
+
+describe('pollOnce with a settle window', () => {
+  it('waits for the window before queuing and does not restart it on the next poll', async () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({ getBranchHead: async () => 'same', listOpenPulls: async () => [pr(1, 'h1')] }, { REVIEW_SETTLE_SECONDS: '300' });
+      deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+      deps.db.setRepoStatus('github:o/n', 'ready', { last_commit: 'same' });
+      expect((await pollOnce(deps)).reviewed).toEqual([{ repository: 'github:o/n', prNumber: 1 }]);
+      expect(deps.db.listJobs()).toEqual([]);
+      vi.advanceTimersByTime(200_000);
+      expect((await pollOnce(deps)).reviewed).toEqual([]);
+      vi.advanceTimersByTime(101_000);
+      expect(deps.db.listJobs().map((j) => [j.kind, j.pr_number])).toEqual([['review', 1]]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

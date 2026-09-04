@@ -33,6 +33,8 @@ const envSchema = z.object({
   REVIEW_STATUS_CONTEXT: z.string().default('repolens/review'),
   /** Which finding severity makes the status fail: critical | warning | never. */
   REVIEW_FAIL_ON: z.enum(['critical', 'warning', 'never']).default('critical'),
+  /** Seconds a PR must go without a new push before an automatic review starts. 0 reviews immediately. */
+  REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(300),
 });
 
 export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli';
@@ -58,7 +60,7 @@ export interface Config {
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
   chatModel: string;
-  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never' };
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number };
 }
 
 export class ConfigError extends Error {}
@@ -104,7 +106,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     chatProvider: e.CHAT_PROVIDER,
     chatModel: e.CHAT_MODEL,
-    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON },
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS },
     github: {
       token: e.GITHUB_TOKEN,
       apiUrl: e.GITHUB_API_URL,
