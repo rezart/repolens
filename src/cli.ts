@@ -2,7 +2,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
 import { startServer, buildDeps } from './server.js';
 import { enqueueIndex, enqueueReview, normalizeRepoId } from './app.js';
-import { parseRemote } from './indexer/git.js';
+import { parseRemote, repoIdOf } from './indexer/git.js';
 import { answerQuestion } from './query/answer.js';
 
 function loadDotEnv() {
@@ -17,8 +17,8 @@ function loadDotEnv() {
 function usage(): never {
   console.error(`Usage:
   repolens serve
-  repolens index <owner/name | url> [--branch <b>]
-  repolens ask <github:owner/name> "<question>"
+  repolens index <owner/name | github url | local path> [--branch <b>]
+  repolens ask <github:owner/name | local:name> "<question>"
   repolens review <github:owner/name> <pr-number> [--post] [--force]`);
   process.exit(1);
 }
@@ -43,7 +43,7 @@ async function main() {
       if (!args[0]) usage();
       const deps = buildDeps(config, log);
       const parsed = parseRemote(args[0]);
-      const id = `github:${parsed.owner}/${parsed.name}`;
+      const id = repoIdOf(parsed);
       // '' means "use the remote's default branch"; the index job resolves it.
       deps.db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: flag(args, '--branch') ?? '' });
       const job = enqueueIndex(deps, id);

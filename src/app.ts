@@ -10,7 +10,7 @@ import type { LLMProvider } from './llm/types.js';
 import type { EmbeddingProvider } from './embeddings/types.js';
 import type { RetrieveFn } from './search/types.js';
 import { JobQueue } from './jobs.js';
-import { parseRemote, repoIdFor, RepoCheckout } from './indexer/git.js';
+import { parseRemote, repoIdFor, repoIdOf, RepoCheckout } from './indexer/git.js';
 import { indexRepo } from './indexer/indexer.js';
 import { answerQuestion } from './query/answer.js';
 import { reviewPullRequest } from './review/reviewer.js';
@@ -79,7 +79,7 @@ export function checkoutFor(deps: Pick<AppDeps, 'config'>, repo: { id: string; r
  */
 export function normalizeRepoId(ref: string | { remote?: string; repository: string }): string {
   const value = typeof ref === 'string' ? ref : ref.repository;
-  return value.startsWith('github:') ? value.toLowerCase() : repoIdFor(value);
+  return /^(github|local):/.test(value) ? value.toLowerCase() : repoIdFor(value);
 }
 
 export function enqueueIndex(deps: AppDeps, repoId: string) {
@@ -110,6 +110,7 @@ export function enqueueIndex(deps: AppDeps, repoId: string) {
 export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, opts: { post?: boolean; force?: boolean } = {}) {
   const repo = deps.db.getRepo(repoId);
   if (!repo) throw new Error(`Unknown repository ${repoId}`);
+  if (!repoId.startsWith('github:')) throw new Error(`Pull request review needs a GitHub repository; ${repoId} is local`);
   return deps.jobs.enqueue('review', repoId, async (ctx) => {
     ctx.progress(`reviewing PR #${prNumber}`);
     const result = await reviewPullRequest(
@@ -165,9 +166,17 @@ export function createApp(deps: AppDeps): Hono {
   app.post('/api/repositories', async (c) => {
     const body = addRepoSchema.safeParse(await c.req.json().catch(() => ({})));
     if (!body.success) return c.json({ error: body.error.message }, 400);
-    if (body.data.remote !== 'github') return c.json({ error: 'Only remote "github" is supported' }, 400);
-    const parsed = parseRemote(body.data.repository);
-    const id = `github:${parsed.owner}/${parsed.name}`;
+    if (body.data.remote !== 'github' && body.data.remote !== 'local') {
+      return c.json({ error: 'remote must be "github" or "local"' }, 400);
+    }
+    let parsed;
+    try {
+      parsed = parseRemote(body.data.repository);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    if (parsed.host !== body.data.remote) return c.json({ error: `${body.data.repository} is not a ${body.data.remote} repository` }, 400);
+    const id = repoIdOf(parsed);
     // An unset branch is stored as '' and resolved from the remote by the index job.
     const repo = db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: body.data.branch ?? '' });
     const job = enqueueIndex(deps, id);

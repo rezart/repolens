@@ -82,6 +82,9 @@ export class ClaudeCliProvider implements LLMProvider {
 
   private async runOnce(req: CompleteRequest): Promise<string> {
     const system = withJsonInstruction(req.system, req.json);
+    // Deliberately no `--bare`: it skips keychain reads, so the CLI cannot see the
+    // user's subscription login and answers "Not logged in". Isolation comes from
+    // `--tools ''`, no session persistence, and an empty scratch cwd instead.
     const args = [
       '-p',
       '--output-format',

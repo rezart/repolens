@@ -35,9 +35,26 @@ export function rrf(rankings: number[][], k = RRF_K): Map<number, number> {
 
 /** Changelogs and release notes mention every identifier; keep them but rank code above them. */
 const LOW_SIGNAL_PATH = /(^|\/)(changelog|changes|history|release[-_]?notes|news)(\.(md|markdown|txt|rst|adoc))?$/i;
+/** Tests and docs repeat the names of the code they describe; the implementation should win ties. */
+const TEST_PATH = /(^|\/)(tests?|__tests__|spec|specs|fixtures?|testdata)\/|\.(test|spec)\.[a-z]+$|_test\.[a-z]+$/i;
+const DOC_PATH = /(^|\/)(docs?|documentation)\/|\.(md|markdown|rst|adoc|txt)$/i;
 
-export function pathWeight(path: string): number {
-  return LOW_SIGNAL_PATH.test(path) ? 0.6 : 1;
+/**
+ * Static prior for a path: source code 1.0, docs 0.8, tests 0.7, changelogs 0.6.
+ * Query terms that appear in the path add a boost so `src/llm/claude-cli.ts`
+ * outranks a test that merely mentions the same identifiers.
+ */
+export function pathWeight(path: string, queryTokens: string[] = []): number {
+  let w = 1;
+  if (LOW_SIGNAL_PATH.test(path)) w = 0.6;
+  else if (TEST_PATH.test(path)) w = 0.7;
+  else if (DOC_PATH.test(path)) w = 0.8;
+  const lower = path.toLowerCase();
+  let matches = 0;
+  for (const t of queryTokens) {
+    if (t.length >= 3 && lower.includes(t)) matches++;
+  }
+  return w * (1 + Math.min(matches, 3) * 0.25);
 }
 
 function toRetrieved(chunk: ChunkRow, score: number): RetrievedChunk {
@@ -89,7 +106,7 @@ export function createRetriever({ db, embeddings }: { db: Db; embeddings?: Embed
         const chunk = chunks.get(id);
         if (!chunk) return [];
         if (req.excludePath && chunk.path === req.excludePath) return [];
-        return [toRetrieved(chunk, score * pathWeight(chunk.path))];
+        return [toRetrieved(chunk, score * pathWeight(chunk.path, tokens))];
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);

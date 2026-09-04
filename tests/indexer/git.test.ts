@@ -18,6 +18,19 @@ async function commitAll(cwd: string, message: string) {
   await git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', message], cwd);
 }
 
+describe('parseRemote (local paths)', () => {
+  it('accepts a path to a git working tree and derives a local id', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'repolens-Local-'));
+    mkdirSync(join(dir, '.git'));
+    const p = parseRemote(dir);
+    expect(p.host).toBe('local');
+    expect(p.url).toBe(dir);
+    expect(p.name).toBe(dir.split('/').pop()!.toLowerCase());
+    expect(repoIdFor(dir)).toBe(`local:${p.name}`);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe('parseRemote', () => {
   it('accepts the common github remote spellings', () => {
     for (const remote of [
@@ -49,6 +62,7 @@ describe('parseRemote', () => {
 
   it('throws on unsupported remotes', () => {
     expect(() => parseRemote('https://gitlab.com/o/n')).toThrow(/Unsupported remote/);
+    expect(() => parseRemote('/definitely/not/a/repo')).toThrow(/Unsupported remote/);
     expect(() => parseRemote('')).toThrow(/Unsupported remote/);
     expect(() => parseRemote('not a remote at all')).toThrow(/Unsupported remote/);
   });

@@ -182,4 +182,10 @@ describe('pathWeight', () => {
     expect(pathWeight('src/history.ts')).toBe(1);
     expect(pathWeight('lib/router/index.js')).toBe(1);
   });
+  it('ranks source above tests and docs, and boosts path matches', () => {
+    expect(pathWeight('tests/llm/claude-cli.test.ts')).toBeLessThan(pathWeight('src/llm/claude-cli.ts'));
+    expect(pathWeight('docs/plans/design.md')).toBeLessThan(pathWeight('src/db.ts'));
+    expect(pathWeight('src/llm/claude-cli.ts', ['claude', 'cli'])).toBeGreaterThan(pathWeight('src/llm/openrouter.ts', ['claude', 'cli']));
+    expect(pathWeight('src/a.ts', ['zz'])).toBe(1);
+  });
 });

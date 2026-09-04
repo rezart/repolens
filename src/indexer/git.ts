@@ -4,10 +4,10 @@ import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
 export interface ParsedRemote {
-  host: 'github';
+  host: 'github' | 'local';
   owner: string;
   name: string;
-  /** Normalised clone url. */
+  /** Normalised clone url (an absolute path for local repositories). */
   url: string;
 }
 
@@ -21,6 +21,8 @@ const SHORTHAND_RE = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?$/;
  */
 export function parseRemote(remote: string): ParsedRemote {
   const s = (remote ?? '').trim().replace(/\/+$/, '');
+  const local = parseLocalPath(s);
+  if (local) return local;
   const m = GITHUB_RE.exec(s) ?? SHORTHAND_RE.exec(s);
   if (!m || !m[1] || !m[2] || m[1] === '.' || m[2] === '.') {
     throw new Error(`Unsupported remote: ${remote}`);
@@ -30,10 +32,34 @@ export function parseRemote(remote: string): ParsedRemote {
   return { host: 'github', owner, name, url: `https://github.com/${owner}/${name}.git` };
 }
 
+/**
+ * A filesystem path to a git repository (working tree or bare). Recognised when it
+ * looks like a path (`/`, `./`, `../`, `~/`) or simply exists on disk.
+ */
+function parseLocalPath(s: string): ParsedRemote | null {
+  if (!s) return null;
+  const looksLikePath = /^(\/|\.\.?\/|~\/)/.test(s);
+  const expanded = s.startsWith('~/') ? join(process.env.HOME ?? '', s.slice(2)) : s;
+  if (!looksLikePath && !existsSync(expanded)) return null;
+  const abs = resolve(expanded);
+  const isRepo = existsSync(join(abs, '.git')) || (existsSync(join(abs, 'HEAD')) && existsSync(join(abs, 'objects')));
+  if (!isRepo) throw new Error(`Unsupported remote: ${s} is not a git repository`);
+  const name = abs
+    .split('/')
+    .filter(Boolean)
+    .pop()!
+    .replace(/\.git$/, '')
+    .toLowerCase();
+  return { host: 'local', owner: 'local', name, url: abs };
+}
+
 /** Stable repo id used as the primary key in the database. */
+export function repoIdOf(parsed: ParsedRemote): string {
+  return parsed.host === 'local' ? `local:${parsed.name}` : `github:${parsed.owner}/${parsed.name}`;
+}
+
 export function repoIdFor(remote: string): string {
-  const { owner, name } = parseRemote(remote);
-  return `github:${owner}/${name}`;
+  return repoIdOf(parseRemote(remote));
 }
 
 export interface GitRunOptions {
