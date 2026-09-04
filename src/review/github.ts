@@ -41,6 +41,12 @@ export interface ExistingReviewComment {
   user: string;
 }
 
+export interface PullCommit {
+  sha: string;
+  /** First line of the commit message. */
+  message: string;
+}
+
 export type CommitStatusState = 'pending' | 'success' | 'failure' | 'error';
 
 export interface CommitStatusInput {
@@ -171,6 +177,27 @@ export class GitHubClient {
       allow: [404],
     });
     if (res.status === 404) return null;
+    return res.text;
+  }
+
+  /** Commits on the pull request, oldest first (first page of 100). */
+  async listPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]> {
+    const raw = await this.json<Array<{ sha?: string; commit?: { message?: string } }>>(
+      `/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`,
+    );
+    return (raw ?? []).map((c) => ({ sha: c.sha ?? '', message: (c.commit?.message ?? '').split('\n')[0] }));
+  }
+
+  /**
+   * Unified diff from `base` to `head`, or null when GitHub cannot compare them
+   * (a force push removed the old head, or the shas are unrelated).
+   */
+  async compareDiff(owner: string, repo: string, base: string, head: string): Promise<string | null> {
+    const res = await this.request(
+      `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
+      { accept: 'application/vnd.github.v3.diff', allow: [404, 422] },
+    );
+    if (res.status === 404 || res.status === 422) return null;
     return res.text;
   }
 

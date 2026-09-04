@@ -444,6 +444,20 @@ export class Db {
       .get(repoId, prNumber, headSha) as ReviewRow | undefined;
   }
 
+  /** Newest finished review of a pull request, whatever head it reviewed. */
+  findLatestReview(repoId: string, prNumber: number): ReviewRow | undefined {
+    return this.raw
+      .prepare(`select * from reviews where repo_id=? and pr_number=? and status='done' order by id desc limit 1`)
+      .get(repoId, prNumber) as ReviewRow | undefined;
+  }
+
+  countPrReviews(repoId: string, prNumber: number): number {
+    const row = this.raw
+      .prepare(`select count(*) as n from reviews where repo_id=? and pr_number=? and status='done'`)
+      .get(repoId, prNumber) as { n: number };
+    return row.n;
+  }
+
   listReviews(repoId?: string, limit = 50, offset = 0): ReviewRow[] {
     if (repoId) {
       return this.raw

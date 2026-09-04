@@ -348,3 +348,41 @@ describe('verifyWebhookSignature', () => {
     expect(verifyWebhookSignature('', body, sig)).toBe(false);
   });
 });
+
+describe('GitHubClient.listPullCommits', () => {
+  it('returns sha and message subject, oldest first, from the pull commits endpoint', async () => {
+    const { f, gh } = client([
+      jsonResponse([
+        { sha: 'aaaa1111', commit: { message: 'feat: first\n\nbody' } },
+        { sha: 'bbbb2222', commit: { message: 'fix: second' } },
+      ]),
+    ]);
+    const commits = await gh.listPullCommits('o', 'r', 42);
+    expect(f.calls[0].url).toBe('https://api.github.com/repos/o/r/pulls/42/commits?per_page=100');
+    expect(commits).toEqual([
+      { sha: 'aaaa1111', message: 'feat: first' },
+      { sha: 'bbbb2222', message: 'fix: second' },
+    ]);
+  });
+});
+
+describe('GitHubClient.compareDiff', () => {
+  it('requests the diff media type for base...head', async () => {
+    const { f, gh } = client([textResponse('diff --git a/x b/x\n')]);
+    const diff = await gh.compareDiff('o', 'r', 'oldsha', 'newsha');
+    expect(f.calls[0].url).toBe('https://api.github.com/repos/o/r/compare/oldsha...newsha');
+    expect(f.calls[0].headers.Accept).toBe('application/vnd.github.v3.diff');
+    expect(diff).toBe('diff --git a/x b/x\n');
+  });
+
+  it('returns null when the compare cannot be produced (404 or 422)', async () => {
+    const { gh } = client([textResponse('gone', 404), textResponse('bad', 422)]);
+    expect(await gh.compareDiff('o', 'r', 'a', 'b')).toBeNull();
+    expect(await gh.compareDiff('o', 'r', 'a', 'b')).toBeNull();
+  });
+
+  it('still throws on other errors', async () => {
+    const { gh } = client([textResponse('nope', 500)]);
+    await expect(gh.compareDiff('o', 'r', 'a', 'b')).rejects.toThrow('GitHub 500');
+  });
+});
