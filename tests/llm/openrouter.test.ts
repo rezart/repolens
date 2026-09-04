@@ -1,0 +1,150 @@
+import { describe, it, expect } from 'vitest';
+import { OpenRouterProvider } from '../../src/llm/openrouter.js';
+import { ProviderError } from '../../src/llm/types.js';
+
+interface Call {
+  url: string;
+  init: RequestInit;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function fakeFetch(responses: Response[]) {
+  const calls: Call[] = [];
+  const fn = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    const next = responses.shift();
+    if (!next) throw new Error('unexpected extra fetch call');
+    return next;
+  };
+  return { calls, fetch: fn as unknown as typeof fetch };
+}
+
+const ok = () => jsonResponse({ choices: [{ message: { role: 'assistant', content: 'hello there' } }] });
+
+describe('OpenRouterProvider', () => {
+  it('exposes name, model and concurrency', () => {
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'anthropic/claude-sonnet-4.5' });
+    expect(p.name).toBe('openrouter');
+    expect(p.model).toBe('anthropic/claude-sonnet-4.5');
+    expect(p.concurrency).toBe(4);
+  });
+
+  it('posts the expected request shape and returns the message content', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'secret-key', model: 'm1', fetch: f.fetch });
+    const out = await p.complete({
+      system: 'you are terse',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'yo' },
+        { role: 'user', content: 'again' },
+      ],
+      maxTokens: 123,
+      temperature: 0.2,
+    });
+    expect(out).toBe('hello there');
+    expect(f.calls).toHaveLength(1);
+    const call = f.calls[0]!;
+    expect(call.url).toBe('https://openrouter.ai/api/v1/chat/completions');
+    expect(call.init.method).toBe('POST');
+    const headers = call.init.headers as Record<string, string>;
+    expect(headers['Authorization']).toBe('Bearer secret-key');
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers['HTTP-Referer']).toBe('https://github.com/repolens');
+    expect(headers['X-Title']).toBe('RepoLens');
+    const body = JSON.parse(call.init.body as string);
+    expect(body.model).toBe('m1');
+    expect(body.max_tokens).toBe(123);
+    expect(body.temperature).toBe(0.2);
+    expect(body.response_format).toBeUndefined();
+    expect(body.messages).toEqual([
+      { role: 'system', content: 'you are terse' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'yo' },
+      { role: 'user', content: 'again' },
+    ]);
+  });
+
+  it('omits the system message when none is given', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    const body = JSON.parse(f.calls[0]!.init.body as string);
+    expect(body.messages).toEqual([{ role: 'user', content: 'hi' }]);
+    expect(body.max_tokens).toBeUndefined();
+  });
+
+  it('requests a json object when json is set', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }], json: true });
+    const body = JSON.parse(f.calls[0]!.init.body as string);
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('honours a custom base url without a trailing slash problem', async () => {
+    const f = fakeFetch([ok()]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', baseUrl: 'http://local/v1/', fetch: f.fetch });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.url).toBe('http://local/v1/chat/completions');
+  });
+
+  it('retries a 429 then succeeds', async () => {
+    const f = fakeFetch([jsonResponse({ error: 'slow down' }, 429), ok()]);
+    const slept: number[] = [];
+    const p = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm1',
+      fetch: f.fetch,
+      sleep: async (ms: number) => {
+        slept.push(ms);
+      },
+    });
+    const out = await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(out).toBe('hello there');
+    expect(f.calls).toHaveLength(2);
+    expect(slept).toHaveLength(1);
+  });
+
+  it('retries 5xx up to 3 attempts then throws', async () => {
+    const f = fakeFetch([
+      jsonResponse({ e: 1 }, 500),
+      jsonResponse({ e: 2 }, 502),
+      jsonResponse({ e: 3 }, 503),
+    ]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, sleep: async () => {} });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toMatchObject({
+      name: 'ProviderError',
+      status: 503,
+    });
+    expect(f.calls).toHaveLength(3);
+  });
+
+  it('throws a ProviderError with the status on a 400', async () => {
+    const f = fakeFetch([new Response('bad model', { status: 400 })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, sleep: async () => {} });
+    const err = await p.complete({ messages: [{ role: 'user', content: 'hi' }] }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ProviderError);
+    const pe = err as ProviderError;
+    expect(pe.provider).toBe('openrouter');
+    expect(pe.status).toBe(400);
+    expect(pe.message).toContain('HTTP 400');
+    expect(pe.detail).toContain('bad model');
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('throws when the response has no content', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toBeInstanceOf(ProviderError);
+  });
+});
