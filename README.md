@@ -102,12 +102,14 @@ npm run cli -- review github:owner/name 42 --post
 
 ### GitHub setup
 
+RepoLens can learn about new changes two ways. **Polling** (default, every 5 minutes) needs no inbound network access: it reindexes when the tracked branch moves and reviews any open, non-draft PR whose head commit hasn't been reviewed. **Webhooks** react instantly but need the server reachable from the internet (a reverse proxy or a Cloudflare Tunnel). Both can be on at once; reviews are deduped by head commit.
+
 1. Create a token with `repo` scope (classic PAT) or a fine-grained token with *Contents: read* and *Pull requests: read & write*. Put it in `GITHUB_TOKEN`. Private repos are cloned with this token.
-2. In the repository (or org) settings add a webhook:
+2. (Webhooks only) In the repository (or org) settings add a webhook:
    - Payload URL: `https://<your host>/webhooks/github`
    - Content type: `application/json`
    - Secret: the value of `GITHUB_WEBHOOK_SECRET` (required; the endpoint returns 503 without it)
-   - Events: *Pull requests* and *Issue comments*
+   - Events: *Pull requests*, *Issue comments* and *Pushes*
 3. Index the repository (API, CLI, or dashboard). New and updated PRs are then reviewed automatically and the review is posted to the PR. Comments that mention `REVIEW_BOT_HANDLE` (default `@repolens`) get an answer.
 
 Per-repository review instructions (coding standards, what to ignore) can be set in the dashboard's Settings tab or via `PUT /api/repositories/:id/instructions`.
@@ -148,6 +150,7 @@ See `.env.example` for every variable. The important ones:
 | `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews |
 | `GITHUB_WEBHOOK_SECRET` | | Verifies webhook payloads. The webhook endpoint refuses requests until this is set |
 | `REVIEW_BOT_HANDLE` | `@repolens` | Mention that triggers PR chat |
+| `REPOLENS_POLL_INTERVAL` | `300` | Seconds between GitHub polls for new commits and PRs. `0` disables polling |
 
 ## Docker
 
@@ -159,7 +162,7 @@ The Docker image works with `LLM_PROVIDER=openrouter`. The CLI providers need th
 
 ## How review works
 
-1. The webhook (or API call) queues a review job. Jobs run one at a time.
+1. A poll, a webhook, or an API call queues a review job. Jobs run one at a time. A push to the tracked branch queues an incremental reindex first, so reviews see current code.
 2. The PR diff is fetched from GitHub and split into files and hunks. Lockfiles, vendored, generated and binary files are skipped.
 3. For every changed file, related code is retrieved from the index using the file path and the identifiers in the added lines, and the model is asked for findings as JSON. Findings that don't point at an added line are dropped.
 4. A summary and verdict are generated, then a single GitHub review is posted: the summary as the review body and each finding as an inline comment on the changed line. Findings already commented on a previous run are skipped, so `synchronize` events don't pile up duplicates.

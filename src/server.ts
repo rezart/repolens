@@ -8,6 +8,7 @@ import { createRetriever } from './search/retrieve.js';
 import { GitHubClient } from './review/github.js';
 import { JobQueue } from './jobs.js';
 import { createApp, type AppDeps } from './app.js';
+import { startPoller } from './poller.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
   const db = openDb(join(config.dataDir, 'repolens.db'));
@@ -46,5 +47,12 @@ export function startServer(config: Config, log: (msg: string) => void = console
       log('WARNING: GITHUB_WEBHOOK_SECRET is empty; /webhooks/github will reject all deliveries with 503');
     }
   });
-  return { server, deps };
+  let poller: { stop: () => void } | undefined;
+  if (config.pollIntervalSeconds > 0) {
+    poller = startPoller(deps, config.pollIntervalSeconds * 1000, log);
+    log(`Polling GitHub every ${config.pollIntervalSeconds}s for new commits and pull requests`);
+  } else {
+    log('Polling disabled (REPOLENS_POLL_INTERVAL=0); relying on webhooks');
+  }
+  return { server, deps, poller };
 }

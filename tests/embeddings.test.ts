@@ -38,6 +38,7 @@ function baseConfig(overrides: Partial<Config> = {}): Config {
   return {
     dataDir: './data',
     apiToken: '',
+    pollIntervalSeconds: 0,
     port: 3000,
     publicUrl: '',
     llm: {

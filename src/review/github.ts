@@ -101,6 +101,10 @@ export class GitHubClient {
 
   async getPull(owner: string, repo: string, number: number): Promise<PullRequest> {
     const raw = await this.json<PullApiPayload>(`/repos/${owner}/${repo}/pulls/${number}`);
+    return this.mapPull(raw);
+  }
+
+  private mapPull(raw: PullApiPayload): PullRequest {
     return {
       number: raw.number,
       title: raw.title ?? '',
@@ -113,6 +117,18 @@ export class GitHubClient {
       htmlUrl: raw.html_url ?? '',
       draft: Boolean(raw.draft),
     };
+  }
+
+  /** Head commit sha of a branch. */
+  async getBranchHead(owner: string, repo: string, branch: string): Promise<string> {
+    const raw = await this.json<{ commit?: { sha?: string } }>(`/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`);
+    return raw?.commit?.sha ?? '';
+  }
+
+  /** Open pull requests, newest first (first page of 100). */
+  async listOpenPulls(owner: string, repo: string): Promise<PullRequest[]> {
+    const raw = await this.json<PullApiPayload[]>(`/repos/${owner}/${repo}/pulls?state=open&per_page=100&sort=updated&direction=desc`);
+    return (raw ?? []).map((r) => this.mapPull(r));
   }
 
   async getPullDiff(owner: string, repo: string, number: number): Promise<string> {

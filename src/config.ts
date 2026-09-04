@@ -22,6 +22,8 @@ const envSchema = z.object({
   GITHUB_API_URL: z.string().default('https://api.github.com'),
   GITHUB_WEBHOOK_SECRET: z.string().default(''),
   REVIEW_BOT_HANDLE: z.string().default('@repolens'),
+  /** Seconds between GitHub polls for new commits and pull requests. 0 disables polling. */
+  REPOLENS_POLL_INTERVAL: z.coerce.number().int().min(0).default(300),
 });
 
 export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli';
@@ -42,6 +44,7 @@ export interface Config {
   };
   embedding: { baseUrl: string; apiKey: string; model: string } | null;
   github: { token: string; apiUrl: string; webhookSecret: string; botHandle: string };
+  pollIntervalSeconds: number;
 }
 
 export class ConfigError extends Error {}
@@ -75,6 +78,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     embedding: e.EMBEDDING_MODEL
       ? { baseUrl: e.EMBEDDING_BASE_URL, apiKey: e.EMBEDDING_API_KEY, model: e.EMBEDDING_MODEL }
       : null,
+    pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     github: {
       token: e.GITHUB_TOKEN,
       apiUrl: e.GITHUB_API_URL,

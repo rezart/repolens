@@ -208,6 +208,26 @@ describe('API', () => {
       await deps.jobs.idle();
     });
 
+    it('reindexes on a push to the tracked branch and ignores other branches', async () => {
+      deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+      deps.db.setRepoStatus('github:o/n', 'ready', { last_commit: 'old' });
+      const post = async (payload: object) => {
+        const body = JSON.stringify(payload);
+        const res = await app.request('/webhooks/github', {
+          method: 'POST',
+          headers: { 'x-github-event': 'push', 'x-hub-signature-256': sign(body), 'content-type': 'application/json' },
+          body,
+        });
+        return res.json();
+      };
+      expect((await post({ ref: 'refs/heads/feature', after: 'x', repository: { full_name: 'o/n' } })).action).toBe('ignored');
+      expect((await post({ ref: 'refs/heads/main', after: 'old', repository: { full_name: 'o/n' } })).action).toBe('ignored');
+      const out = await post({ ref: 'refs/heads/main', after: 'new', repository: { full_name: 'o/n' } });
+      expect(out.action).toBe('index');
+      expect(deps.db.getJob(out.jobId)?.kind).toBe('index');
+      await deps.jobs.idle();
+    });
+
     it('answers a PR comment that mentions the bot', async () => {
       deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
       const posted: string[] = [];

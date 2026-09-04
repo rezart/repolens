@@ -1,10 +1,10 @@
 import type { AppDeps } from '../app.js';
-import { enqueueReview } from '../app.js';
+import { enqueueReview, enqueueIndex } from '../app.js';
 import { answerQuestion } from '../query/answer.js';
 import { parseUnifiedDiff, hunkText } from './diff.js';
 
 export interface WebhookOutcome {
-  action: 'review' | 'chat' | 'ignored';
+  action: 'review' | 'chat' | 'index' | 'ignored';
   reason?: string;
   jobId?: number;
   repository?: string;
@@ -15,6 +15,13 @@ interface PullRequestEvent {
   number?: number;
   pull_request?: { number: number; draft?: boolean; head?: { sha: string } };
   repository?: { full_name?: string; clone_url?: string; default_branch?: string };
+}
+
+interface PushEvent {
+  ref?: string;
+  after?: string;
+  deleted?: boolean;
+  repository?: { full_name?: string; default_branch?: string };
 }
 
 interface IssueCommentEvent {
@@ -42,6 +49,7 @@ function escapeRegExp(s: string): string {
 export function handleGitHubWebhook(deps: AppDeps, event: string, payload: unknown): WebhookOutcome {
   if (event === 'pull_request') return handlePullRequest(deps, payload as PullRequestEvent);
   if (event === 'issue_comment') return handleIssueComment(deps, payload as IssueCommentEvent);
+  if (event === 'push') return handlePush(deps, payload as PushEvent);
   return { action: 'ignored', reason: `event ${event || '(none)'} not handled` };
 }
 
@@ -59,6 +67,22 @@ function handlePullRequest(deps: AppDeps, p: PullRequestEvent): WebhookOutcome {
   if (!deps.db.getRepo(repoId)) return { action: 'ignored', reason: `${repoId} is not indexed by RepoLens` };
   const job = enqueueReview(deps, repoId, number, { post: true });
   return { action: 'review', jobId: job.id, repository: repoId };
+}
+
+/** A push to the indexed branch refreshes the index so reviews and answers see the new code. */
+function handlePush(deps: AppDeps, p: PushEvent): WebhookOutcome {
+  const repoId = repoIdFromPayload(p.repository?.full_name);
+  if (!repoId) return { action: 'ignored', reason: 'missing repository' };
+  const repo = deps.db.getRepo(repoId);
+  if (!repo) return { action: 'ignored', reason: `${repoId} is not indexed by RepoLens` };
+  if (p.deleted) return { action: 'ignored', reason: 'branch deleted' };
+  const branch = (p.ref ?? '').replace(/^refs\/heads\//, '');
+  const tracked = repo.branch || p.repository?.default_branch || '';
+  if (!branch || branch !== tracked) return { action: 'ignored', reason: `push to ${branch || '(unknown)'}, tracking ${tracked || '(default)'}` };
+  if (p.after && p.after === repo.last_commit) return { action: 'ignored', reason: 'already indexed' };
+  if (repo.status === 'queued' || repo.status === 'indexing') return { action: 'ignored', reason: 'index already in progress' };
+  const job = enqueueIndex(deps, repoId);
+  return { action: 'index', jobId: job.id, repository: repoId };
 }
 
 function handleIssueComment(deps: AppDeps, p: IssueCommentEvent): WebhookOutcome {
