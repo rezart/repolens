@@ -3,6 +3,8 @@
 /* ---------------------------------------------------------------- state */
 
 const TOKEN_KEY = 'repolens_token';
+const TABS = ['chat', 'reviews', 'settings'];
+const REVIEW_PAGE_SIZE = 10;
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
@@ -13,7 +15,8 @@ const state = {
   tab: 'chat',
   usage: { days: 30, data: null, loading: false, error: null, seq: 0 },
   chats: {},        // repoId -> { messages: [{role, content, sources}], busy }
-  reviews: {},      // repoId -> review rows
+  reviews: {},      // repoId -> { rows, total, page }
+  reviewOpen: {},   // reviewId -> expanded? (unset = collapsed when done, open otherwise)
   busy: {},         // repoId -> { review, reindex, instructions }
   note: {},         // repoId -> transient job progress text
   pulls: {},        // repoId -> { rows, loading, error }
@@ -253,6 +256,11 @@ function pullsFor(repoId) {
   return state.pulls[repoId];
 }
 
+function reviewsFor(repoId) {
+  if (!state.reviews[repoId]) state.reviews[repoId] = { rows: null, total: 0, page: 1 };
+  return state.reviews[repoId];
+}
+
 function pullJobsFor(repoId) {
   if (!state.pullJobs[repoId]) state.pullJobs[repoId] = {};
   return state.pullJobs[repoId];
@@ -295,14 +303,62 @@ async function loadRepos(quiet) {
 }
 
 async function loadReviews(repoId) {
+  const rv = reviewsFor(repoId);
+  const page = rv.page;
   try {
-    const data = await api('/api/reviews?repository=' + encodeURIComponent(repoId));
-    state.reviews[repoId] = (data && data.reviews) || [];
+    const offset = (page - 1) * REVIEW_PAGE_SIZE;
+    const data = await api('/api/reviews?repository=' + encodeURIComponent(repoId) + '&limit=' + REVIEW_PAGE_SIZE + '&offset=' + offset);
+    if (rv.page !== page) return; // the user moved on; that request renders itself
+    rv.rows = (data && data.reviews) || [];
+    rv.total = (data && data.total) || 0;
+    if (!rv.rows.length && page > 1) {
+      // Past the end (stale link, reviews deleted with the repo): fall back to the last page.
+      rv.page = Math.max(1, Math.ceil(rv.total / REVIEW_PAGE_SIZE));
+      syncUrl(true);
+      return loadReviews(repoId);
+    }
   } catch (err) {
-    state.reviews[repoId] = [];
+    rv.rows = [];
+    rv.total = 0;
     handleError(err);
   }
   if (state.selectedId === repoId && state.tab === 'reviews') renderReviewList();
+}
+
+/* --------------------------------------------------------------- routing */
+
+function routePath() {
+  if (state.view === 'usage') return '/usage';
+  if (!state.selectedId) return '/';
+  const rv = state.reviews[state.selectedId];
+  const page = state.tab === 'reviews' && rv && rv.page > 1 ? '?page=' + rv.page : '';
+  return '/repos/' + state.selectedId + '/' + state.tab + page;
+}
+
+/** Push (or replace) the URL for the current view; a no-op when it already matches. */
+function syncUrl(replace) {
+  const path = routePath();
+  if (location.pathname + location.search === path) return;
+  history[replace ? 'replaceState' : 'pushState'](null, '', path + location.hash);
+}
+
+/** Read view, repo, tab and page from the URL into state. */
+function applyRoute() {
+  const parts = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  state.view = parts[0] === 'usage' ? 'usage' : 'repo';
+  if (parts[0] !== 'repos' || parts.length < 2) return;
+  state.tab = parts.length > 2 && TABS.includes(parts[parts.length - 1]) ? parts.pop() : 'chat';
+  state.selectedId = parts.slice(1).join('/');
+  const page = parseInt(new URLSearchParams(location.search).get('page'), 10);
+  reviewsFor(state.selectedId).page = page > 0 ? page : 1;
+}
+
+function onPopState() {
+  applyRoute();
+  renderRepoList();
+  renderPanel();
+  if (state.view === 'usage') loadUsage();
+  else if (state.tab === 'reviews' && state.selectedId) loadReviews(state.selectedId);
 }
 
 async function loadPulls(repoId) {
@@ -419,6 +475,7 @@ function renderRepoList() {
 function selectRepo(id) {
   state.selectedId = id;
   state.view = 'repo';
+  syncUrl();
   renderRepoList();
   renderPanel();
 }
@@ -426,6 +483,7 @@ function selectRepo(id) {
 /* ---------------------------------------------------------- panel render */
 
 function renderPanel() {
+  syncUrl(true);
   const usage = state.view === 'usage';
   dom.usagePanel.hidden = !usage;
   dom.usageNav.classList.toggle('is-active', usage);
@@ -908,7 +966,8 @@ function renderReviewList() {
   const box = $('review-list');
   const repo = selectedRepo();
   if (!box || !repo) return;
-  const rows = state.reviews[repo.id];
+  const st = reviewsFor(repo.id);
+  const rows = st.rows;
   box.replaceChildren();
   if (!rows) return box.appendChild(h('p', { class: 'muted', text: 'Loading…' }));
   if (!rows.length) return box.appendChild(h('p', { class: 'muted', text: 'No reviews yet.' }));
@@ -918,14 +977,16 @@ function renderReviewList() {
     try { findings = JSON.parse(rv.comments_json || '[]') || []; } catch { findings = []; }
     findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity));
 
-    const head = h('div', { class: 'review-head' }, [
+    const anchor = 'review-' + rv.id;
+    const linked = location.hash === '#' + anchor;
+    const head = h('summary', { class: 'review-head' }, [
       h('a', {
         class: 'review-pr', href: 'https://github.com/' + repo.owner + '/' + repo.name + '/pull/' + rv.pr_number,
         target: '_blank', rel: 'noopener noreferrer', text: '#' + rv.pr_number,
       }),
       rv.verdict ? h('span', { class: 'badge badge-' + String(rv.verdict).toLowerCase().replace(/[^a-z]+/g, '-'), text: String(rv.verdict).replace(/_/g, ' ') }) : null,
       h('span', { class: 'pill pill-' + rv.status, text: rv.status }),
-      h('span', { class: 'review-time', text: fmtTime(rv.created_at) }),
+      h('a', { class: 'review-time', href: '#' + anchor, title: 'Link to this review', text: fmtTime(rv.created_at) }),
       h('span', { class: 'review-posted ' + (rv.posted ? 'is-posted' : ''), text: rv.posted ? 'posted to GitHub' : 'not posted' }),
       rv.head_sha ? h('code', { text: String(rv.head_sha).slice(0, 8) }) : null,
     ]);
@@ -956,7 +1017,22 @@ function renderReviewList() {
     } else if (rv.status === 'done') {
       parts.push(h('p', { class: 'muted', text: 'No inline findings.' }));
     }
-    box.appendChild(h('article', { class: 'review' }, parts));
+    // Finished reviews start collapsed; a review the user toggled, or one the URL points at, keeps its state.
+    const open = rv.id in state.reviewOpen ? state.reviewOpen[rv.id] : linked || rv.status !== 'done';
+    const el = h('details', { class: 'review', id: anchor, open }, parts);
+    el.addEventListener('toggle', () => { state.reviewOpen[rv.id] = el.open; });
+    box.appendChild(el);
+    if (linked && !(rv.id in state.reviewOpen)) el.scrollIntoView({ block: 'start' });
+  }
+
+  const pages = Math.max(1, Math.ceil(st.total / REVIEW_PAGE_SIZE));
+  if (pages > 1) {
+    const go = (page) => { st.page = page; syncUrl(); loadReviews(repo.id); };
+    box.appendChild(h('div', { class: 'review-pager' }, [
+      h('button', { class: 'btn btn-sm', type: 'button', text: '\u2039 Newer', disabled: st.page <= 1, onclick: () => go(st.page - 1) }),
+      h('span', { class: 'muted', text: 'Page ' + st.page + ' of ' + pages + ' \u00b7 ' + st.total + ' reviews' }),
+      h('button', { class: 'btn btn-sm', type: 'button', text: 'Older \u203a', disabled: st.page >= pages, onclick: () => go(st.page + 1) }),
+    ]));
   }
 }
 
@@ -1102,6 +1178,7 @@ async function addRepo(repository, branch, btn) {
 
 function showUsage() {
   state.view = 'usage';
+  syncUrl();
   renderPanel();
   loadUsage();
 }
@@ -1309,8 +1386,14 @@ function init() {
     const btn = e.target.closest('.tab');
     if (!btn) return;
     state.tab = btn.dataset.tab;
+    syncUrl();
     renderPanel();
   });
+
+  window.addEventListener('popstate', onPopState);
+  window.addEventListener('hashchange', () => { if (state.tab === 'reviews') renderReviewList(); });
+  applyRoute();
+  if (state.view === 'usage') loadUsage();
 
   loadHealth();
   loadRepos();

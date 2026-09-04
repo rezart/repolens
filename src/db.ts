@@ -444,11 +444,20 @@ export class Db {
       .get(repoId, prNumber, headSha) as ReviewRow | undefined;
   }
 
-  listReviews(repoId?: string, limit = 50): ReviewRow[] {
+  listReviews(repoId?: string, limit = 50, offset = 0): ReviewRow[] {
     if (repoId) {
-      return this.raw.prepare(`select * from reviews where repo_id=? order by id desc limit ?`).all(repoId, limit) as ReviewRow[];
+      return this.raw
+        .prepare(`select * from reviews where repo_id=? order by id desc limit ? offset ?`)
+        .all(repoId, limit, offset) as ReviewRow[];
     }
-    return this.raw.prepare(`select * from reviews order by id desc limit ?`).all(limit) as ReviewRow[];
+    return this.raw.prepare(`select * from reviews order by id desc limit ? offset ?`).all(limit, offset) as ReviewRow[];
+  }
+
+  countReviews(repoId?: string): number {
+    const row = repoId
+      ? this.raw.prepare(`select count(*) as n from reviews where repo_id=?`).get(repoId)
+      : this.raw.prepare(`select count(*) as n from reviews`).get();
+    return (row as { n: number }).n;
   }
 
   markReviewPosted(id: number) {
