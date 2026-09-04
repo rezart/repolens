@@ -131,6 +131,8 @@ export class OpenRouterProvider implements LLMProvider {
         break;
       }
     }
+    // Flush any multi-byte character the decoder was holding back before the last line is parsed.
+    buffer += decoder.decode();
     if (buffer) consumeLine(buffer);
     // A body that ends without [DONE] (or a finish_reason) was cut short; the text
     // gathered so far is an incomplete answer, not a successful one.

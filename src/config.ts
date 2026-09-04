@@ -75,6 +75,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.LLM_PROVIDER === 'openrouter' && !e.LLM_MODEL) {
     throw new ConfigError('LLM_MODEL is required when LLM_PROVIDER=openrouter (e.g. anthropic/claude-sonnet-4.5)');
   }
+  // Chat may run on a different backend; validate the effective chat provider the same way.
+  const chatProvider = e.CHAT_PROVIDER || e.LLM_PROVIDER;
+  if (chatProvider === 'openrouter' && !e.OPENROUTER_API_KEY) {
+    throw new ConfigError('OPENROUTER_API_KEY is required when chat runs on OpenRouter (CHAT_PROVIDER=openrouter)');
+  }
+  if (chatProvider === 'openrouter' && !(e.CHAT_MODEL || e.LLM_MODEL)) {
+    throw new ConfigError('CHAT_MODEL (or LLM_MODEL) is required when chat runs on OpenRouter');
+  }
   return {
     dataDir: e.REPOLENS_DATA_DIR,
     apiToken: e.REPOLENS_API_TOKEN,

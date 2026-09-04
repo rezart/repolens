@@ -212,6 +212,25 @@ describe('OpenRouterProvider.stream', () => {
     expect(sent.max_tokens).toBe(100);
   });
 
+  it('does not drop a multi-byte character split across the final chunks', async () => {
+    // Last frame carries "é" (2 bytes) with no trailing newline after the [DONE]-less finish_reason frame.
+    const last = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'caf\u00e9' }, finish_reason: 'stop' }] });
+    const bytes = new TextEncoder().encode(dataFrame('ok ') + last);
+    const cut = bytes.length - 3; // split inside the 2-byte "é" near the end
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(bytes.slice(0, cut));
+        c.enqueue(bytes.slice(cut));
+        c.close();
+      },
+    });
+    const res = new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    const f = fakeFetch([res]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const out = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {});
+    expect(out).toBe('ok caf\u00e9');
+  });
+
   it('ignores keep-alive comments and blank lines', async () => {
     const body = ': ping\n\n' + '\n' + dataFrame('ok') + 'data: [DONE]\n\n';
     const f = fakeFetch([sseResponse([body])]);
