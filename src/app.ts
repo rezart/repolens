@@ -13,6 +13,8 @@ import { parseRemote, repoIdFor, RepoCheckout } from './indexer/git.js';
 import { indexRepo } from './indexer/indexer.js';
 import { answerQuestion } from './query/answer.js';
 import { reviewPullRequest } from './review/reviewer.js';
+import { formatContext } from './search/retrieve.js';
+import { identifiersFromCode } from './search/tokenize.js';
 import { GitHubClient, verifyWebhookSignature } from './review/github.js';
 import { handleGitHubWebhook } from './review/webhook.js';
 
@@ -93,7 +95,15 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
   return deps.jobs.enqueue('review', repoId, async (ctx) => {
     ctx.progress(`reviewing PR #${prNumber}`);
     const result = await reviewPullRequest(
-      { db: deps.db, llm: deps.llm, retrieve: deps.retrieve, github: deps.github, log: (m) => ctx.progress(m) },
+      {
+        db: deps.db,
+        llm: deps.llm,
+        retrieve: deps.retrieve,
+        github: deps.github,
+        identifiers: identifiersFromCode,
+        formatContext: (chunks) => formatContext(chunks, 16000),
+        log: (m) => ctx.progress(m),
+      },
       { repoId, prNumber, post: opts.post ?? true, force: opts.force },
     );
     return { reviewId: result.reviewId, findings: result.findings.length, posted: result.posted, reviewUrl: result.reviewUrl };
