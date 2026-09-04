@@ -33,6 +33,13 @@ export function rrf(rankings: number[][], k = RRF_K): Map<number, number> {
   return scores;
 }
 
+/** Changelogs and release notes mention every identifier; keep them but rank code above them. */
+const LOW_SIGNAL_PATH = /(^|\/)(changelog|changes|history|release[-_]?notes|news)(\.(md|markdown|txt|rst|adoc))?$/i;
+
+export function pathWeight(path: string): number {
+  return LOW_SIGNAL_PATH.test(path) ? 0.6 : 1;
+}
+
 function toRetrieved(chunk: ChunkRow, score: number): RetrievedChunk {
   return {
     chunkId: chunk.id,
@@ -78,13 +85,13 @@ export function createRetriever({ db, embeddings }: { db: Db; embeddings?: Embed
     const fused = rrf([lexical.map((h) => h.chunk.id), semantic.map((h) => h.chunk.id)]);
 
     return [...fused.entries()]
-      .sort((a, b) => b[1] - a[1])
       .flatMap(([id, score]) => {
         const chunk = chunks.get(id);
         if (!chunk) return [];
         if (req.excludePath && chunk.path === req.excludePath) return [];
-        return [toRetrieved(chunk, score)];
+        return [toRetrieved(chunk, score * pathWeight(chunk.path))];
       })
+      .sort((a, b) => b.score - a.score)
       .slice(0, limit);
   };
 }

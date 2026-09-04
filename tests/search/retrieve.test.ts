@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { openDb, type Db } from '../../src/db.js';
 import type { EmbeddingProvider } from '../../src/embeddings/types.js';
 import type { RetrievedChunk } from '../../src/search/types.js';
-import { createRetriever, rrf, formatContext, chunksToSources } from '../../src/search/retrieve.js';
+import { createRetriever, rrf, formatContext, chunksToSources, pathWeight } from '../../src/search/retrieve.js';
 
 const REPO = 'github:acme/app';
 
@@ -172,5 +172,14 @@ describe('chunksToSources', () => {
       { chunkId: 4, repoId: REPO, path: 'a.ts', startLine: 1, endLine: 2, content: 'z'.repeat(500), score: 1 },
     ]);
     expect(s.summary).toHaveLength(120);
+  });
+});
+
+describe('pathWeight', () => {
+  it('demotes changelog-style files', () => {
+    expect(pathWeight('History.md')).toBeLessThan(1);
+    expect(pathWeight('docs/CHANGELOG.md')).toBeLessThan(1);
+    expect(pathWeight('src/history.ts')).toBe(1);
+    expect(pathWeight('lib/router/index.js')).toBe(1);
   });
 });
