@@ -427,7 +427,8 @@ export function createApp(deps: AppDeps): Hono {
   // Dashboard routes (/repos/..., /usage) are handled client-side; deep links load the shell.
   app.get('/*', async (c) => {
     if (c.req.path.startsWith('/api/') || /\.[a-z0-9]+$/i.test(c.req.path)) return c.notFound();
-    return c.html(await readFile(join(webDir, 'index.html'), 'utf8'));
+    const shell = await readFile(join(webDir, 'index.html'), 'utf8');
+    return c.html(shell);
   });
 
   return app;
