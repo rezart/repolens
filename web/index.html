@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RepoLens</title>
+<link rel="stylesheet" href="/style.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script defer src="/app.js"></script>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <span class="brand-mark">◧</span>
+      <span class="brand-name">RepoLens</span>
+      <span class="brand-version" id="version"></span>
+    </div>
+
+    <div class="health" id="health">
+      <span class="dot dot-idle"></span><span class="health-text">checking…</span>
+    </div>
+
+    <section class="side-section">
+      <label class="field-label" for="token-input">API token</label>
+      <div class="token-row">
+        <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="Bearer token">
+        <button id="token-save" class="btn btn-sm" type="button">Save</button>
+      </div>
+      <p class="hint" id="token-hint">Stored in localStorage.</p>
+    </section>
+
+    <section class="side-section">
+      <div class="side-head">
+        <span class="field-label">Repositories</span>
+        <button id="refresh-repos" class="btn btn-ghost btn-sm" type="button" title="Refresh">↻</button>
+      </div>
+      <ul class="repo-list" id="repo-list"></ul>
+    </section>
+
+    <section class="side-section">
+      <span class="field-label">Add repository</span>
+      <form id="add-repo-form" class="add-form" autocomplete="off">
+        <input id="add-repo-name" type="text" placeholder="owner/name" spellcheck="false" required>
+        <input id="add-repo-branch" type="text" placeholder="branch (default main)" spellcheck="false">
+        <button class="btn btn-primary" type="submit">Index repository</button>
+      </form>
+    </section>
+  </aside>
+
+  <main id="main">
+    <div class="empty" id="empty-state">
+      <h1>RepoLens</h1>
+      <p>Index a git repository, ask questions about the codebase with cited sources, and run AI reviews on GitHub pull requests.</p>
+      <p class="muted">Select a repository on the left, or add one to get started.</p>
+    </div>
+
+    <div class="panel" id="repo-panel" hidden>
+      <header class="panel-head">
+        <div class="panel-title">
+          <h2 id="repo-title">—</h2>
+          <div class="panel-meta" id="repo-meta"></div>
+        </div>
+        <nav class="tabs" id="tabs">
+          <button class="tab" data-tab="chat" type="button">Chat</button>
+          <button class="tab" data-tab="reviews" type="button">Reviews</button>
+          <button class="tab" data-tab="settings" type="button">Settings</button>
+        </nav>
+      </header>
+      <div class="panel-body" id="tab-body"></div>
+    </div>
+  </main>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>
