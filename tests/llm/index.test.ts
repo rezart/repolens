@@ -53,6 +53,16 @@ describe('createProvider', () => {
     expect(effortOf(createProvider(config, { reasoningEffort: '' }))).toBeUndefined();
   });
 
+  it('hands the usage sink to whichever backend it builds', () => {
+    const onUsage = () => {};
+    const sinkOf = (p: LLMProvider): unknown => (p as unknown as { onUsage?: unknown }).onUsage;
+    const config = loadConfig({ ...base, OPENROUTER_API_KEY: 'k' });
+    for (const provider of ['claude-cli', 'codex-cli', 'openrouter'] as const) {
+      const p = createProvider(config, { provider, model: 'anthropic/claude-sonnet-4.5', onUsage });
+      expect(sinkOf(p), provider).toBe(onUsage);
+    }
+  });
+
   it('rejects an openrouter override without a model', () => {
     const config = loadConfig({ ...base, OPENROUTER_API_KEY: 'k' });
     expect(() => createProvider(config, { provider: 'openrouter', model: '' })).toThrow(/model is required/i);

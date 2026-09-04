@@ -1,6 +1,7 @@
 import type { Config } from '../config.js';
 import { ProviderError } from '../llm/types.js';
 import type { EmbeddingProvider } from './types.js';
+import type { UsageSink } from '../usage/types.js';
 
 export type { EmbeddingProvider } from './types.js';
 
@@ -15,6 +16,8 @@ export interface OpenAIEmbeddingsOptions {
   timeoutMs?: number;
   /** Injectable for tests; defaults to setTimeout. */
   sleep?: Sleep;
+  /** Called once per successful batch with the tokens it consumed. */
+  onUsage?: UsageSink;
 }
 
 const DEFAULT_BATCH_SIZE = 64;
@@ -24,6 +27,13 @@ const defaultSleep: Sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 interface EmbeddingResponse {
   data?: Array<{ index?: number; embedding?: unknown }>;
+  usage?: { prompt_tokens?: unknown } | null;
+}
+
+/** One batch's vectors plus whatever token count the server reported for it. */
+interface BatchResult {
+  vectors: number[][];
+  promptTokens: number | null;
 }
 
 /** OpenAI-compatible /embeddings endpoint (OpenAI, OpenRouter, Ollama, LM Studio, ...). */
@@ -37,6 +47,7 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
   private readonly batchSize: number;
   private readonly timeoutMs: number;
   private readonly sleep: Sleep;
+  private readonly onUsage: UsageSink | undefined;
 
   constructor(opts: OpenAIEmbeddingsOptions) {
     this.model = opts.model;
@@ -46,6 +57,28 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
     this.batchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
     this.timeoutMs = opts.timeoutMs ?? 120_000;
     this.sleep = opts.sleep ?? defaultSleep;
+    this.onUsage = opts.onUsage;
+  }
+
+  /**
+   * Hand one batch's token count to the sink. Ignores a count the server did not
+   * report, and never lets a throwing sink turn a finished batch into a failure.
+   */
+  private reportUsage(promptTokens: number | null): void {
+    if (!this.onUsage || promptTokens === null) return;
+    try {
+      this.onUsage({
+        provider: 'embeddings',
+        model: this.model,
+        inputTokens: promptTokens,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        costUsd: null,
+      });
+    } catch {
+      // Accounting must never break an embedding.
+    }
   }
 
   get dimension(): number | null {
@@ -89,7 +122,11 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
         continue;
       }
 
-      if (res.ok) return await parseVectors(res, batch.length);
+      if (res.ok) {
+        const { vectors, promptTokens } = await parseBatch(res, batch.length);
+        this.reportUsage(promptTokens);
+        return vectors;
+      }
 
       const detail = await safeText(res);
       const err = new ProviderError('embeddings', `HTTP ${res.status}`, res.status, detail);
@@ -101,7 +138,7 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
   }
 }
 
-async function parseVectors(res: Response, expected: number): Promise<number[][]> {
+async function parseBatch(res: Response, expected: number): Promise<BatchResult> {
   const text = await safeText(res);
   let parsed: EmbeddingResponse;
   try {
@@ -119,13 +156,15 @@ async function parseVectors(res: Response, expected: number): Promise<number[][]
     );
   }
   const ordered = [...rows].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-  return ordered.map((row) => {
+  const vectors = ordered.map((row) => {
     const v = row.embedding;
     if (!Array.isArray(v) || v.some((n) => typeof n !== 'number')) {
       throw new ProviderError('embeddings', 'response contained a non-numeric embedding', res.status);
     }
     return v as number[];
   });
+  const prompt = parsed.usage?.prompt_tokens;
+  return { vectors, promptTokens: typeof prompt === 'number' ? prompt : null };
 }
 
 function isRetryable(status: number): boolean {
@@ -141,12 +180,13 @@ async function safeText(res: Response): Promise<string> {
 }
 
 /** Build the configured embedding backend, or null when embeddings are disabled. */
-export function createEmbeddings(config: Config): EmbeddingProvider | null {
+export function createEmbeddings(config: Config, opts: { onUsage?: UsageSink } = {}): EmbeddingProvider | null {
   if (!config.embedding) return null;
   return new OpenAIEmbeddings({
     baseUrl: config.embedding.baseUrl,
     apiKey: config.embedding.apiKey,
     model: config.embedding.model,
     timeoutMs: config.llm.timeoutMs,
+    onUsage: opts.onUsage,
   });
 }

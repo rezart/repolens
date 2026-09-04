@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { UsageRole } from './usage/types.js';
 
 export type RepoStatus = 'queued' | 'indexing' | 'ready' | 'error';
 export type JobKind = 'index' | 'review';
@@ -86,6 +87,42 @@ export interface JobRow {
   updated_at: string;
 }
 
+/** One backend call, as written by UsageTracker. */
+export interface UsageInsert {
+  role: UsageRole;
+  provider: string;
+  model: string;
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  output_tokens: number;
+  /** Cost reported by the backend; null when it reported none. */
+  cost_usd: number | null;
+}
+
+/**
+ * One UTC day of calls for a role/provider/model. The `unpriced_*` sums cover
+ * only the calls whose backend reported no cost, so a list-price estimate can be
+ * added to `reported_cost_usd` without double counting.
+ */
+export interface UsageDayRow {
+  day: string;
+  role: string;
+  provider: string;
+  model: string;
+  calls: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  output_tokens: number;
+  reported_cost_usd: number;
+  unpriced_input_tokens: number;
+  unpriced_cached_input_tokens: number;
+  unpriced_cache_write_tokens: number;
+  unpriced_output_tokens: number;
+  unpriced_calls: number;
+}
+
 const SCHEMA = `
 create table if not exists repos (
   id text primary key,
@@ -161,6 +198,19 @@ create table if not exists jobs (
   updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create table if not exists meta (key text primary key, value text not null);
+create table if not exists llm_usage (
+  id integer primary key autoincrement,
+  ts text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  role text not null,
+  provider text not null,
+  model text not null,
+  input_tokens integer not null default 0,
+  cached_input_tokens integer not null default 0,
+  cache_write_tokens integer not null default 0,
+  output_tokens integer not null default 0,
+  cost_usd real
+);
+create index if not exists llm_usage_ts on llm_usage(ts);
 `;
 
 export class Db {
@@ -175,8 +225,8 @@ export class Db {
     this.raw.pragma('foreign_keys = ON');
     this.raw.exec(SCHEMA);
     migrate(this.raw);
-    const dim = this.raw.prepare(`select value from meta where key='vec_dim'`).get() as { value: string } | undefined;
-    if (dim) this.vecDim = Number(dim.value);
+    const dim = this.getMeta('vec_dim');
+    if (dim) this.vecDim = Number(dim);
   }
 
   close() {
@@ -330,7 +380,7 @@ export class Db {
          embedding float[${dim}]
        )`,
     );
-    this.raw.prepare(`insert or replace into meta (key, value) values ('vec_dim', ?)`).run(String(dim));
+    this.setMeta('vec_dim', String(dim));
     this.vecDim = dim;
   }
 
@@ -423,6 +473,46 @@ export class Db {
 
   listJobs(limit = 50): JobRow[] {
     return this.raw.prepare(`select * from jobs order by id desc limit ?`).all(limit) as JobRow[];
+  }
+
+  // ---- usage ----
+  insertUsage(row: UsageInsert) {
+    this.raw
+      .prepare(
+        `insert into llm_usage (role, provider, model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_usd)
+         values (@role, @provider, @model, @input_tokens, @cached_input_tokens, @cache_write_tokens, @output_tokens, @cost_usd)`,
+      )
+      .run(row);
+  }
+
+  /** Per UTC day, role, provider and model since `sinceIso` (inclusive), newest day first. */
+  usageByDay(sinceIso: string): UsageDayRow[] {
+    return this.raw
+      .prepare(
+        `select substr(ts, 1, 10) as day, role, provider, model, count(*) as calls,
+           sum(input_tokens) as input_tokens, sum(cached_input_tokens) as cached_input_tokens,
+           sum(cache_write_tokens) as cache_write_tokens, sum(output_tokens) as output_tokens,
+           coalesce(sum(cost_usd), 0) as reported_cost_usd,
+           sum(case when cost_usd is null then input_tokens else 0 end) as unpriced_input_tokens,
+           sum(case when cost_usd is null then cached_input_tokens else 0 end) as unpriced_cached_input_tokens,
+           sum(case when cost_usd is null then cache_write_tokens else 0 end) as unpriced_cache_write_tokens,
+           sum(case when cost_usd is null then output_tokens else 0 end) as unpriced_output_tokens,
+           sum(case when cost_usd is null then 1 else 0 end) as unpriced_calls
+         from llm_usage where ts >= ?
+         group by day, role, provider, model
+         order by day desc, provider, model, role`,
+      )
+      .all(sinceIso) as UsageDayRow[];
+  }
+
+  // ---- meta ----
+  getMeta(key: string): string | undefined {
+    const r = this.raw.prepare(`select value from meta where key=?`).get(key) as { value: string } | undefined;
+    return r?.value;
+  }
+
+  setMeta(key: string, value: string) {
+    this.raw.prepare(`insert into meta (key, value) values (?, ?) on conflict(key) do update set value=excluded.value`).run(key, value);
   }
 
   /** Review jobs of one repository, latest first. */

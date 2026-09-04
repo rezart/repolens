@@ -8,6 +8,7 @@ import { JobQueue } from '../../src/jobs.js';
 import type { AppDeps } from '../../src/app.js';
 import type { GitHubClient, PullRequest } from '../../src/review/github.js';
 import { listPullStatuses, reviewPulls, type PullStatus } from '../../src/review/pulls.js';
+import { UsageTracker } from '../../src/usage/tracker.js';
 
 const REPO_ID = 'github:o/n';
 
@@ -57,6 +58,7 @@ function makeDeps(pulls: PullRequest[] = PULLS): AppDeps {
     retrieve: async () => [],
     github,
     jobs: new JobQueue(db),
+    usage: new UsageTracker({ db, pricing: null }),
   };
   db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/n.git', owner: 'o', name: 'n', branch: 'main' });
   return deps;

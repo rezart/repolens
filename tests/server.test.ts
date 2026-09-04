@@ -7,6 +7,7 @@ import { openDb, type Db } from '../src/db.js';
 import { loadConfig } from '../src/config.js';
 import { JobQueue } from '../src/jobs.js';
 import { createApp, streamAnswer, type AppDeps } from '../src/app.js';
+import { UsageTracker } from '../src/usage/tracker.js';
 import { buildDeps } from '../src/server.js';
 import type { LLMProvider, CompleteRequest } from '../src/llm/types.js';
 import type { GitHubClient } from '../src/review/github.js';
@@ -44,6 +45,7 @@ function makeDeps(overrides: Partial<AppDeps> = {}, env: Record<string, string> 
     retrieve: async () => [{ chunkId: 1, repoId: 'github:o/n', path: 'src/auth.ts', startLine: 1, endLine: 5, content: 'export function verifyToken() {}', score: 1 }],
     github,
     jobs,
+    usage: new UsageTracker({ db, pricing: null }),
     ...overrides,
   };
   // Chat shares the review backend unless a test overrides it.
@@ -228,6 +230,63 @@ describe('API', () => {
       body: JSON.stringify({ instructions: 'Be strict about error handling.' }),
     });
     expect((await res.json()).instructions).toBe('Be strict about error handling.');
+  });
+
+  describe('usage', () => {
+    beforeEach(() => {
+      deps.db.insertUsage({
+        role: 'review',
+        provider: 'claude-cli',
+        model: 'claude-haiku-4-5',
+        input_tokens: 100,
+        cached_input_tokens: 20,
+        cache_write_tokens: 5,
+        output_tokens: 30,
+        cost_usd: null,
+      });
+      deps.db.insertUsage({
+        role: 'chat',
+        provider: 'openrouter',
+        model: 'anthropic/claude-haiku-4.5',
+        input_tokens: 40,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 8,
+        cost_usd: 0.0125,
+      });
+    });
+
+    it('needs auth', async () => {
+      expect((await app.request('/api/usage')).status).toBe(401);
+    });
+
+    it('rejects a days value outside the allowed range or not a number', async () => {
+      for (const q of ['?days=0', '?days=abc', '?days=400', '?days=1.5']) {
+        const res = await app.request(`/api/usage${q}`, { headers: auth });
+        expect(res.status, q).toBe(400);
+        expect((await res.json()).error).toBeTruthy();
+      }
+    });
+
+    it('reports rows for the requested window', async () => {
+      const res = await app.request('/api/usage?days=7', { headers: auth });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.days).toBe(7);
+      expect(body.since).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(body.pricing).toEqual({ fetchedAt: null, error: 'pricing disabled' });
+      const byRole = new Map(body.rows.map((r: { role: string }) => [r.role, r]));
+      expect(byRole.get('review')).toMatchObject({ provider: 'claude-cli', calls: 1, inputTokens: 100, costUsd: null, priced: false });
+      expect(byRole.get('chat')).toMatchObject({ provider: 'openrouter', calls: 1, costUsd: 0.0125, priced: true });
+    });
+
+    it('defaults to 30 days when days is missing or empty', async () => {
+      for (const path of ['/api/usage', '/api/usage?days=']) {
+        const res = await app.request(path, { headers: auth });
+        expect(res.status, path).toBe(200);
+        expect((await res.json()).days, path).toBe(30);
+      }
+    });
   });
 
   describe('pull requests', () => {

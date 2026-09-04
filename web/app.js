@@ -9,7 +9,9 @@ const state = {
   health: null,
   repos: [],
   selectedId: null,
+  view: 'repo',     // 'repo' | 'usage'
   tab: 'chat',
+  usage: { days: 30, data: null, loading: false, error: null, seq: 0 },
   chats: {},        // repoId -> { messages: [{role, content, sources}], busy }
   reviews: {},      // repoId -> review rows
   busy: {},         // repoId -> { review, reindex, instructions }
@@ -52,6 +54,12 @@ function fmtTime(value) {
 
 function fmtCount(n) {
   return typeof n === 'number' ? n.toLocaleString() : '0';
+}
+
+function fmtUsd(n) {
+  // A fraction of a cent still cost something; '$0.0000' reads as free.
+  if (n > 0 && n < 0.0001) return '<$0.0001';
+  return '$' + n.toFixed(n < 1 ? 4 : 2);
 }
 
 function fmtRelative(value) {
@@ -410,6 +418,7 @@ function renderRepoList() {
 
 function selectRepo(id) {
   state.selectedId = id;
+  state.view = 'repo';
   renderRepoList();
   renderPanel();
 }
@@ -417,6 +426,16 @@ function selectRepo(id) {
 /* ---------------------------------------------------------- panel render */
 
 function renderPanel() {
+  const usage = state.view === 'usage';
+  dom.usagePanel.hidden = !usage;
+  dom.usageNav.classList.toggle('is-active', usage);
+  if (usage) {
+    // The repo panel keeps its mounted DOM; it is shown again on the next select.
+    dom.emptyState.hidden = true;
+    dom.repoPanel.hidden = true;
+    return;
+  }
+
   const repo = selectedRepo();
   dom.emptyState.hidden = !!repo;
   dom.repoPanel.hidden = !repo;
@@ -1079,6 +1098,172 @@ async function addRepo(repository, branch, btn) {
   }
 }
 
+/* ----------------------------------------------------------------- usage */
+
+function showUsage() {
+  state.view = 'usage';
+  renderPanel();
+  loadUsage();
+}
+
+async function loadUsage() {
+  const st = state.usage;
+  // Changing the range mid-load must not leave the old range's rows on screen:
+  // only the newest request is allowed to touch the state it renders from.
+  const seq = ++st.seq;
+  st.loading = true;
+  st.error = null;
+  renderUsage();
+  try {
+    const data = await api('/api/usage?days=' + encodeURIComponent(st.days));
+    if (seq !== st.seq) return;
+    st.data = data;
+  } catch (err) {
+    if (seq !== st.seq) return;
+    st.data = null;
+    st.error = err.message || 'Could not load usage';
+    handleError(err);
+  } finally {
+    if (seq === st.seq) {
+      st.loading = false;
+      renderUsage();
+    }
+  }
+}
+
+function usageTotals(rows) {
+  const t = { cost: 0, priced: false, estimated: false, unpriced: false, tokens: 0, calls: 0 };
+  for (const row of rows) {
+    if (typeof row.costUsd === 'number') { t.cost += row.costUsd; t.priced = true; }
+    // Calls nothing could price are missing from the total, not worth $0.
+    if (typeof row.costUsd !== 'number' || row.priced === false) t.unpriced = true;
+    if (row.estimatedCostUsd > 0) t.estimated = true;
+    t.tokens += (row.inputTokens || 0) + (row.cachedInputTokens || 0) + (row.cacheWriteTokens || 0) + (row.outputTokens || 0);
+    t.calls += row.calls || 0;
+  }
+  return t;
+}
+
+/** '—' when nothing in the set could be priced, '~' when any part is estimated. */
+function usageCostText(totals) {
+  if (!totals.priced) return '—';
+  return (totals.estimated ? '~' : '') + fmtUsd(totals.cost);
+}
+
+function usageCard(label, value, title) {
+  return h('div', { class: 'usage-card' }, [
+    h('span', { class: 'field-label', text: label }),
+    h('span', { class: 'usage-value mono', title: title || null, text: value }),
+  ]);
+}
+
+function usageCostCell(row) {
+  let text;
+  let title = null;
+  if (typeof row.costUsd === 'number') {
+    text = (row.estimatedCostUsd > 0 ? '~' : '') + fmtUsd(row.costUsd);
+  } else {
+    text = '—';
+    title = 'No OpenRouter price for ' + (row.model || 'this model');
+  }
+  // A partially priced row is a floor; a fully unpriced one already reads as '—'.
+  if (row.priced === false && typeof row.costUsd === 'number') {
+    text += '*';
+    title = 'Some calls in this row could not be priced; the cost shown covers the priced calls only.';
+  }
+  return h('td', { class: 'num mono', title, text });
+}
+
+function usageTable(rows) {
+  const body = [];
+  let day = null;
+  let group = [];
+  // Rows arrive newest day first; the day header carries that day's subtotal.
+  const flush = () => {
+    if (!group.length) return;
+    body.push(h('tr', { class: 'usage-day' }, [
+      h('td', { colspan: 8, text: day }),
+      h('td', { class: 'num mono', text: usageCostText(usageTotals(group)) }),
+    ]));
+    for (const row of group) {
+      body.push(h('tr', {}, [
+        h('td', { text: row.provider || '—' }),
+        h('td', { class: 'mono', text: row.model || '—' }),
+        h('td', {}, [h('span', { class: 'pill', text: row.role || '—' })]),
+        h('td', { class: 'num mono', text: fmtCount(row.calls) }),
+        h('td', { class: 'num mono', text: fmtCount(row.inputTokens) }),
+        h('td', { class: 'num mono', text: fmtCount(row.cachedInputTokens) }),
+        h('td', { class: 'num mono', text: fmtCount(row.cacheWriteTokens) }),
+        h('td', { class: 'num mono', text: fmtCount(row.outputTokens) }),
+        usageCostCell(row),
+      ]));
+    }
+    group = [];
+  };
+
+  for (const row of rows) {
+    if (row.day !== day) { flush(); day = row.day; }
+    group.push(row);
+  }
+  flush();
+
+  const head = ['Provider', 'Model', 'Role', 'Calls', 'Input', 'Cached', 'Cache write', 'Output', 'Cost'];
+  return h('div', { class: 'usage-scroll' }, [
+    h('table', { class: 'usage-table' }, [
+      h('thead', {}, [h('tr', {}, head.map((label, i) => h('th', { class: i >= 3 ? 'num' : null, text: label })))]),
+      h('tbody', {}, body),
+    ]),
+  ]);
+}
+
+function usageNote(pricing) {
+  if (!pricing) return null;
+  // With no list at all there are no list prices to explain, only the failure.
+  if (!pricing.fetchedAt) {
+    return pricing.error ? h('p', { class: 'usage-note', text: 'Price list unavailable: ' + pricing.error }) : null;
+  }
+  let text = 'Costs are OpenRouter list prices (~ = estimated from token counts; subscription CLIs are not billed per token). '
+    + 'Price list fetched ' + fmtTime(pricing.fetchedAt) + '.';
+  // A stale list still prices the rows; say so rather than hiding the failure.
+  if (pricing.error) text += ' The latest refresh failed: ' + pricing.error + '.';
+  return h('p', { class: 'usage-note', text });
+}
+
+function renderUsage() {
+  const box = dom.usageBody;
+  if (!box) return;
+  const st = state.usage;
+  const pane = h('div', { class: 'tab-pane' });
+
+  if (st.error) pane.appendChild(h('p', { class: 'hint hint-error', text: st.error }));
+  if (st.loading) pane.appendChild(h('p', { class: 'muted', text: 'Loading…' }));
+
+  const data = st.data;
+  if (data) {
+    const rows = data.rows || [];
+    if (!rows.length) {
+      pane.appendChild(h('p', { class: 'muted', text: 'No usage recorded in the last ' + (data.days || st.days) + ' days.' }));
+    } else {
+      const totals = usageTotals(rows);
+      pane.appendChild(h('div', { class: 'usage-summary' }, [
+        usageCard(
+          'Total cost',
+          // Same rule as the rows: a floor gets a star, a total with nothing priced is just '—'.
+          usageCostText(totals) + (totals.unpriced && totals.priced ? '*' : ''),
+          totals.unpriced && totals.priced ? 'Some calls could not be priced; this total covers the priced calls only.' : null,
+        ),
+        usageCard('Total tokens', fmtCount(totals.tokens)),
+        usageCard('Calls', fmtCount(totals.calls)),
+      ]));
+      pane.appendChild(usageTable(rows));
+    }
+    const note = usageNote(data.pricing);
+    if (note) pane.appendChild(note);
+  }
+
+  box.replaceChildren(pane);
+}
+
 /* ------------------------------------------------------------------ init */
 
 function init() {
@@ -1087,6 +1272,8 @@ function init() {
     tokenInput: $('token-input'), tokenHint: $('token-hint'), addName: $('add-repo-name'),
     addBranch: $('add-repo-branch'), emptyState: $('empty-state'), repoPanel: $('repo-panel'),
     repoTitle: $('repo-title'), repoMeta: $('repo-meta'), tabs: $('tabs'), tabBody: $('tab-body'),
+    usageNav: $('usage-nav'), usagePanel: $('usage-panel'), usageBody: $('usage-body'),
+    usageDays: $('usage-days'),
   });
 
   dom.tokenInput.value = state.token;
@@ -1107,6 +1294,15 @@ function init() {
     const name = dom.addName.value.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/, '').replace(/^\/+|\/+$/g, '');
     if (!/^[^/\s]+\/[^/\s]+$/.test(name)) return toast('Enter the repository as owner/name.');
     addRepo(name, dom.addBranch.value.trim(), e.target.querySelector('button[type=submit]'));
+  });
+
+  dom.usageNav.addEventListener('click', () => showUsage());
+
+  dom.usageDays.value = String(state.usage.days);
+  dom.usageDays.addEventListener('change', () => {
+    state.usage.days = parseInt(dom.usageDays.value, 10) || 30;
+    state.usage.data = null;
+    loadUsage();
   });
 
   dom.tabs.addEventListener('click', (e) => {

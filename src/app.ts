@@ -20,6 +20,7 @@ import { identifiersFromCode } from './search/tokenize.js';
 import { GitHubClient, verifyWebhookSignature } from './review/github.js';
 import { handleGitHubWebhook } from './review/webhook.js';
 import { listPullStatuses, reviewPulls } from './review/pulls.js';
+import type { UsageTracker } from './usage/tracker.js';
 
 export interface AppDeps {
   config: Config;
@@ -32,6 +33,8 @@ export interface AppDeps {
   retrieve: RetrieveFn;
   github: GitHubClient;
   jobs: JobQueue;
+  /** Records what backend calls cost and reports it per day. */
+  usage: UsageTracker;
   log?: (msg: string) => void;
   /** Directory for static dashboard files. Defaults to <project>/web. */
   webDir?: string;
@@ -63,6 +66,9 @@ const reviewPullsSchema = z.object({
   post: z.boolean().optional(),
   force: z.boolean().optional(),
 });
+
+// `?days=` (empty) means the default, like an absent param; coercing '' would give 0 and fail min(1).
+const usageDaysSchema = z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(1).max(365).default(30));
 
 const reviewSchema = z.object({
   repository: z.string().min(1),
@@ -343,6 +349,13 @@ export function createApp(deps: AppDeps): Hono {
     if (!db.getRepo(id)) return c.json({ error: 'Not found' }, 404);
     const job = enqueueReview(deps, id, body.data.prNumber, { post: body.data.post ?? true, force: body.data.force });
     return c.json({ jobId: job.id }, 202);
+  });
+
+  // ---- usage ----
+  app.get('/api/usage', async (c) => {
+    const days = usageDaysSchema.safeParse(c.req.query('days'));
+    if (!days.success) return c.json({ error: days.error.message }, 400);
+    return c.json(await deps.usage.report(days.data));
   });
 
   // ---- jobs ----

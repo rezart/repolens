@@ -21,6 +21,10 @@
       <span class="dot dot-idle"></span><span class="health-text">checking…</span>
     </div>
 
+    <div class="side-nav">
+      <button id="usage-nav" class="btn btn-ghost btn-sm" type="button">Usage</button>
+    </div>
+
     <section class="side-section">
       <label class="field-label" for="token-input">API token</label>
       <div class="token-row">
@@ -68,6 +72,24 @@
         </nav>
       </header>
       <div class="panel-body" id="tab-body"></div>
+    </div>
+
+    <div class="panel" id="usage-panel" hidden>
+      <header class="panel-head">
+        <div class="panel-title">
+          <h2>Usage</h2>
+          <div class="panel-meta">tokens and cost per day, provider and model</div>
+        </div>
+        <div class="usage-range">
+          <label class="field-label" for="usage-days">Range</label>
+          <select id="usage-days">
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+          </select>
+        </div>
+      </header>
+      <div class="panel-body" id="usage-body"></div>
     </div>
   </main>
 </div>

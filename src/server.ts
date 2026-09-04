@@ -8,12 +8,18 @@ import { createRetriever } from './search/retrieve.js';
 import { GitHubClient } from './review/github.js';
 import { JobQueue } from './jobs.js';
 import { createApp, type AppDeps } from './app.js';
+import { OpenRouterPricing } from './usage/pricing.js';
+import { UsageTracker } from './usage/tracker.js';
 import { startPoller } from './poller.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
   const db = openDb(join(config.dataDir, 'repolens.db'));
+  // Accounting is wired before the backends so each one gets its role's sink.
+  // The price list is public, so it is fetched with or without an OpenRouter key.
+  const pricing = new OpenRouterPricing({ db, baseUrl: config.llm.openrouterBaseUrl });
+  const usage = new UsageTracker({ db, pricing, log });
   // Reviews get the configured reasoning budget.
-  const llm = createProvider(config, { reasoningEffort: config.llm.reasoningEffort });
+  const llm = createProvider(config, { reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
   // Chat always gets its own provider so it pins effort to 'low' rather than
   // inheriting the review budget, even when it runs on the same provider/model.
   // Measured on the Claude CLI with haiku, the default budget spends ~17s thinking
@@ -24,12 +30,13 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
     provider: config.chatProvider || undefined,
     model: config.chatModel || undefined,
     reasoningEffort: 'low',
+    onUsage: usage.sinkFor('chat'),
   });
-  const embeddings = createEmbeddings(config);
+  const embeddings = createEmbeddings(config, { onUsage: usage.sinkFor('embed') });
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token: config.github.token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, chatLlm, embeddings, retrieve, github, jobs, log };
+  return { config, db, llm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {

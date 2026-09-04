@@ -20,6 +20,7 @@ Everything runs in one Node process with a SQLite database (FTS5 for lexical sea
 - **PR chat**: mention the bot handle in a PR comment (`@repolens why does this change X?`) to get an answer posted back.
 - **REST API** modeled on Greptile's (`/api/repositories`, `/api/query`, `/api/search`, `/api/reviews`).
 - **Dashboard** at `/` for adding repos, chatting, running reviews, and setting per-repo review instructions.
+- **Usage and cost**: every LLM and embedding call is recorded; the dashboard's Usage page shows tokens per day, provider and model with a dollar figure priced from OpenRouter's public model list (exact where the backend reports a cost, estimated for the subscription CLIs).
 - **CLI** for indexing, asking, and reviewing from the terminal.
 
 ## Quick start
@@ -163,6 +164,7 @@ All `/api/*` routes except `/api/health` require `Authorization: Bearer <REPOLEN
 | POST | `/api/reviews` | `{ repository, prNumber, post? (default true), force? }` → 202 with `jobId` |
 | GET | `/api/reviews?repository=` | past reviews with findings |
 | GET | `/api/jobs/:id` | job status and progress |
+| GET | `/api/usage?days=` | tokens and cost per day, provider and model (default 30 days, max 365). `costUsd` is the reported cost plus an OpenRouter list-price estimate for calls that reported none; `null` when the model has no price |
 | POST | `/webhooks/github` | GitHub webhook (HMAC verified) |
 
 ## Configuration

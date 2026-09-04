@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { ProviderError } from '../../src/llm/types.js';
+import type { UsageRecord } from '../../src/usage/types.js';
 
 interface Call {
   url: string;
@@ -86,6 +87,8 @@ describe('OpenRouterProvider', () => {
     await p.complete({ messages: [{ role: 'user', content: 'hi' }], json: true });
     const body = JSON.parse(f.calls[0]!.init.body as string);
     expect(body.response_format).toEqual({ type: 'json_object' });
+    // json mode must not cost us the usage block every call is billed from.
+    expect(body.usage).toEqual({ include: true });
   });
 
   it('honours a custom base url without a trailing slash problem', async () => {
@@ -295,6 +298,122 @@ describe('OpenRouterProvider.stream', () => {
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
     await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
     expect(JSON.parse(String(f.calls[0]!.init.body)).stream).toBeUndefined();
+  });
+});
+
+describe('OpenRouterProvider usage reporting', () => {
+  const withUsage = (usage: unknown) =>
+    jsonResponse({ choices: [{ message: { role: 'assistant', content: 'hello there' } }], usage });
+
+  it('reports normalised usage with cost and cached tokens, and asks for cost in the payload', async () => {
+    const f = fakeFetch([
+      withUsage({
+        prompt_tokens: 120,
+        completion_tokens: 30,
+        prompt_tokens_details: { cached_tokens: 20 },
+        cost: 0.0042,
+      }),
+    ]);
+    const seen: UsageRecord[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    expect(await p.complete({ messages: [{ role: 'user', content: 'hi' }] })).toBe('hello there');
+    expect(seen).toEqual([
+      {
+        provider: 'openrouter',
+        model: 'm1',
+        inputTokens: 100,
+        cachedInputTokens: 20,
+        cacheWriteTokens: 0,
+        outputTokens: 30,
+        costUsd: 0.0042,
+      },
+    ]);
+    expect(JSON.parse(String(f.calls[0]!.init.body)).usage).toEqual({ include: true });
+  });
+
+  it('reports a null cost and no cached tokens when the body omits them', async () => {
+    const f = fakeFetch([withUsage({ prompt_tokens: 10, completion_tokens: 4 })]);
+    const seen: UsageRecord[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([
+      {
+        provider: 'openrouter',
+        model: 'm1',
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 4,
+        costUsd: null,
+      },
+    ]);
+  });
+
+  it('reports nothing when the response carries no usage', async () => {
+    const f = fakeFetch([ok()]);
+    const seen: UsageRecord[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([]);
+  });
+
+  it('reports nothing when the usage fields are not numbers', async () => {
+    const f = fakeFetch([withUsage({ prompt_tokens: 'lots', completion_tokens: null })]);
+    const seen: UsageRecord[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([]);
+  });
+
+  it('still returns the completion when the sink throws', async () => {
+    const f = fakeFetch([withUsage({ prompt_tokens: 5, completion_tokens: 1 })]);
+    const p = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm1',
+      fetch: f.fetch,
+      onUsage: () => {
+        throw new Error('sink is broken');
+      },
+    });
+    expect(await p.complete({ messages: [{ role: 'user', content: 'hi' }] })).toBe('hello there');
+  });
+
+  it('reports the usage carried on the last stream frame, once', async () => {
+    const usageFrame =
+      'data: ' +
+      JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 80, completion_tokens: 12, prompt_tokens_details: { cached_tokens: 30 }, cost: 0.5 },
+      }) +
+      '\n\n';
+    const f = fakeFetch([sseResponse([dataFrame('hi'), usageFrame, 'data: [DONE]\n\n'])]);
+    const seen: UsageRecord[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    expect(await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).toBe('hi');
+    expect(seen).toEqual([
+      {
+        provider: 'openrouter',
+        model: 'm1',
+        inputTokens: 50,
+        cachedInputTokens: 30,
+        cacheWriteTokens: 0,
+        outputTokens: 12,
+        costUsd: 0.5,
+      },
+    ]);
+    expect(JSON.parse(String(f.calls[0]!.init.body)).usage).toEqual({ include: true });
+  });
+
+  it('reports nothing when the stream ends before [DONE]', async () => {
+    const usageFrame =
+      'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 9, completion_tokens: 1 } }) + '\n\n';
+    const f = fakeFetch([sseResponse([dataFrame('half an ans'), usageFrame])]);
+    const seen: UsageRecord[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toThrow(
+      /stream ended before \[DONE\]/,
+    );
+    expect(seen).toEqual([]);
   });
 });
 

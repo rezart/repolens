@@ -1,6 +1,7 @@
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
+import type { UsageSink } from '../usage/types.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -14,6 +15,8 @@ export interface OpenRouterOptions {
   sleep?: Sleep;
   /** Sent as `reasoning: { effort }`. Blank/undefined omits it. */
   reasoningEffort?: ReasoningEffort | '';
+  /** Called once per successful completion with the tokens it consumed. */
+  onUsage?: UsageSink;
 }
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -21,14 +24,24 @@ const MAX_ATTEMPTS = 3;
 
 const defaultSleep: Sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+/** OpenRouter's usage block, requested with `usage: { include: true }`. */
+interface RawUsage {
+  prompt_tokens?: unknown;
+  completion_tokens?: unknown;
+  prompt_tokens_details?: { cached_tokens?: unknown } | null;
+  cost?: unknown;
+}
+
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: unknown } }>;
+  usage?: RawUsage | null;
   error?: unknown;
 }
 
 /** One `data:` frame of a `stream: true` chat completion. */
 interface StreamChunk {
   choices?: Array<{ delta?: { content?: unknown }; finish_reason?: unknown }>;
+  usage?: RawUsage | null;
 }
 
 /** OpenRouter (OpenAI-compatible) chat completions. */
@@ -43,6 +56,7 @@ export class OpenRouterProvider implements LLMProvider {
   private readonly timeoutMs: number;
   private readonly sleep: Sleep;
   private readonly effort: ReasoningEffort | undefined;
+  private readonly onUsage: UsageSink | undefined;
 
   constructor(opts: OpenRouterOptions) {
     this.apiKey = opts.apiKey;
@@ -52,6 +66,39 @@ export class OpenRouterProvider implements LLMProvider {
     this.timeoutMs = opts.timeoutMs ?? 300_000;
     this.sleep = opts.sleep ?? defaultSleep;
     this.effort = opts.reasoningEffort || undefined;
+    this.onUsage = opts.onUsage;
+  }
+
+  /**
+   * Normalise and hand one usage block to the sink. Silently ignores usage the
+   * backend did not report (or reported malformed), and never lets a throwing
+   * sink turn a finished completion into a failure.
+   *
+   * The block has no cache-write field, so Anthropic cache-creation tokens stay
+   * counted inside `prompt_tokens` here, while the Claude CLI reports them
+   * separately as `cacheWriteTokens`. Cost is unaffected: OpenRouter reports
+   * `cost` itself, so those tokens are never re-priced from the token split.
+   */
+  private reportUsage(usage: RawUsage | null | undefined): void {
+    if (!this.onUsage || !usage || typeof usage !== 'object') return;
+    const prompt = usage.prompt_tokens;
+    const completion = usage.completion_tokens;
+    if (typeof prompt !== 'number' || typeof completion !== 'number') return;
+    const rawCached = usage.prompt_tokens_details?.cached_tokens;
+    const cached = typeof rawCached === 'number' ? rawCached : 0;
+    try {
+      this.onUsage({
+        provider: 'openrouter',
+        model: this.model,
+        inputTokens: prompt - cached,
+        cachedInputTokens: cached,
+        cacheWriteTokens: 0,
+        outputTokens: completion,
+        costUsd: typeof usage.cost === 'number' ? usage.cost : null,
+      });
+    } catch {
+      // Accounting must never break a completion.
+    }
   }
 
   private buildPayload(req: CompleteRequest, streaming: boolean): string {
@@ -59,7 +106,8 @@ export class OpenRouterProvider implements LLMProvider {
       ? [{ role: 'system', content: req.system }, ...req.messages]
       : [...req.messages];
 
-    const body: Record<string, unknown> = { model: this.model, messages };
+    // `usage.include` makes OpenRouter return token counts and the call's cost.
+    const body: Record<string, unknown> = { model: this.model, messages, usage: { include: true } };
     if (req.maxTokens !== undefined) body.max_tokens = req.maxTokens;
     if (req.temperature !== undefined) body.temperature = req.temperature;
     if (req.json) body.response_format = { type: 'json_object' };
@@ -69,7 +117,9 @@ export class OpenRouterProvider implements LLMProvider {
   }
 
   async complete(req: CompleteRequest): Promise<string> {
-    return this.readContent(await this.post(this.buildPayload(req, false)));
+    const { content, usage } = await this.readContent(await this.post(this.buildPayload(req, false)));
+    this.reportUsage(usage);
+    return content;
   }
 
   /**
@@ -88,6 +138,9 @@ export class OpenRouterProvider implements LLMProvider {
     let text = '';
     let done = false;
     let finishReason = false;
+    // OpenRouter sends usage on a late frame (often one with no choices); keep the
+    // last one and report it only once the stream has ended successfully.
+    let usage: RawUsage | null | undefined;
 
     const consumeLine = (line: string) => {
       const trimmed = line.trim();
@@ -106,6 +159,7 @@ export class OpenRouterProvider implements LLMProvider {
         // rather than returning a silently truncated response.
         throw new ProviderError('openrouter', `malformed stream frame: ${data.slice(0, 200)}`, res.status);
       }
+      if (chunk.usage) usage = chunk.usage;
       if (chunk.choices?.[0]?.finish_reason) finishReason = true;
       const delta = chunk.choices?.[0]?.delta?.content;
       if (typeof delta !== 'string' || !delta) return;
@@ -139,6 +193,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (!done && !finishReason) {
       throw new ProviderError('openrouter', 'stream ended before [DONE]', res.status, text.slice(0, 200));
     }
+    this.reportUsage(usage);
     return text;
   }
 
@@ -181,7 +236,8 @@ export class OpenRouterProvider implements LLMProvider {
     throw lastError ?? new ProviderError('openrouter', 'request failed');
   }
 
-  private async readContent(res: Response): Promise<string> {
+  /** The message text plus the usage block, if the response carried one. */
+  private async readContent(res: Response): Promise<{ content: string; usage: RawUsage | null | undefined }> {
     let parsed: ChatCompletionResponse;
     const text = await safeText(res);
     try {
@@ -193,7 +249,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (typeof content !== 'string') {
       throw new ProviderError('openrouter', 'response had no message content', res.status, text.slice(0, 500));
     }
-    return content;
+    return { content, usage: parsed.usage };
   }
 }
 

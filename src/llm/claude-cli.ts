@@ -5,6 +5,7 @@ import { runProcess, sharedSemaphore, childEnv, lineSplitter } from './spawn.js'
 import type { RunProcess, Semaphore } from './spawn.js';
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
+import type { UsageRecord, UsageSink } from '../usage/types.js';
 
 export const JSON_INSTRUCTION = 'Respond with a single JSON object and nothing else.';
 
@@ -18,6 +19,8 @@ export interface CliProviderOptions {
   cwd?: string;
   /** Thinking budget. Blank/undefined leaves the CLI default alone. */
   reasoningEffort?: ReasoningEffort | '';
+  /** Called once per successful call with the tokens and cost the CLI reported. */
+  onUsage?: UsageSink;
 }
 
 /**
@@ -44,10 +47,38 @@ export function withJsonInstruction(system: string | undefined, json: boolean | 
   return system ? `${system}\n\n${JSON_INSTRUCTION}` : JSON_INSTRUCTION;
 }
 
+/**
+ * The token counts a `result` object carries. `input_tokens` is already the
+ * fresh (uncached) input; cache reads and writes are counted separately.
+ */
+interface ClaudeCliUsage {
+  input_tokens?: unknown;
+  cache_creation_input_tokens?: unknown;
+  cache_read_input_tokens?: unknown;
+  output_tokens?: unknown;
+}
+
+/**
+ * One model's share of a call. The CLI can switch models mid-call (a fallback
+ * on overload, a subagent), and only these entries say which tokens went where.
+ */
+interface ClaudeCliModelUsage {
+  canonicalModel?: unknown;
+  inputTokens?: unknown;
+  outputTokens?: unknown;
+  cacheReadInputTokens?: unknown;
+  cacheCreationInputTokens?: unknown;
+  costUSD?: unknown;
+}
+
 interface ClaudeCliResult {
   result?: unknown;
   is_error?: boolean;
   subtype?: string;
+  total_cost_usd?: unknown;
+  usage?: ClaudeCliUsage;
+  /** Keyed by the dated model id; the entry names the canonical model. */
+  modelUsage?: Record<string, ClaudeCliModelUsage | undefined>;
 }
 
 /**
@@ -77,6 +108,7 @@ export class ClaudeCliProvider implements LLMProvider {
   private readonly run: RunProcess;
   private readonly cwdOption: string | undefined;
   private readonly effort: ReasoningEffort | undefined;
+  private readonly onUsage: UsageSink | undefined;
   private tempDir: string | undefined;
   /** Shared per binary: two providers on the same CLI still run one process at a time. */
   private readonly gate: Semaphore;
@@ -89,7 +121,79 @@ export class ClaudeCliProvider implements LLMProvider {
     this.run = opts.run ?? runProcess;
     this.cwdOption = opts.cwd;
     this.effort = opts.reasoningEffort || undefined;
+    this.onUsage = opts.onUsage;
     this.gate = sharedSemaphore(`${this.name}:${this.bin}`);
+  }
+
+  /**
+   * Report the token counts of a successful run. Anything missing or
+   * unexpectedly shaped is skipped rather than guessed at, and a sink that
+   * throws must never turn a good completion into a failure.
+   */
+  private emitUsage(final: ClaudeCliResult | undefined): void {
+    if (!this.onUsage || !final) return;
+    for (const record of this.usageRecords(final)) {
+      try {
+        this.onUsage(record);
+      } catch {
+        // A broken usage sink is not a reason to fail the call.
+      }
+    }
+  }
+
+  /**
+   * One record per model the call used. `usage` and `total_cost_usd` are the
+   * aggregate over all of them, so per-model entries are preferred: billing a
+   * two-model call entirely to the first one misprices both.
+   */
+  private usageRecords(final: ClaudeCliResult): UsageRecord[] {
+    const usage = final.usage;
+    const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+    const perModel: UsageRecord[] = [];
+    let soleEntryLacksCacheCounts = false;
+    for (const [key, entry] of Object.entries(final.modelUsage ?? {})) {
+      if (!entry) continue;
+      const inputTokens = num(entry.inputTokens);
+      const outputTokens = num(entry.outputTokens);
+      if (inputTokens === null || outputTokens === null) continue;
+      const cacheRead = num(entry.cacheReadInputTokens);
+      const cacheWrite = num(entry.cacheCreationInputTokens);
+      soleEntryLacksCacheCounts = cacheRead === null && cacheWrite === null;
+      perModel.push({
+        provider: this.name,
+        model: typeof entry.canonicalModel === 'string' ? entry.canonicalModel : key,
+        inputTokens,
+        cachedInputTokens: cacheRead ?? 0,
+        cacheWriteTokens: cacheWrite ?? 0,
+        outputTokens,
+        costUsd: num(entry.costUSD),
+      });
+    }
+    if (perModel.length === 1 && soleEntryLacksCacheCounts && usage) {
+      // A lone entry that omits its cache counts still owns the whole call, so the
+      // aggregate cache figures (and cost, if the entry has none) are its own.
+      const only = perModel[0]!;
+      only.cachedInputTokens = num(usage.cache_read_input_tokens) ?? 0;
+      only.cacheWriteTokens = num(usage.cache_creation_input_tokens) ?? 0;
+      only.costUsd ??= num(final.total_cost_usd);
+    }
+    if (perModel.length) return perModel;
+
+    if (!usage) return [];
+    const inputTokens = num(usage.input_tokens);
+    const outputTokens = num(usage.output_tokens);
+    if (inputTokens === null || outputTokens === null) return [];
+    return [
+      {
+        provider: this.name,
+        model: this.model,
+        inputTokens,
+        cachedInputTokens: num(usage.cache_read_input_tokens) ?? 0,
+        cacheWriteTokens: num(usage.cache_creation_input_tokens) ?? 0,
+        outputTokens,
+        costUsd: num(final.total_cost_usd),
+      },
+    ];
   }
 
   /** An empty scratch directory so the CLI has no project context to read. */
@@ -168,6 +272,7 @@ export class ClaudeCliProvider implements LLMProvider {
     if (final?.is_error) {
       throw new ProviderError('claude-cli', `CLI reported an error (${final.subtype ?? 'unknown'})`, undefined, detail);
     }
+    this.emitUsage(final);
     // The `result` event carries the authoritative text; the deltas are a
     // best-effort preview and are used only if the CLI never emitted one.
     if (typeof final?.result === 'string') return final.result;
@@ -212,6 +317,7 @@ export class ClaudeCliProvider implements LLMProvider {
     if (typeof parsed.result !== 'string') {
       throw new ProviderError('claude-cli', 'output JSON had no string result', undefined, detail);
     }
+    this.emitUsage(parsed);
     return parsed.result;
   }
 }

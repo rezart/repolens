@@ -7,6 +7,56 @@ import { flattenMessages, withJsonInstruction } from './claude-cli.js';
 import type { CliProviderOptions, ReasoningEffort } from './claude-cli.js';
 import { ProviderError } from './types.js';
 import type { CompleteRequest, LLMProvider, OnDelta } from './types.js';
+import type { UsageRecord, UsageSink } from '../usage/types.js';
+
+/**
+ * The `turn.completed` line of `codex exec --json`, taken from a live run:
+ * `{"type":"turn.completed","usage":{"input_tokens":18114,"cached_input_tokens":15104,
+ * "output_tokens":97,"reasoning_output_tokens":90}}`. `input_tokens` is the total
+ * prompt size and already includes the cached tokens.
+ */
+interface CodexTurnCompleted {
+  type?: string;
+  usage?: {
+    input_tokens?: unknown;
+    cached_input_tokens?: unknown;
+    output_tokens?: unknown;
+  };
+}
+
+/**
+ * Pull the token counts out of a `codex exec --json` stdout stream.
+ * Non-JSON log lines and events of other types are ignored, and the last
+ * `turn.completed` wins. Returns undefined when the run reported no usable counts.
+ */
+function usageFromStdout(stdout: string): Omit<UsageRecord, 'provider' | 'model'> | undefined {
+  let found: Omit<UsageRecord, 'provider' | 'model'> | undefined;
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: CodexTurnCompleted;
+    try {
+      event = JSON.parse(trimmed) as CodexTurnCompleted;
+    } catch {
+      continue; // plain log lines share stdout with the events
+    }
+    if (!event || typeof event !== 'object' || event.type !== 'turn.completed') continue;
+    const usage = event.usage;
+    if (!usage) continue;
+    const total = usage.input_tokens;
+    const outputTokens = usage.output_tokens;
+    if (typeof total !== 'number' || typeof outputTokens !== 'number') continue;
+    const cachedInputTokens = typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0;
+    found = {
+      inputTokens: total - cachedInputTokens,
+      cachedInputTokens,
+      cacheWriteTokens: 0,
+      outputTokens,
+      costUsd: null, // Codex reports tokens only, never a price
+    };
+  }
+  return found;
+}
 
 /** Runs completions through the local `codex` CLI (uses the user's ChatGPT subscription). */
 export class CodexCliProvider implements LLMProvider {
@@ -20,6 +70,7 @@ export class CodexCliProvider implements LLMProvider {
   private readonly run: RunProcess;
   private readonly cwdOption: string | undefined;
   private readonly effort: ReasoningEffort | undefined;
+  private readonly onUsage: UsageSink | undefined;
   private tempDir: string | undefined;
   /** Shared per binary: two providers on the same CLI still run one process at a time. */
   private readonly gate: Semaphore;
@@ -32,7 +83,24 @@ export class CodexCliProvider implements LLMProvider {
     this.run = opts.run ?? runProcess;
     this.cwdOption = opts.cwd;
     this.effort = opts.reasoningEffort || undefined;
+    this.onUsage = opts.onUsage;
     this.gate = sharedSemaphore(`${this.name}:${this.bin}`);
+  }
+
+  /**
+   * Report the token counts of a successful run. Missing or oddly shaped counts
+   * are skipped rather than guessed at, and a sink that throws must never turn a
+   * good completion into a failure.
+   */
+  private emitUsage(stdout: string): void {
+    if (!this.onUsage) return;
+    const counts = usageFromStdout(stdout);
+    if (!counts) return;
+    try {
+      this.onUsage({ provider: this.name, model: this.model, ...counts });
+    } catch {
+      // A broken usage sink is not a reason to fail the call.
+    }
   }
 
   /** Scratch directory used both as cwd and to hold the output file. */
@@ -67,6 +135,9 @@ export class CodexCliProvider implements LLMProvider {
       'read-only',
       '--color',
       'never',
+      // Line-delimited events on stdout; the only one read is `turn.completed`,
+      // for its token counts. The answer still comes from the `-o` file.
+      '--json',
       '-C',
       cwd,
       '-o',
@@ -104,6 +175,7 @@ export class CodexCliProvider implements LLMProvider {
       }
       const trimmed = output.trim();
       if (!trimmed) throw new ProviderError('codex-cli', 'CLI output was empty', undefined, detail);
+      this.emitUsage(res.stdout);
       // The output file is authoritative and Codex emits no token deltas, only whole
       // (sometimes intermediate) assistant messages. Forwarding those would show text
       // that is absent from the final answer, so streaming is a single delta at the end.
