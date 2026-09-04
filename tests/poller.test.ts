@@ -10,7 +10,7 @@ import type { GitHubClient, PullRequest } from '../src/review/github.js';
 import { pollOnce } from '../src/poller.js';
 
 function pr(number: number, headSha: string, draft = false): PullRequest {
-  return { number, title: 't', body: '', headSha, baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft };
+  return { number, title: 't', body: '', headSha, baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'a', htmlUrl: '', draft, updatedAt: null };
 }
 
 function makeDeps(github: Partial<GitHubClient>): AppDeps {

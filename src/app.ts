@@ -18,6 +18,7 @@ import { formatContext } from './search/retrieve.js';
 import { identifiersFromCode } from './search/tokenize.js';
 import { GitHubClient, verifyWebhookSignature } from './review/github.js';
 import { handleGitHubWebhook } from './review/webhook.js';
+import { listPullStatuses, reviewPulls } from './review/pulls.js';
 
 export interface AppDeps {
   config: Config;
@@ -51,6 +52,12 @@ const searchSchema = z.object({
   query: z.string().min(1),
   repositories: z.array(z.string()).min(1),
   limit: z.number().int().positive().max(100).optional(),
+});
+
+const reviewPullsSchema = z.object({
+  prNumbers: z.array(z.number().int().positive()).optional(),
+  post: z.boolean().optional(),
+  force: z.boolean().optional(),
 });
 
 const reviewSchema = z.object({
@@ -111,22 +118,27 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
   const repo = deps.db.getRepo(repoId);
   if (!repo) throw new Error(`Unknown repository ${repoId}`);
   if (!repoId.startsWith('github:')) throw new Error(`Pull request review needs a GitHub repository; ${repoId} is local`);
-  return deps.jobs.enqueue('review', repoId, async (ctx) => {
-    ctx.progress(`reviewing PR #${prNumber}`);
-    const result = await reviewPullRequest(
-      {
-        db: deps.db,
-        llm: deps.llm,
-        retrieve: deps.retrieve,
-        github: deps.github,
-        identifiers: identifiersFromCode,
-        formatContext: (chunks) => formatContext(chunks, 16000),
-        log: (m) => ctx.progress(m),
-      },
-      { repoId, prNumber, post: opts.post ?? true, force: opts.force },
-    );
-    return { reviewId: result.reviewId, findings: result.findings.length, posted: result.posted, reviewUrl: result.reviewUrl };
-  });
+  return deps.jobs.enqueue(
+    'review',
+    repoId,
+    async (ctx) => {
+      ctx.progress(`reviewing PR #${prNumber}`);
+      const result = await reviewPullRequest(
+        {
+          db: deps.db,
+          llm: deps.llm,
+          retrieve: deps.retrieve,
+          github: deps.github,
+          identifiers: identifiersFromCode,
+          formatContext: (chunks) => formatContext(chunks, 16000),
+          log: (m) => ctx.progress(m),
+        },
+        { repoId, prNumber, post: opts.post ?? true, force: opts.force },
+      );
+      return { reviewId: result.reviewId, findings: result.findings.length, posted: result.posted, reviewUrl: result.reviewUrl };
+    },
+    { prNumber },
+  );
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -208,6 +220,34 @@ export function createApp(deps: AppDeps): Hono {
     if (!db.getRepo(id)) return c.json({ error: 'Not found' }, 404);
     db.deleteRepo(id);
     return c.json({ ok: true });
+  });
+
+  // ---- pull requests ----
+  app.get('/api/repositories/:id/pulls', async (c) => {
+    const id = decodeURIComponent(c.req.param('id'));
+    if (!db.getRepo(id)) return c.json({ error: 'Not found' }, 404);
+    if (!id.startsWith('github:')) return c.json({ error: 'pull requests need a GitHub repository' }, 400);
+    try {
+      return c.json({ pulls: await listPullStatuses(deps, id) });
+    } catch (err) {
+      // The repo exists and is on GitHub, so a failure here is GitHub's (or the network's).
+      return c.json({ error: (err as Error).message }, 502);
+    }
+  });
+
+  app.post('/api/repositories/:id/pulls/review', async (c) => {
+    const id = decodeURIComponent(c.req.param('id'));
+    if (!db.getRepo(id)) return c.json({ error: 'Not found' }, 404);
+    if (!id.startsWith('github:')) return c.json({ error: 'pull requests need a GitHub repository' }, 400);
+    const body = reviewPullsSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!body.success) return c.json({ error: body.error.message }, 400);
+    let pulls;
+    try {
+      pulls = await listPullStatuses(deps, id);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 502);
+    }
+    return c.json(reviewPulls(deps, id, { ...body.data, pulls }), 202);
   });
 
   // ---- query / search ----

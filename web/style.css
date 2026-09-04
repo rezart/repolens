@@ -306,6 +306,28 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .sev-medium, .sev-warning, .sev-warn { background: var(--warn-soft); color: var(--warn); }
 .sev-low, .sev-info, .sev-nit { background: var(--info-soft); color: var(--info); }
 
+/* ------------------------------------------------- open pull requests */
+
+.pulls { display: flex; flex-direction: column; gap: 6px; }
+.pull {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px; background: var(--panel-2);
+}
+.pull-main { flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.pull-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; }
+.pull-num { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--accent); text-decoration: none; flex: none; }
+.pull-name { font-weight: 550; color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
+.pull-num:hover, .pull-name:hover { text-decoration: underline; }
+.pull-meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--muted); }
+.pull-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+.pull-findings { font-size: 11px; color: var(--muted); }
+.pull-progress { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.pull-status .review-posted { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.pull-status .review-posted.is-posted { color: var(--ok); }
+.pulls-err { margin: 0 0 4px; color: var(--err); font-size: 12px; }
+.badge-draft { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+
 /* ------------------------------------------------------------ toasts */
 
 .toasts { position: fixed; right: 14px; bottom: 14px; z-index: 50; display: flex; flex-direction: column; gap: 8px; max-width: min(420px, calc(100vw - 28px)); }
@@ -331,4 +353,5 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
   .chat-composer { padding: 10px 12px; }
   .chat-log { min-height: 40vh; }
   .review-time { margin-left: 0; }
+  .pull-status { margin-left: 0; }
 }

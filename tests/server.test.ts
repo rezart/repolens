@@ -157,6 +157,85 @@ describe('API', () => {
     expect((await res.json()).instructions).toBe('Be strict about error handling.');
   });
 
+  describe('pull requests', () => {
+    const openPulls = [
+      { number: 1, title: 'Add auth', body: '', headSha: 'h1', baseSha: 'b', headRef: 'f', baseRef: 'main', author: 'octocat', htmlUrl: 'https://github.com/o/n/pull/1', draft: false, updatedAt: '2026-01-02T03:04:05Z' },
+      { number: 2, title: 'WIP', body: '', headSha: 'h2', baseSha: 'b', headRef: 'g', baseRef: 'main', author: 'octocat', htmlUrl: 'https://github.com/o/n/pull/2', draft: true, updatedAt: null },
+    ];
+
+    beforeEach(() => {
+      deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+      deps.github = {
+        listOpenPulls: async () => openPulls,
+        getPull: async (_o: string, _r: string, n: number) => openPulls.find((p) => p.number === n),
+        getPullDiff: async () => '',
+        listReviewComments: async () => [],
+        createReview: async () => ({ id: 1, htmlUrl: 'u' }),
+      } as unknown as GitHubClient;
+    });
+
+    it('lists open pull requests with their review status', async () => {
+      deps.db.insertReview({
+        repo_id: 'github:o/n', pr_number: 1, head_sha: 'h1', status: 'done', summary: 's', verdict: 'comment',
+        comments_json: '[{"path":"a.ts","line":1,"severity":"nit","title":"t","body":"b"}]', posted: 1, error: null,
+      });
+      const res = await app.request('/api/repositories/github%3Ao%2Fn/pulls', { headers: auth });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.pulls).toHaveLength(2);
+      expect(body.pulls[0]).toMatchObject({ number: 1, title: 'Add auth', updatedAt: '2026-01-02T03:04:05Z' });
+      expect(body.pulls[0].review).toEqual({ status: 'reviewed', reviewId: 1, posted: true, verdict: 'comment', findings: 1 });
+      expect(body.pulls[1].review).toEqual({ status: 'none' });
+    });
+
+    it('queues reviews for the unreviewed pull requests', async () => {
+      const res = await app.request('/api/repositories/github%3Ao%2Fn/pulls/review', {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ post: false }),
+      });
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.jobs).toHaveLength(1);
+      expect(body.jobs[0].prNumber).toBe(1);
+      expect(deps.db.getJob(body.jobs[0].jobId)?.kind).toBe('review');
+      expect(body.skipped).toEqual([{ prNumber: 2, reason: 'draft' }]);
+      await deps.jobs.idle();
+    });
+
+    it('reviews the requested pull request numbers', async () => {
+      const res = await app.request('/api/repositories/github%3Ao%2Fn/pulls/review', {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ prNumbers: [2], post: false }),
+      });
+      expect(res.status).toBe(202);
+      expect((await res.json()).jobs.map((j: { prNumber: number }) => j.prNumber)).toEqual([2]);
+      await deps.jobs.idle();
+    });
+
+    it('rejects pull request routes for local repositories and unknown repos', async () => {
+      deps.db.upsertRepo({ id: 'local:x', remote: '/x', owner: 'local', name: 'x', branch: 'main' });
+      const res = await app.request('/api/repositories/local%3Ax/pulls', { headers: auth });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/GitHub repository/);
+      const post = await app.request('/api/repositories/local%3Ax/pulls/review', { method: 'POST', headers: auth, body: '{}' });
+      expect(post.status).toBe(400);
+      expect((await app.request('/api/repositories/github%3Ano%2Fpe/pulls', { headers: auth })).status).toBe(404);
+    });
+
+    it('surfaces GitHub failures as 502', async () => {
+      deps.github = {
+        listOpenPulls: async () => {
+          throw new Error('GitHub 403 rate limited');
+        },
+      } as unknown as GitHubClient;
+      const res = await app.request('/api/repositories/github%3Ao%2Fn/pulls', { headers: auth });
+      expect(res.status).toBe(502);
+      expect((await res.json()).error).toContain('GitHub 403');
+    });
+  });
+
   describe('webhook', () => {
     const sign = (body: string) => 'sha256=' + createHmac('sha256', 'whsec').update(body).digest('hex');
 

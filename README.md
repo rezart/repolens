@@ -97,7 +97,9 @@ Or from the terminal:
 ```bash
 npm run cli -- index owner/name --branch main
 npm run cli -- ask github:owner/name "Where are webhooks verified?"
+npm run cli -- pulls github:owner/name              # open PRs and their review status
 npm run cli -- review github:owner/name 42 --post
+npm run cli -- review github:owner/name --all --post  # every unreviewed open PR (--force re-reviews)
 ```
 
 ### GitHub setup
@@ -129,6 +131,8 @@ All `/api/*` routes except `/api/health` require `Authorization: Bearer <REPOLEN
 | DELETE | `/api/repositories/:id` | |
 | POST | `/api/query` | `{ messages, repositories, stream? }` → `{ message, sources }` (SSE when `stream: true`) |
 | POST | `/api/search` | `{ query, repositories, limit? }` → chunks |
+| GET | `/api/repositories/:id/pulls` | open pull requests with their review status (`none`, `pending`, `reviewed`, `error`). 400 for local repos, 502 when GitHub fails |
+| POST | `/api/repositories/:id/pulls/review` | `{ prNumbers?, post? (default true), force? }` → 202 with `{ jobs, skipped }`. Without `prNumbers`, reviews every open non-draft PR that has no review for its head commit |
 | POST | `/api/reviews` | `{ repository, prNumber, post? (default true), force? }` → 202 with `jobId` |
 | GET | `/api/reviews?repository=` | past reviews with findings |
 | GET | `/api/jobs/:id` | job status and progress |

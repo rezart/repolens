@@ -11,6 +11,7 @@ export interface PullRequest {
   author: string;
   htmlUrl: string;
   draft: boolean;
+  updatedAt: string | null;
 }
 
 export interface ReviewComment {
@@ -116,6 +117,7 @@ export class GitHubClient {
       author: raw.user?.login ?? '',
       htmlUrl: raw.html_url ?? '',
       draft: Boolean(raw.draft),
+      updatedAt: raw.updated_at ?? null,
     };
   }
 
@@ -205,6 +207,7 @@ interface PullApiPayload {
   body: string | null;
   draft?: boolean;
   html_url: string;
+  updated_at?: string | null;
   user: { login: string } | null;
   head: { sha: string; ref: string } | null;
   base: { sha: string; ref: string } | null;

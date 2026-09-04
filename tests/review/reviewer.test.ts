@@ -59,6 +59,7 @@ const PR: PullRequest = {
   author: 'octocat',
   htmlUrl: 'https://github.com/o/r/pull/42',
   draft: false,
+  updatedAt: '2026-01-01T00:00:00Z',
 };
 
 const CHUNK: RetrievedChunk = {

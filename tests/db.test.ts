@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { openDb, type Db } from '../src/db.js';
+import { openDb, migrate, type Db } from '../src/db.js';
 
 function seed(db: Db) {
   db.upsertRepo({ id: 'github:o/n', remote: 'https://github.com/o/n', owner: 'o', name: 'n', branch: 'main' });
@@ -86,5 +86,28 @@ describe('Db', () => {
     expect(db.findReview('github:o/n', 7, 'h')?.id).toBe(review.id);
     db.markReviewPosted(review.id);
     expect(db.getReview(review.id)?.posted).toBe(1);
+  });
+
+  it('tags review jobs with their pull request number', () => {
+    seed(db);
+    db.createJob('index', 'github:o/n');
+    const first = db.createJob('review', 'github:o/n', 7);
+    const second = db.createJob('review', 'github:o/n', 8);
+    db.createJob('review', 'github:other/x', 9);
+    expect(db.getJob(first.id)?.pr_number).toBe(7);
+    // latest first, this repo's review jobs only
+    expect(db.listReviewJobsForRepo('github:o/n').map((j) => j.id)).toEqual([second.id, first.id]);
+  });
+
+  it('adds pr_number to a jobs table created before the column existed', () => {
+    const hasPrNumber = () => (db.raw.pragma('table_info(jobs)') as Array<{ name: string }>).some((c) => c.name === 'pr_number');
+    expect(hasPrNumber()).toBe(true);
+    db.raw.exec('alter table jobs drop column pr_number');
+    expect(hasPrNumber()).toBe(false);
+    migrate(db.raw);
+    expect(hasPrNumber()).toBe(true);
+    // running it again on an up-to-date database is a no-op
+    migrate(db.raw);
+    expect(hasPrNumber()).toBe(true);
   });
 });

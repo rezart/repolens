@@ -76,6 +76,8 @@ export interface JobRow {
   id: number;
   kind: JobKind;
   repo_id: string | null;
+  /** Pull request the job is about (review jobs only). */
+  pr_number: number | null;
   status: JobStatus;
   progress: string | null;
   error: string | null;
@@ -150,6 +152,7 @@ create table if not exists jobs (
   id integer primary key autoincrement,
   kind text not null,
   repo_id text,
+  pr_number integer,
   status text not null default 'queued',
   progress text,
   error text,
@@ -171,6 +174,7 @@ export class Db {
     this.raw.pragma('journal_mode = WAL');
     this.raw.pragma('foreign_keys = ON');
     this.raw.exec(SCHEMA);
+    migrate(this.raw);
     const dim = this.raw.prepare(`select value from meta where key='vec_dim'`).get() as { value: string } | undefined;
     if (dim) this.vecDim = Number(dim.value);
   }
@@ -402,8 +406,8 @@ export class Db {
   }
 
   // ---- jobs ----
-  createJob(kind: JobKind, repoId: string | null): JobRow {
-    const res = this.raw.prepare(`insert into jobs (kind, repo_id) values (?, ?)`).run(kind, repoId);
+  createJob(kind: JobKind, repoId: string | null, prNumber: number | null = null): JobRow {
+    const res = this.raw.prepare(`insert into jobs (kind, repo_id, pr_number) values (?, ?, ?)`).run(kind, repoId, prNumber);
     return this.getJob(Number(res.lastInsertRowid))!;
   }
 
@@ -420,6 +424,22 @@ export class Db {
   listJobs(limit = 50): JobRow[] {
     return this.raw.prepare(`select * from jobs order by id desc limit ?`).all(limit) as JobRow[];
   }
+
+  /** Review jobs of one repository, latest first. */
+  listReviewJobsForRepo(repoId: string, limit = 200): JobRow[] {
+    return this.raw
+      .prepare(`select * from jobs where kind='review' and repo_id=? order by id desc limit ?`)
+      .all(repoId, limit) as JobRow[];
+  }
+}
+
+/**
+ * Additive migrations for databases created by an older RepoLens. Every step must be
+ * safe to re-run: the schema above already contains the result for fresh databases.
+ */
+export function migrate(raw: Database.Database) {
+  const columns = raw.pragma('table_info(jobs)') as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === 'pr_number')) raw.exec(`alter table jobs add column pr_number integer`);
 }
 
 export function openDb(path: string): Db {
