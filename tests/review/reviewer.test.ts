@@ -11,6 +11,7 @@ import type {
 import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import {
   reviewPullRequest,
+  ReviewSupersededError,
   isReviewablePath,
   buildReviewBody,
   defaultIdentifiers,
@@ -182,6 +183,20 @@ describe('reviewPullRequest', () => {
     db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
   });
   afterEach(() => db.close());
+
+  it('abandons the review without posting when the PR head moves mid-review', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub();
+    let calls = 0;
+    gh.github.getPull = async () => (calls++ === 0 ? PR : { ...PR, headSha: 'moved' });
+    await expect(
+      reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 }),
+    ).rejects.toBeInstanceOf(ReviewSupersededError);
+    expect(llm.fileCalls()).toHaveLength(0);
+    expect(gh.reviews).toHaveLength(0);
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending']);
+    expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
 
   it('keeps findings on changed lines and drops the rest', async () => {
     const llm = fakeLlm({

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -30,6 +30,7 @@ function makeDeps(overrides: Partial<AppDeps> = {}, env: Record<string, string> 
     LLM_PROVIDER: 'claude-cli',
     REPOLENS_API_TOKEN: 'secret',
     GITHUB_WEBHOOK_SECRET: 'whsec',
+    REVIEW_SETTLE_SECONDS: '0',
     REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
     ...env,
   });
@@ -357,8 +358,35 @@ describe('API', () => {
       });
       const out = await res.json();
       expect(out.action).toBe('review');
-      expect(deps.db.getJob(out.jobId)?.kind).toBe('review');
+      expect(deps.db.listJobs().map((j) => [j.kind, j.pr_number])).toEqual([['review', 3]]);
       await deps.jobs.idle();
+    });
+
+    it('waits for a flurry of pushes to settle before queuing one review', async () => {
+      vi.useFakeTimers();
+      try {
+        const d = makeDeps({}, { REVIEW_SETTLE_SECONDS: '300' });
+        const a = createApp(d);
+        d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+        const push = async () => {
+          const body = JSON.stringify({ action: 'synchronize', number: 3, pull_request: { number: 3, draft: false }, repository: { full_name: 'o/n' } });
+          const res = await a.request('/webhooks/github', {
+            method: 'POST',
+            headers: { 'x-github-event': 'pull_request', 'x-hub-signature-256': sign(body), 'content-type': 'application/json' },
+            body,
+          });
+          return res.json();
+        };
+        expect((await push()).action).toBe('review');
+        vi.advanceTimersByTime(200_000);
+        await push();
+        vi.advanceTimersByTime(200_000);
+        expect(d.db.listJobs()).toEqual([]);
+        vi.advanceTimersByTime(101_000);
+        expect(d.db.listJobs().map((j) => [j.kind, j.pr_number])).toEqual([['review', 3]]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('reindexes on a push to the tracked branch and ignores other branches', async () => {

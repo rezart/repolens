@@ -118,6 +118,23 @@ export function enqueueIndex(deps: AppDeps, repoId: string) {
   });
 }
 
+/**
+ * Automatic triggers (webhook, poller) go through here: the review is deferred until the
+ * PR has had no push for `review.settleSeconds`, and each new push restarts the wait.
+ */
+export function scheduleReview(deps: AppDeps, repoId: string, prNumber: number): void {
+  const ms = deps.config.review.settleSeconds * 1000;
+  if (ms <= 0) {
+    enqueueReview(deps, repoId, prNumber, { post: true });
+    return;
+  }
+  deps.jobs.schedule(reviewKey(repoId, prNumber), ms, () => enqueueReview(deps, repoId, prNumber, { post: true }));
+}
+
+export function reviewKey(repoId: string, prNumber: number): string {
+  return `${repoId}#${prNumber}`;
+}
+
 export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, opts: { post?: boolean; force?: boolean } = {}) {
   const repo = deps.db.getRepo(repoId);
   if (!repo) throw new Error(`Unknown repository ${repoId}`);

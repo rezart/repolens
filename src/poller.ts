@@ -1,5 +1,5 @@
 import type { AppDeps } from './app.js';
-import { enqueueIndex, enqueueReview } from './app.js';
+import { enqueueIndex, reviewKey, scheduleReview } from './app.js';
 
 export interface PollOutcome {
   indexed: string[];
@@ -30,10 +30,11 @@ export async function pollOnce(deps: AppDeps): Promise<PollOutcome> {
       const pulls = await deps.github.listOpenPulls(repo.owner, repo.name);
       for (const pr of pulls) {
         if (pr.draft || !pr.headSha) continue;
-        const key = `${repo.id}#${pr.number}`;
-        if (busyReviews.has(key)) continue;
+        const key = reviewKey(repo.id, pr.number);
+        // A scheduled review is left alone: re-scheduling would restart its settle window.
+        if (busyReviews.has(key) || deps.jobs.scheduled(key)) continue;
         if (deps.db.findReview(repo.id, pr.number, pr.headSha)?.posted) continue;
-        enqueueReview(deps, repo.id, pr.number, { post: true });
+        scheduleReview(deps, repo.id, pr.number);
         busyReviews.add(key);
         out.reviewed.push({ repository: repo.id, prNumber: pr.number });
       }

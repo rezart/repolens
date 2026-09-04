@@ -19,6 +19,7 @@ export interface JobMeta {
 export class JobQueue {
   private queues = new Map<JobKind, Array<{ id: number; fn: JobFn }>>();
   private running = new Set<JobKind>();
+  private timers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly db: Db,
@@ -34,6 +35,28 @@ export class JobQueue {
       this.log(`job queue (${kind}) drain failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return job;
+  }
+
+  /**
+   * Debounced deferral: `fn` runs once `delayMs` after the most recent call for `key`.
+   * Lets a burst of triggers (pushes to one PR) collapse into a single job.
+   */
+  schedule(key: string, delayMs: number, fn: () => void): void {
+    clearTimeout(this.timers.get(key));
+    const t = setTimeout(() => {
+      this.timers.delete(key);
+      try {
+        fn();
+      } catch (err) {
+        this.log(`scheduled job ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }, delayMs);
+    t.unref?.();
+    this.timers.set(key, t);
+  }
+
+  scheduled(key: string): boolean {
+    return this.timers.has(key);
   }
 
   /** Resolves when every queued job of every kind has finished. Useful in tests and the CLI. */
