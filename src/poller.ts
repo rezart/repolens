@@ -62,9 +62,11 @@ export function startPoller(deps: AppDeps, intervalMs: number, log: (msg: string
     if (stopped) return;
     try {
       const r = await pollOnce(deps);
-      if (r.indexed.length || r.reviewed.length || r.errors.length) {
-        log(`poll: reindex ${r.indexed.length}, review ${r.reviewed.length}${r.errors.length ? `, errors: ${r.errors.join('; ')}` : ''}`);
-      }
+      const repos = deps.db.listRepos().filter((x) => x.id.startsWith('github:')).length;
+      log(
+        `poll: ${repos} GitHub repo(s) checked; reindex ${r.indexed.length}, review ${r.reviewed.length}` +
+          (r.errors.length ? `; errors: ${r.errors.join('; ')}` : ''),
+      );
     } catch (err) {
       log(`poll failed: ${(err as Error).message}`);
     } finally {

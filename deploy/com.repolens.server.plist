@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.repolens.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/rez/workspace/greptile-clone/node_modules/tsx/dist/cli.mjs</string>
+    <string>/Users/rez/workspace/greptile-clone/src/cli.ts</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/rez/workspace/greptile-clone</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- claude/codex/git must be on this PATH; .env supplies the rest -->
+    <key>PATH</key><string>/Users/rez/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/rez</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/rez/workspace/greptile-clone/data/repolens.log</string>
+  <key>StandardErrorPath</key><string>/Users/rez/workspace/greptile-clone/data/repolens.log</string>
+</dict>
+</plist>
