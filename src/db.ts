@@ -225,8 +225,8 @@ export class Db {
     this.raw.pragma('foreign_keys = ON');
     this.raw.exec(SCHEMA);
     migrate(this.raw);
-    const dim = this.raw.prepare(`select value from meta where key='vec_dim'`).get() as { value: string } | undefined;
-    if (dim) this.vecDim = Number(dim.value);
+    const dim = this.getMeta('vec_dim');
+    if (dim) this.vecDim = Number(dim);
   }
 
   close() {
@@ -380,7 +380,7 @@ export class Db {
          embedding float[${dim}]
        )`,
     );
-    this.raw.prepare(`insert or replace into meta (key, value) values ('vec_dim', ?)`).run(String(dim));
+    this.setMeta('vec_dim', String(dim));
     this.vecDim = dim;
   }
 

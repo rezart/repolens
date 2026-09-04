@@ -26,7 +26,7 @@ export interface UsageReportRow {
 
 export interface UsageReport {
   days: number;
-  /** Start of the window, YYYY-MM-DD in UTC. */
+  /** Start of the window, an ISO timestamp in UTC: exactly `days` before now. */
   since: string;
   pricing: { fetchedAt: string | null; error: string | null };
   rows: UsageReportRow[];
@@ -82,7 +82,7 @@ export class UsageTracker {
   }
 
   async report(days: number): Promise<UsageReport> {
-    const since = new Date(this.now() - days * DAY_MS).toISOString().slice(0, 10);
+    const since = new Date(this.now() - days * DAY_MS).toISOString();
     const rows = this.db.usageByDay(since);
     // A missing price list is not an error the report can fail on: rows still
     // carry whatever costs the backends reported themselves.

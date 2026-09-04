@@ -5,7 +5,7 @@ import { runProcess, sharedSemaphore, childEnv, lineSplitter } from './spawn.js'
 import type { RunProcess, Semaphore } from './spawn.js';
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
-import type { UsageSink } from '../usage/types.js';
+import type { UsageRecord, UsageSink } from '../usage/types.js';
 
 export const JSON_INSTRUCTION = 'Respond with a single JSON object and nothing else.';
 
@@ -58,6 +58,19 @@ interface ClaudeCliUsage {
   output_tokens?: unknown;
 }
 
+/**
+ * One model's share of a call. The CLI can switch models mid-call (a fallback
+ * on overload, a subagent), and only these entries say which tokens went where.
+ */
+interface ClaudeCliModelUsage {
+  canonicalModel?: unknown;
+  inputTokens?: unknown;
+  outputTokens?: unknown;
+  cacheReadInputTokens?: unknown;
+  cacheCreationInputTokens?: unknown;
+  costUSD?: unknown;
+}
+
 interface ClaudeCliResult {
   result?: unknown;
   is_error?: boolean;
@@ -65,7 +78,7 @@ interface ClaudeCliResult {
   total_cost_usd?: unknown;
   usage?: ClaudeCliUsage;
   /** Keyed by the dated model id; the entry names the canonical model. */
-  modelUsage?: Record<string, { canonicalModel?: unknown } | undefined>;
+  modelUsage?: Record<string, ClaudeCliModelUsage | undefined>;
 }
 
 /**
@@ -119,29 +132,55 @@ export class ClaudeCliProvider implements LLMProvider {
    */
   private emitUsage(final: ClaudeCliResult | undefined): void {
     if (!this.onUsage || !final) return;
+    for (const record of this.usageRecords(final)) {
+      try {
+        this.onUsage(record);
+      } catch {
+        // A broken usage sink is not a reason to fail the call.
+      }
+    }
+  }
+
+  /**
+   * One record per model the call used. `usage` and `total_cost_usd` are the
+   * aggregate over all of them, so per-model entries are preferred: billing a
+   * two-model call entirely to the first one misprices both.
+   */
+  private usageRecords(final: ClaudeCliResult): UsageRecord[] {
+    const perModel: UsageRecord[] = [];
+    for (const [key, entry] of Object.entries(final.modelUsage ?? {})) {
+      if (!entry) continue;
+      const inputTokens = entry.inputTokens;
+      const outputTokens = entry.outputTokens;
+      if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') continue;
+      perModel.push({
+        provider: this.name,
+        model: typeof entry.canonicalModel === 'string' ? entry.canonicalModel : key,
+        inputTokens,
+        cachedInputTokens: typeof entry.cacheReadInputTokens === 'number' ? entry.cacheReadInputTokens : 0,
+        cacheWriteTokens: typeof entry.cacheCreationInputTokens === 'number' ? entry.cacheCreationInputTokens : 0,
+        outputTokens,
+        costUsd: typeof entry.costUSD === 'number' ? entry.costUSD : null,
+      });
+    }
+    if (perModel.length) return perModel;
+
     const usage = final.usage;
-    if (!usage) return;
+    if (!usage) return [];
     const inputTokens = usage.input_tokens;
     const outputTokens = usage.output_tokens;
-    if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') return;
-
-    const entry = Object.entries(final.modelUsage ?? {})[0];
-    const canonical = entry?.[1]?.canonicalModel;
-    const model = typeof canonical === 'string' ? canonical : (entry?.[0] ?? this.model);
-
-    try {
-      this.onUsage({
+    if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') return [];
+    return [
+      {
         provider: this.name,
-        model,
+        model: this.model,
         inputTokens,
         cachedInputTokens: typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0,
         cacheWriteTokens: typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0,
         outputTokens,
         costUsd: typeof final.total_cost_usd === 'number' ? final.total_cost_usd : null,
-      });
-    } catch {
-      // A broken usage sink is not a reason to fail the call.
-    }
+      },
+    ];
   }
 
   /** An empty scratch directory so the CLI has no project context to read. */

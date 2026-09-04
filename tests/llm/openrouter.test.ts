@@ -87,6 +87,8 @@ describe('OpenRouterProvider', () => {
     await p.complete({ messages: [{ role: 'user', content: 'hi' }], json: true });
     const body = JSON.parse(f.calls[0]!.init.body as string);
     expect(body.response_format).toEqual({ type: 'json_object' });
+    // json mode must not cost us the usage block every call is billed from.
+    expect(body.usage).toEqual({ include: true });
   });
 
   it('honours a custom base url without a trailing slash problem', async () => {

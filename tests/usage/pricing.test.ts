@@ -49,8 +49,11 @@ const modelsBody = {
     { id: 42, pricing: { prompt: '0.000001', completion: '0.000002' } },
     { pricing: { prompt: '0.000001', completion: '0.000002' } },
     { id: 'broken/no-pricing' },
+    // "-1" is OpenRouter's marker for a variable-priced auto-router, not a price.
+    { id: 'broken/variable-price', pricing: { prompt: '-1', completion: '-1' } },
     // Should the API ever send bare numbers instead of decimal strings.
-    { id: 'numeric/prices', pricing: { prompt: 4e-6, completion: 8e-6 } },
+    // A negative cache price is no more usable than a missing one: same fallback.
+    { id: 'numeric/prices', pricing: { prompt: 4e-6, completion: 8e-6, input_cache_read: -1 } },
   ],
 };
 
@@ -97,6 +100,8 @@ describe('OpenRouterPricing.ensure', () => {
       inputCacheRead: 4e-6,
       inputCacheWrite: 4e-6,
     });
+    // A variable-priced router ("-1") is not a price we can bill with.
+    expect(list!.models['broken/variable-price']).toBeUndefined();
     // Malformed entries are skipped, not stored as NaN.
     expect(Object.keys(list!.models).sort()).toEqual([
       'anthropic/claude-sonnet-4.5',
@@ -214,6 +219,62 @@ describe('OpenRouterPricing.ensure', () => {
     const recovered = await p.ensure();
     expect(recovered.error).toBeNull();
     expect(Object.keys(recovered.list!.models)).toEqual(['back/again']);
+    db.close();
+  });
+
+  it('waits out the retry window before refetching after a failure', async () => {
+    const db = openDb(':memory:');
+    let now = 1_000_000;
+    const f = fakeFetch([
+      new Error('ECONNREFUSED'),
+      jsonResponse({ data: [{ id: 'back/again', pricing: { prompt: '0.000001', completion: '0.000002' } }] }),
+    ]);
+    const p = new OpenRouterPricing({
+      db,
+      baseUrl: 'http://local/v1',
+      fetch: f.fetch,
+      retryAfterMs: 60_000,
+      now: () => now,
+    });
+
+    const failed = await p.ensure();
+    expect(failed.list).toBeNull();
+    expect(failed.error).toContain('ECONNREFUSED');
+    expect(f.calls).toHaveLength(1);
+
+    // Inside the cooldown: the error is repeated without touching the network.
+    now += 59_999;
+    const cooling = await p.ensure();
+    expect(f.calls).toHaveLength(1);
+    expect(cooling.list).toBeNull();
+    expect(cooling.error).toContain('ECONNREFUSED');
+
+    now += 2;
+    const recovered = await p.ensure();
+    expect(f.calls).toHaveLength(2);
+    expect(recovered.error).toBeNull();
+    expect(Object.keys(recovered.list!.models)).toEqual(['back/again']);
+    db.close();
+  });
+
+  it('serves the stale list without fetching while cooling down after a failed refresh', async () => {
+    const db = openDb(':memory:');
+    const base = Date.parse('2026-01-01T00:00:00.000Z');
+    let now = base;
+    const f = fakeFetch([jsonResponse(modelsBody), new Error('ECONNREFUSED')]);
+    const p = new OpenRouterPricing({ db, baseUrl: 'http://local/v1', fetch: f.fetch, now: () => now });
+    await p.ensure();
+
+    now = base + 25 * HOUR;
+    expect((await p.ensure()).error).toContain('ECONNREFUSED');
+    expect(f.calls).toHaveLength(2);
+
+    // Default cooldown is 5 minutes; a page load a minute later must not stall.
+    now += 60_000;
+    const cooling = await p.ensure();
+    expect(f.calls).toHaveLength(2);
+    expect(cooling.error).toContain('ECONNREFUSED');
+    expect(cooling.list!.models['openai/gpt-5']).toBeDefined();
     db.close();
   });
 

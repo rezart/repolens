@@ -11,7 +11,7 @@ const state = {
   selectedId: null,
   view: 'repo',     // 'repo' | 'usage'
   tab: 'chat',
-  usage: { days: 30, data: null, loading: false, error: null },
+  usage: { days: 30, data: null, loading: false, error: null, seq: 0 },
   chats: {},        // repoId -> { messages: [{role, content, sources}], busy }
   reviews: {},      // repoId -> review rows
   busy: {},         // repoId -> { review, reindex, instructions }
@@ -57,6 +57,8 @@ function fmtCount(n) {
 }
 
 function fmtUsd(n) {
+  // A fraction of a cent still cost something; '$0.0000' reads as free.
+  if (n > 0 && n < 0.0001) return '<$0.0001';
   return '$' + n.toFixed(n < 1 ? 4 : 2);
 }
 
@@ -1106,26 +1108,35 @@ function showUsage() {
 
 async function loadUsage() {
   const st = state.usage;
-  if (st.loading) return;
+  // Changing the range mid-load must not leave the old range's rows on screen:
+  // only the newest request is allowed to touch the state it renders from.
+  const seq = ++st.seq;
   st.loading = true;
   st.error = null;
   renderUsage();
   try {
-    st.data = await api('/api/usage?days=' + encodeURIComponent(st.days));
+    const data = await api('/api/usage?days=' + encodeURIComponent(st.days));
+    if (seq !== st.seq) return;
+    st.data = data;
   } catch (err) {
+    if (seq !== st.seq) return;
     st.data = null;
     st.error = err.message || 'Could not load usage';
     handleError(err);
   } finally {
-    st.loading = false;
-    renderUsage();
+    if (seq === st.seq) {
+      st.loading = false;
+      renderUsage();
+    }
   }
 }
 
 function usageTotals(rows) {
-  const t = { cost: 0, priced: false, estimated: false, tokens: 0, calls: 0 };
+  const t = { cost: 0, priced: false, estimated: false, unpriced: false, tokens: 0, calls: 0 };
   for (const row of rows) {
     if (typeof row.costUsd === 'number') { t.cost += row.costUsd; t.priced = true; }
+    // Calls nothing could price are missing from the total, not worth $0.
+    if (typeof row.costUsd !== 'number' || row.priced === false) t.unpriced = true;
     if (row.estimatedCostUsd > 0) t.estimated = true;
     t.tokens += (row.inputTokens || 0) + (row.cachedInputTokens || 0) + (row.cacheWriteTokens || 0) + (row.outputTokens || 0);
     t.calls += row.calls || 0;
@@ -1139,10 +1150,10 @@ function usageCostText(totals) {
   return (totals.estimated ? '~' : '') + fmtUsd(totals.cost);
 }
 
-function usageCard(label, value) {
+function usageCard(label, value, title) {
   return h('div', { class: 'usage-card' }, [
     h('span', { class: 'field-label', text: label }),
-    h('span', { class: 'usage-value mono', text: value }),
+    h('span', { class: 'usage-value mono', title: title || null, text: value }),
   ]);
 }
 
@@ -1206,10 +1217,14 @@ function usageTable(rows) {
 
 function usageNote(pricing) {
   if (!pricing) return null;
-  const text = pricing.error
-    ? 'Price list unavailable: ' + pricing.error
-    : 'Costs are OpenRouter list prices (~ = estimated from token counts; subscription CLIs are not billed per token). '
-      + 'Price list fetched ' + fmtTime(pricing.fetchedAt) + '.';
+  // With no list at all there are no list prices to explain, only the failure.
+  if (!pricing.fetchedAt) {
+    return pricing.error ? h('p', { class: 'usage-note', text: 'Price list unavailable: ' + pricing.error }) : null;
+  }
+  let text = 'Costs are OpenRouter list prices (~ = estimated from token counts; subscription CLIs are not billed per token). '
+    + 'Price list fetched ' + fmtTime(pricing.fetchedAt) + '.';
+  // A stale list still prices the rows; say so rather than hiding the failure.
+  if (pricing.error) text += ' The latest refresh failed: ' + pricing.error + '.';
   return h('p', { class: 'usage-note', text });
 }
 
@@ -1230,7 +1245,12 @@ function renderUsage() {
     } else {
       const totals = usageTotals(rows);
       pane.appendChild(h('div', { class: 'usage-summary' }, [
-        usageCard('Total cost', usageCostText(totals)),
+        usageCard(
+          'Total cost',
+          // Same rule as the rows: a floor gets a star, a total with nothing priced is just '—'.
+          usageCostText(totals) + (totals.unpriced && totals.priced ? '*' : ''),
+          totals.unpriced && totals.priced ? 'Some calls could not be priced; this total covers the priced calls only.' : null,
+        ),
         usageCard('Total tokens', fmtCount(totals.tokens)),
         usageCard('Calls', fmtCount(totals.calls)),
       ]));

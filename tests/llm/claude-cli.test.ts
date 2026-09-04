@@ -279,6 +279,8 @@ const liveUsageFields = {
     'claude-haiku-4-5-20251001': {
       inputTokens: 10,
       outputTokens: 258,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 7508,
       costUSD: 0.016316,
       canonicalModel: 'claude-haiku-4-5',
     },
@@ -320,6 +322,83 @@ describe('ClaudeCliProvider usage reporting', () => {
         cacheWriteTokens: 7508,
         outputTokens: 258,
         costUsd: 0.016316,
+      },
+    ]);
+  });
+
+  it('emits one record per model when the call used more than one', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({
+        type: 'result',
+        result: 'ok',
+        // The aggregate covers both models; only the per-model entries can split it.
+        total_cost_usd: 0.02,
+        usage: { input_tokens: 14, cache_creation_input_tokens: 7508, cache_read_input_tokens: 900, output_tokens: 300 },
+        modelUsage: {
+          'claude-haiku-4-5-20251001': {
+            inputTokens: 10,
+            outputTokens: 258,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 7508,
+            costUSD: 0.016316,
+            canonicalModel: 'claude-haiku-4-5',
+          },
+          'claude-sonnet-4-6': {
+            inputTokens: 4,
+            outputTokens: 42,
+            cacheReadInputTokens: 900,
+            costUSD: 0.0037,
+          },
+        },
+      }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'sonnet', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([
+      {
+        provider: 'claude-cli',
+        model: 'claude-haiku-4-5',
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 7508,
+        outputTokens: 258,
+        costUsd: 0.016316,
+      },
+      {
+        provider: 'claude-cli',
+        model: 'claude-sonnet-4-6',
+        inputTokens: 4,
+        cachedInputTokens: 900,
+        cacheWriteTokens: 0,
+        outputTokens: 42,
+        costUsd: 0.0037,
+      },
+    ]);
+  });
+
+  it('skips a modelUsage entry without token counts and bills the aggregate instead', async () => {
+    const f = fakeRun({
+      stdout: JSON.stringify({
+        type: 'result',
+        result: 'ok',
+        total_cost_usd: 0.5,
+        usage: { input_tokens: 3, output_tokens: 5 },
+        modelUsage: { 'claude-opus-4-6': { costUSD: 0.5 } },
+      }),
+    });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'sonnet', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([
+      {
+        provider: 'claude-cli',
+        model: 'sonnet',
+        inputTokens: 3,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 5,
+        costUsd: 0.5,
       },
     ]);
   });

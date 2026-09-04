@@ -20,12 +20,15 @@ export interface OpenRouterPricingOptions {
   baseUrl: string;
   fetch?: typeof fetch;
   ttlMs?: number;
+  /** How long a failed refresh is left alone before it is tried again. */
+  retryAfterMs?: number;
   /** Injectable for tests; defaults to Date.now. */
   now?: () => number;
 }
 
 const META_KEY = 'openrouter_pricing';
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_RETRY_AFTER_MS = 5 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 30_000;
 
 /** The model name that stands in for "whatever the CLI defaults to", which we cannot price. */
@@ -48,10 +51,13 @@ export class OpenRouterPricing {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly ttlMs: number;
+  private readonly retryAfterMs: number;
   private readonly now: () => number;
 
   private list: PriceList | null = null;
   private error: string | null = null;
+  /** When the last refresh was started, so a failed one is not retried per request. */
+  private lastAttemptAt: number | null = null;
   /** The refresh currently in flight, so concurrent callers share one fetch. */
   private pending: Promise<void> | null = null;
 
@@ -60,6 +66,7 @@ export class OpenRouterPricing {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+    this.retryAfterMs = opts.retryAfterMs ?? DEFAULT_RETRY_AFTER_MS;
     this.now = opts.now ?? Date.now;
     this.list = this.load();
   }
@@ -67,6 +74,9 @@ export class OpenRouterPricing {
   /** Refresh if stale. Never throws: a failure is reported alongside the old list. */
   async ensure(): Promise<{ list: PriceList | null; error: string | null }> {
     if (this.isFresh()) return { list: this.list, error: this.error };
+    // While OpenRouter is unreachable every call would otherwise wait out the
+    // fetch timeout again; the report is better served late prices than a stall.
+    if (this.coolingDown()) return { list: this.list, error: this.error };
     if (!this.pending) {
       this.pending = this.refresh().finally(() => {
         this.pending = null;
@@ -98,6 +108,12 @@ export class OpenRouterPricing {
     );
   }
 
+  /** True while the last attempt failed recently enough not to be worth repeating. */
+  private coolingDown(): boolean {
+    if (this.error === null || this.lastAttemptAt === null) return false;
+    return this.now() - this.lastAttemptAt < this.retryAfterMs;
+  }
+
   private isFresh(): boolean {
     if (!this.list) return false;
     const at = Date.parse(this.list.fetchedAt);
@@ -119,6 +135,7 @@ export class OpenRouterPricing {
   }
 
   private async refresh(): Promise<void> {
+    this.lastAttemptAt = this.now();
     try {
       const res = await this.fetchImpl(`${this.baseUrl}/models`, {
         method: 'GET',
@@ -175,12 +192,16 @@ function parseModels(entries: RawModel[]): Record<string, ModelPrice> {
   return models;
 }
 
-/** OpenRouter prices are decimal strings in USD per token; a bare number is accepted too. */
+/**
+ * OpenRouter prices are decimal strings in USD per token; a bare number is
+ * accepted too. A negative value is not a price: "-1" marks a variable-priced
+ * auto-router, so such an entry is skipped rather than billed as a credit.
+ */
 function num(value: unknown): number | null {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'number') return Number.isFinite(value) && value >= 0 ? value : null;
   if (typeof value !== 'string' || value.trim() === '') return null;
   const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
 /**

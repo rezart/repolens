@@ -273,7 +273,7 @@ describe('API', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.days).toBe(7);
-      expect(body.since).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(body.since).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
       expect(body.pricing).toEqual({ fetchedAt: null, error: 'pricing disabled' });
       const byRole = new Map(body.rows.map((r: { role: string }) => [r.role, r]));
       expect(byRole.get('review')).toMatchObject({ provider: 'claude-cli', calls: 1, inputTokens: 100, costUsd: null, priced: false });

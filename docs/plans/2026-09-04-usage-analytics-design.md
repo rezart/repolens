@@ -113,7 +113,7 @@ integer 1 to 365, default 30):
 ```json
 {
   "days": 30,
-  "since": "2026-08-05",
+  "since": "2026-08-05T16:00:00.000Z",
   "pricing": { "fetchedAt": "2026-09-04T16:00:00.000Z", "error": null },
   "rows": [
     {

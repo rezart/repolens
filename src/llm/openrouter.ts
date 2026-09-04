@@ -73,6 +73,11 @@ export class OpenRouterProvider implements LLMProvider {
    * Normalise and hand one usage block to the sink. Silently ignores usage the
    * backend did not report (or reported malformed), and never lets a throwing
    * sink turn a finished completion into a failure.
+   *
+   * The block has no cache-write field, so Anthropic cache-creation tokens stay
+   * counted inside `prompt_tokens` here, while the Claude CLI reports them
+   * separately as `cacheWriteTokens`. Cost is unaffected: OpenRouter reports
+   * `cost` itself, so those tokens are never re-priced from the token split.
    */
   private reportUsage(usage: RawUsage | null | undefined): void {
     if (!this.onUsage || !usage || typeof usage !== 'object') return;

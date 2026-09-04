@@ -289,7 +289,7 @@ export class UsageTracker {
 }
 ```
 
-`report`: `since = new Date(Date.now() - days*86400000).toISOString().slice(0,10)`; rows from `db.usageByDay(since)`; `pricing?.ensure()` for the list; per row `estimatedCostUsd` is `null` when `unpriced_calls > 0` and no price resolves, else the estimate over the unpriced token sums (0 when there are none); `costUsd = reportedCostUsd + (estimatedCostUsd ?? 0)` but `null` when `reported == 0 && estimated == null`; `priced = unpriced_calls === 0 || estimatedCostUsd !== null`. `pricing: { fetchedAt: list?.fetchedAt ?? null, error }`; with no pricing object, `{ fetchedAt: null, error: 'pricing disabled' }`.
+`report`: `since = new Date(Date.now() - days*86400000).toISOString()`; rows from `db.usageByDay(since)`; `pricing?.ensure()` for the list; per row `estimatedCostUsd` is `null` when `unpriced_calls > 0` and no price resolves, else the estimate over the unpriced token sums (0 when there are none); `costUsd = reportedCostUsd + (estimatedCostUsd ?? 0)` but `null` when `reported == 0 && estimated == null`; `priced = unpriced_calls === 0 || estimatedCostUsd !== null`. `pricing: { fetchedAt: list?.fetchedAt ?? null, error }`; with no pricing object, `{ fetchedAt: null, error: 'pricing disabled' }`.
 
 **Route:** `app.get('/api/usage')` parses `days` with `z.coerce.number().int().min(1).max(365).default(30)`, 400 on failure, returns `await deps.usage.report(days)`.
 

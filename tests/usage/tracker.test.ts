@@ -102,7 +102,7 @@ describe('UsageTracker.report', () => {
 
     const report = await tracker.report(7);
     expect(report.days).toBe(7);
-    expect(report.since).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(report.since).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
     expect(report.pricing).toEqual({ fetchedAt: null, error: 'pricing disabled' });
 
     const byRole = new Map(report.rows.map((r) => [r.role, r]));
@@ -197,6 +197,42 @@ describe('UsageTracker.report', () => {
     db.close();
   });
 
+  it('still reports rows when the price list cannot be fetched at all', async () => {
+    const db = openDb(':memory:');
+    const pricing = new OpenRouterPricing({
+      db,
+      baseUrl: 'http://local/v1',
+      fetch: (async () => {
+        throw new Error('ECONNREFUSED');
+      }) as unknown as typeof fetch,
+    });
+    const tracker = new UsageTracker({ db, pricing });
+    tracker.sinkFor('review')({
+      provider: 'codex-cli',
+      model: 'gpt-5.6-terra',
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 10,
+      costUsd: null,
+    });
+
+    const report = await tracker.report(30);
+    expect(report.pricing.fetchedAt).toBeNull();
+    expect(report.pricing.error).toContain('ECONNREFUSED');
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]).toMatchObject({
+      provider: 'codex-cli',
+      calls: 1,
+      inputTokens: 100,
+      outputTokens: 10,
+      estimatedCostUsd: null,
+      costUsd: null,
+      priced: false,
+    });
+    db.close();
+  });
+
   it('windows rows by the injected clock', async () => {
     const db = openDb(':memory:');
     const now = Date.parse('2026-03-10T12:00:00.000Z');
@@ -214,9 +250,29 @@ describe('UsageTracker.report', () => {
     db.raw.prepare('update llm_usage set ts=? where id=?').run('2026-03-09T00:00:00.000Z', recent.id);
 
     const report = await tracker.report(7);
-    expect(report.since).toBe(new Date(now - 7 * DAY).toISOString().slice(0, 10));
+    expect(report.since).toBe(new Date(now - 7 * DAY).toISOString());
     expect(report.rows.map((r) => r.model)).toEqual(['sonnet']);
     expect(report.rows[0]!.day).toBe('2026-03-09');
+    db.close();
+  });
+
+  it('covers exactly `days` days, not the whole calendar day the window starts in', async () => {
+    const db = openDb(':memory:');
+    const now = Date.parse('2026-03-10T12:00:00.000Z');
+    const tracker = new UsageTracker({ db, pricing: null, now: () => now });
+    const sink = tracker.sinkFor('review');
+    sink({ provider: 'claude-cli', model: 'inside', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: null });
+    sink({ provider: 'claude-cli', model: 'outside', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: null });
+
+    const ids = db.raw.prepare('select id, model from llm_usage order by id').all() as Array<{ id: number; model: string }>;
+    const at = (model: string, ts: string) =>
+      db.raw.prepare('update llm_usage set ts=? where id=?').run(ts, ids.find((r) => r.model === model)!.id);
+    // Both fall on 2026-03-03, the calendar day the 7-day window opens in.
+    at('inside', '2026-03-03T18:00:00.000Z');
+    at('outside', '2026-03-03T06:00:00.000Z');
+
+    const report = await tracker.report(7);
+    expect(report.rows.map((r) => r.model)).toEqual(['inside']);
     db.close();
   });
 });
