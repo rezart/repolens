@@ -100,6 +100,10 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 .dot-ok { background: var(--ok); }
 .dot-error { background: var(--err); }
 
+.side-nav { display: flex; flex-direction: column; gap: 2px; margin-top: -8px; }
+.side-nav .btn { display: block; width: 100%; text-align: left; padding: 5px 8px; }
+.side-nav .btn.is-active { background: var(--accent-soft); color: var(--accent); }
+
 .side-section { display: flex; flex-direction: column; gap: 6px; }
 .side-head { display: flex; align-items: center; justify-content: space-between; }
 .field-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
@@ -330,6 +334,32 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .pull-status .review-posted.is-posted { color: var(--ok); }
 .pulls-err { margin: 0 0 4px; color: var(--err); font-size: 12px; }
 .badge-draft { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+
+/* ------------------------------------------------------------- usage */
+
+.usage-range { display: flex; align-items: center; gap: 8px; padding-bottom: 10px; }
+.usage-range select { width: auto; padding: 4px 8px; font-size: 12px; }
+
+.usage-summary { display: flex; flex-wrap: wrap; gap: 10px; }
+.usage-card {
+  flex: 1 1 160px;
+  display: flex; flex-direction: column; gap: 4px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px;
+}
+.usage-value { font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; display: block; overflow-x: auto; }
+.usage-table th, .usage-table td { border-bottom: 1px solid var(--border); padding: 5px 8px; text-align: left; white-space: nowrap; }
+.usage-table th { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.usage-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-table td.num { font-family: var(--mono); font-size: 11.5px; }
+.usage-table tbody tr:hover td { background: var(--panel-2); }
+
+.usage-day td { background: var(--panel-2); font-weight: 650; border-bottom-color: var(--border-strong); }
+.usage-day:hover td { background: var(--panel-2); }
+
+.usage-note { margin: 0; font-size: 11px; color: var(--muted); max-width: 80ch; }
 
 /* ------------------------------------------------------------ toasts */
 
