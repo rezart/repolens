@@ -4,6 +4,7 @@ import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import { timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
 import type { LLMProvider } from './llm/types.js';
@@ -69,6 +70,12 @@ const reviewPullsSchema = z.object({
 
 // `?days=` (empty) means the default, like an absent param; coercing '' would give 0 and fail min(1).
 const usageDaysSchema = z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(1).max(365).default(30));
+
+const reviewListSchema = z.object({
+  repository: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  offset: z.coerce.number().int().min(0).default(0),
+});
 
 const reviewSchema = z.object({
   repository: z.string().min(1),
@@ -355,8 +362,10 @@ export function createApp(deps: AppDeps): Hono {
 
   // ---- reviews ----
   app.get('/api/reviews', (c) => {
-    const repo = c.req.query('repository');
-    return c.json({ reviews: db.listReviews(repo ? normalizeRepoId(repo) : undefined) });
+    const q = reviewListSchema.safeParse(c.req.query());
+    if (!q.success) return c.json({ error: q.error.message }, 400);
+    const repo = q.data.repository ? normalizeRepoId(q.data.repository) : undefined;
+    return c.json({ reviews: db.listReviews(repo, q.data.limit, q.data.offset), total: db.countReviews(repo) });
   });
 
   app.post('/api/reviews', async (c) => {
@@ -415,6 +424,12 @@ export function createApp(deps: AppDeps): Hono {
     c.res.headers.set('Cache-Control', 'no-cache');
   });
   app.use('/*', serveStatic({ root: webDir, rewriteRequestPath: (p) => (p === '/' ? '/index.html' : p) }));
+  // Dashboard routes (/repos/..., /usage) are handled client-side; deep links load the shell.
+  app.get('/*', async (c) => {
+    if (c.req.path.startsWith('/api/') || /\.[a-z0-9]+$/i.test(c.req.path)) return c.notFound();
+    const shell = await readFile(join(webDir, 'index.html'), 'utf8');
+    return c.html(shell);
+  });
 
   return app;
 }

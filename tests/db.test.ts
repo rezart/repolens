@@ -88,6 +88,17 @@ describe('Db', () => {
     expect(db.getReview(review.id)?.posted).toBe(1);
   });
 
+  it('pages reviews newest first', () => {
+    seed(db);
+    const ids = [1, 2, 3].map((n) => db.insertReview({
+      repo_id: 'github:o/n', pr_number: n, head_sha: 'h' + n, status: 'done', summary: null, verdict: null,
+      comments_json: '[]', posted: 0, error: null,
+    }).id);
+    expect(db.countReviews('github:o/n')).toBe(3);
+    expect(db.listReviews('github:o/n', 2, 0).map((r) => r.id)).toEqual([ids[2], ids[1]]);
+    expect(db.listReviews('github:o/n', 2, 2).map((r) => r.id)).toEqual([ids[0]]);
+  });
+
   it('tags review jobs with their pull request number', () => {
     seed(db);
     db.createJob('index', 'github:o/n');

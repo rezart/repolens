@@ -302,6 +302,32 @@ describe('API', () => {
       const api = await app.request('/api/health');
       expect(api.headers.get('cache-control')).toBeNull();
     });
+
+    it('serves the shell for client-side routes but not for missing files or API paths', async () => {
+      for (const path of ['/usage', '/repos/github:o/n/reviews']) {
+        const res = await app.request(path);
+        expect(res.status, path).toBe(200);
+        expect(await res.text(), path).toContain('<div id="app">');
+      }
+      expect((await app.request('/missing.js')).status).toBe(404);
+      expect((await app.request('/api/missing', { headers: auth })).status).toBe(404);
+    });
+  });
+
+  describe('reviews', () => {
+    it('pages past reviews newest first with a total', async () => {
+      deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+      for (const n of [1, 2, 3]) {
+        deps.db.insertReview({
+          repo_id: 'github:o/n', pr_number: n, head_sha: 'h' + n, status: 'done', summary: null, verdict: null,
+          comments_json: '[]', posted: 0, error: null,
+        });
+      }
+      const page = await (await app.request('/api/reviews?repository=github:o/n&limit=2&offset=2', { headers: auth })).json();
+      expect(page.total).toBe(3);
+      expect(page.reviews.map((r: { pr_number: number }) => r.pr_number)).toEqual([1]);
+      expect((await app.request('/api/reviews?limit=0', { headers: auth })).status).toBe(400);
+    });
   });
 
   describe('pull requests', () => {
