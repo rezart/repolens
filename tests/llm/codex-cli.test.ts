@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { CodexCliProvider } from '../../src/llm/codex-cli.js';
 import { ProviderError } from '../../src/llm/types.js';
 import type { RunOptions, RunResult } from '../../src/llm/spawn.js';
+import type { UsageRecord } from '../../src/usage/types.js';
 
 interface Recorded {
   cmd: string;
@@ -52,6 +53,9 @@ describe('CodexCliProvider', () => {
     expect(args).toContain('--skip-git-repo-check');
     expect(argValue(args, '-s')).toBe('read-only');
     expect(argValue(args, '--color')).toBe('never');
+    // `--json` makes codex emit the NDJSON event stream that carries token usage.
+    expect(args.indexOf('--json')).toBe(args.indexOf('--color') + 2);
+    expect(args.indexOf('--json')).toBeLessThan(args.indexOf('-C'));
     expect(argValue(args, '-m')).toBe('gpt-5');
     expect(argValue(args, '-C')).toBeTruthy();
     expect(argValue(args, '-o')).toMatch(/out-[a-z0-9]+\.md$/);
@@ -184,14 +188,6 @@ describe('CodexCliProvider.stream', () => {
     expect(deltas).toEqual(['the answer']);
   });
 
-  it('never passes --json: the NDJSON stream is not consumed', async () => {
-    const f = fakeRun({ output: 'x' });
-    const p = new CodexCliProvider({ run: f.run });
-    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
-    await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {});
-    expect(f.calls[0]!.args).not.toContain('--json');
-    expect(f.calls[1]!.args).not.toContain('--json');
-  });
 });
 
 describe('CodexCliProvider reasoning effort', () => {
@@ -208,5 +204,117 @@ describe('CodexCliProvider reasoning effort', () => {
     const p = new CodexCliProvider({ run: f.run, reasoningEffort: '' });
     await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
     expect(f.calls[0]!.args.some((a) => a.startsWith('model_reasoning_effort'))).toBe(false);
+  });
+});
+
+describe('CodexCliProvider usage', () => {
+  /** The shape of a real `codex exec --json` run captured on 2026-09-04. */
+  const ndjson =
+    [
+      JSON.stringify({ type: 'thread.started', thread_id: '01a06d3a-0000-0000-0000-000000000000' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 18114,
+          cached_input_tokens: 15104,
+          output_tokens: 97,
+          reasoning_output_tokens: 90,
+        },
+      }),
+    ].join('\n') + '\n';
+
+  it('reports normalised usage from the turn.completed event', async () => {
+    const f = fakeRun({ output: 'the answer', result: { stdout: ndjson } });
+    const seen: UsageRecord[] = [];
+    const p = new CodexCliProvider({ model: 'gpt-5', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+
+    // input_tokens includes the cached ones, so the fresh input is the difference.
+    expect(seen).toEqual([
+      {
+        provider: 'codex-cli',
+        model: 'gpt-5',
+        inputTokens: 3010,
+        cachedInputTokens: 15104,
+        cacheWriteTokens: 0,
+        outputTokens: 97,
+        costUsd: null,
+      },
+    ]);
+  });
+
+  it('reports usage for a streaming call too', async () => {
+    const f = fakeRun({ output: 'the answer', result: { stdout: ndjson } });
+    const seen: UsageRecord[] = [];
+    const p = new CodexCliProvider({ model: 'gpt-5', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {});
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.outputTokens).toBe(97);
+  });
+
+  it('uses the last turn.completed when the run reports several', async () => {
+    const stdout =
+      [
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 1 } }),
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 40, cached_input_tokens: 10, output_tokens: 5 } }),
+      ].join('\n') + '\n';
+    const f = fakeRun({ output: 'x', result: { stdout } });
+    const seen: UsageRecord[] = [];
+    const p = new CodexCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([
+      {
+        provider: 'codex-cli',
+        model: 'default',
+        inputTokens: 30,
+        cachedInputTokens: 10,
+        cacheWriteTokens: 0,
+        outputTokens: 5,
+        costUsd: null,
+      },
+    ]);
+  });
+
+  it('reports nothing when stdout carries no turn.completed event', async () => {
+    const stdout =
+      [
+        '[2026-09-04T12:00:00] loading config…',
+        JSON.stringify({ type: 'thread.started', thread_id: 'abc' }),
+        JSON.stringify({ type: 'turn.started' }),
+      ].join('\n') + '\n';
+    const f = fakeRun({ output: 'the answer', result: { stdout } });
+    const seen: UsageRecord[] = [];
+    const p = new CodexCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([]);
+  });
+
+  it('reports nothing when the usage counts are not numbers', async () => {
+    const stdout = JSON.stringify({ type: 'turn.completed', usage: { input_tokens: '12', output_tokens: 3 } }) + '\n';
+    const f = fakeRun({ output: 'x', result: { stdout } });
+    const seen: UsageRecord[] = [];
+    const p = new CodexCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(seen).toEqual([]);
+  });
+
+  it('reports nothing when the run failed', async () => {
+    const f = fakeRun({ output: 'ignored', result: { code: 1, stderr: 'kaboom', stdout: ndjson } });
+    const seen: UsageRecord[] = [];
+    const p = new CodexCliProvider({ run: f.run, onUsage: (r) => seen.push(r) });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toBeInstanceOf(ProviderError);
+    expect(seen).toEqual([]);
+  });
+
+  it('survives a sink that throws', async () => {
+    const f = fakeRun({ output: 'the answer', result: { stdout: ndjson } });
+    const p = new CodexCliProvider({
+      run: f.run,
+      onUsage: () => {
+        throw new Error('sink exploded');
+      },
+    });
+    await expect(p.complete({ messages: [{ role: 'user', content: 'hi' }] })).resolves.toBe('the answer');
   });
 });
