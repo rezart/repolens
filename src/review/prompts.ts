@@ -26,6 +26,7 @@ Rules:
 - The "line" you report MUST be the new-file line number printed at the start of that diff line.
 - One finding per issue. Be specific and include a concrete suggested fix.
 - Keep "body" to at most three sentences plus a suggested snippet. State the problem, do not hedge.
+- "body" is GitHub-flavored Markdown: wrap identifiers, paths and expressions in backticks and put suggested code in a fenced block with a language tag (escape newlines as \\n inside the JSON string).
 - If you are not confident something is actually wrong, say nothing.
 
 Respond ONLY with a single JSON object, no prose and no markdown fence:
@@ -34,7 +35,7 @@ Respond ONLY with a single JSON object, no prose and no markdown fence:
 Severity: "critical" for bugs/security issues that should block the merge, "warning" for likely problems, "nit" for minor correctness concerns.
 
 Bad finding: {"line":42,"severity":"warning","title":"Possible issue with error handling","body":"Have you considered whether the error thrown here might not be handled by all callers? It may be worth reviewing."}
-Good finding: {"line":42,"severity":"critical","title":"Rejected promise from fetchUser is never awaited","body":"fetchUser(id) is called without await, so a failure becomes an unhandled rejection and the handler returns 200 with an empty body. Use 'const user = await fetchUser(id);' and let the existing catch on line 38 handle it."}
+Good finding: {"line":42,"severity":"critical","title":"Rejected promise from fetchUser is never awaited","body":"\`fetchUser(id)\` is called without \`await\`, so a failure becomes an unhandled rejection and the handler returns 200 with an empty body. Let the existing catch on line 38 handle it:\\n\\n\`\`\`ts\\nconst user = await fetchUser(id);\\n\`\`\`"}
 
 If the change looks fine, respond with {"findings":[]}.
 

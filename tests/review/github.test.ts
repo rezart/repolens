@@ -175,7 +175,7 @@ describe('GitHubClient.createReview', () => {
       event: 'COMMENT',
       comments: [
         { path: 'src/a.ts', line: 12, body: 'boom' },
-        { path: 'src/b.ts', line: 3, body: 'bang' },
+        { path: 'src/b.ts', line: 3, body: 'bang\n\n```ts\nx();\n```' },
       ],
     });
     expect(res.id).toBe(101);
@@ -186,7 +186,7 @@ describe('GitHubClient.createReview', () => {
     expect(last.event).toBe('COMMENT');
     expect(last.body).toContain('summary here');
     expect(last.body).toContain('- **src/a.ts:12** — boom');
-    expect(last.body).toContain('- **src/b.ts:3** — bang');
+    expect(last.body).toContain('- **src/b.ts:3** — bang\n  \n  ```ts\n  x();\n  ```');
   });
 
   it('reports both failures when the 422 retry also fails', async () => {
