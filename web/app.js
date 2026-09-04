@@ -1155,7 +1155,8 @@ function usageCostCell(row) {
     text = '—';
     title = 'No OpenRouter price for ' + (row.model || 'this model');
   }
-  if (row.priced === false) {
+  // A partially priced row is a floor; a fully unpriced one already reads as '—'.
+  if (row.priced === false && typeof row.costUsd === 'number') {
     text += '*';
     title = 'Some calls in this row could not be priced; the cost shown covers the priced calls only.';
   }
@@ -1195,9 +1196,11 @@ function usageTable(rows) {
   flush();
 
   const head = ['Provider', 'Model', 'Role', 'Calls', 'Input', 'Cached', 'Output', 'Cost'];
-  return h('table', { class: 'usage-table' }, [
-    h('thead', {}, [h('tr', {}, head.map((label, i) => h('th', { class: i >= 3 ? 'num' : null, text: label })))]),
-    h('tbody', {}, body),
+  return h('div', { class: 'usage-scroll' }, [
+    h('table', { class: 'usage-table' }, [
+      h('thead', {}, [h('tr', {}, head.map((label, i) => h('th', { class: i >= 3 ? 'num' : null, text: label })))]),
+      h('tbody', {}, body),
+    ]),
   ]);
 }
 

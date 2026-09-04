@@ -349,7 +349,8 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 }
 .usage-value { font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
 
-.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; display: block; overflow-x: auto; }
+.usage-scroll { overflow-x: auto; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .usage-table th, .usage-table td { border-bottom: 1px solid var(--border); padding: 5px 8px; text-align: left; white-space: nowrap; }
 .usage-table th { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 .usage-table .num { text-align: right; font-variant-numeric: tabular-nums; }
