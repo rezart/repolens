@@ -111,3 +111,53 @@ describe('Db', () => {
     expect(hasPrNumber()).toBe(true);
   });
 });
+
+describe('llm_usage', () => {
+  let db: Db;
+  beforeEach(() => {
+    db = openDb(':memory:');
+  });
+
+  const row = (over: Partial<Parameters<Db['insertUsage']>[0]> = {}) => ({
+    role: 'review' as const,
+    provider: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    input_tokens: 100,
+    cached_input_tokens: 50,
+    cache_write_tokens: 0,
+    output_tokens: 20,
+    cost_usd: null,
+    ...over,
+  });
+
+  it('aggregates per day, provider, model and role, splitting priced from unpriced calls', () => {
+    db.insertUsage(row());
+    db.insertUsage(row({ cost_usd: 0.5, input_tokens: 10, output_tokens: 1 }));
+    db.insertUsage(row({ role: 'chat', provider: 'claude-cli', model: 'claude-haiku-4-5', cost_usd: 0.01 }));
+    // An old row on another day, backdated by hand.
+    db.raw.prepare(`update llm_usage set ts='2020-01-01T00:00:00.000Z' where id=1`).run();
+
+    const all = db.usageByDay('2019-01-01');
+    expect(all).toHaveLength(3);
+    const today = db.usageByDay('2021-01-01');
+    expect(today).toHaveLength(2);
+    const codex = today.find((r) => r.provider === 'codex-cli')!;
+    expect(codex.calls).toBe(1);
+    expect(codex.reported_cost_usd).toBeCloseTo(0.5);
+    expect(codex.unpriced_calls).toBe(0);
+    expect(codex.input_tokens).toBe(10);
+    const oldCodex = all.find((r) => r.day === '2020-01-01')!;
+    expect(oldCodex.unpriced_calls).toBe(1);
+    expect(oldCodex.unpriced_input_tokens).toBe(100);
+    expect(oldCodex.reported_cost_usd).toBe(0);
+    // Newest day first.
+    expect(all[0]!.day > all[all.length - 1]!.day).toBe(true);
+  });
+
+  it('stores and reads meta values', () => {
+    expect(db.getMeta('x')).toBeUndefined();
+    db.setMeta('x', '1');
+    db.setMeta('x', '2');
+    expect(db.getMeta('x')).toBe('2');
+  });
+});
