@@ -40,8 +40,10 @@ LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-...
 LLM_MODEL=anthropic/claude-sonnet-4.5     # or openai/gpt-5, google/gemini-2.5-pro, deepseek/deepseek-chat, ...
 EMBEDDING_API_KEY=sk-or-...               # optional, enables vector search
-EMBEDDING_MODEL=openai/text-embedding-3-small
+EMBEDDING_MODEL=openai/text-embedding-3-small   # or qwen/qwen3-embedding-8b, etc.
 ```
+
+If OpenRouter returns a 401 from the embeddings endpoint while chat works, check the account's BYOK (bring-your-own-key) settings for that upstream provider, or pick an embedding model from a different provider. The embedding model must stay the same for the life of a database; changing it requires deleting `data/repolens.db` and reindexing.
 
 ### Option B: Claude subscription
 
@@ -104,7 +106,7 @@ npm run cli -- review github:owner/name 42 --post
 2. In the repository (or org) settings add a webhook:
    - Payload URL: `https://<your host>/webhooks/github`
    - Content type: `application/json`
-   - Secret: the value of `GITHUB_WEBHOOK_SECRET`
+   - Secret: the value of `GITHUB_WEBHOOK_SECRET` (required; the endpoint returns 503 without it)
    - Events: *Pull requests* and *Issue comments*
 3. Index the repository (API, CLI, or dashboard). New and updated PRs are then reviewed automatically and the review is posted to the PR. Comments that mention `REVIEW_BOT_HANDLE` (default `@repolens`) get an answer.
 
@@ -118,7 +120,7 @@ All `/api/*` routes except `/api/health` require `Authorization: Bearer <REPOLEN
 | --- | --- | --- |
 | GET | `/api/health` | provider, model, embeddings |
 | GET | `/api/repositories` | list |
-| POST | `/api/repositories` | `{ remote: "github", repository: "owner/name", branch? }` → 202 with `jobId` |
+| POST | `/api/repositories` | `{ remote: "github", repository: "owner/name", branch? }` → 202 with `jobId`. Branch defaults to the repository's default branch |
 | GET | `/api/repositories/:id` | status, counts |
 | POST | `/api/repositories/:id/reindex` | → `jobId` |
 | PUT | `/api/repositories/:id/instructions` | `{ instructions }` |
@@ -144,7 +146,7 @@ See `.env.example` for every variable. The important ones:
 | `LLM_TIMEOUT_MS` | `300000` | Per-completion timeout |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | OpenRouter / empty / empty | OpenAI-compatible embeddings. Blank model = lexical only |
 | `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews |
-| `GITHUB_WEBHOOK_SECRET` | | Verifies webhook payloads |
+| `GITHUB_WEBHOOK_SECRET` | | Verifies webhook payloads. The webhook endpoint refuses requests until this is set |
 | `REVIEW_BOT_HANDLE` | `@repolens` | Mention that triggers PR chat |
 
 ## Docker
@@ -154,6 +156,16 @@ docker compose up --build
 ```
 
 The Docker image works with `LLM_PROVIDER=openrouter`. The CLI providers need the `claude`/`codex` binaries and their login state, so for those run `npm start` directly on the host.
+
+## How review works
+
+1. The webhook (or API call) queues a review job. Jobs run one at a time.
+2. The PR diff is fetched from GitHub and split into files and hunks. Lockfiles, vendored, generated and binary files are skipped.
+3. For every changed file, related code is retrieved from the index using the file path and the identifiers in the added lines, and the model is asked for findings as JSON. Findings that don't point at an added line are dropped.
+4. A summary and verdict are generated, then a single GitHub review is posted: the summary as the review body and each finding as an inline comment on the changed line. Findings already commented on a previous run are skipped, so `synchronize` events don't pile up duplicates.
+5. Reviews are deduped by head commit. Use `force: true` to re-run.
+
+PR title, body and comments are treated as untrusted data in the prompts, but as with any LLM reviewer, a determined author can still influence the output. Never give RepoLens a token with more scope than it needs.
 
 ## Development
 

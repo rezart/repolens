@@ -1,8 +1,8 @@
-import type { Db } from '../db.js';
+import type { Db, RepoRow } from '../db.js';
 import type { LLMProvider } from '../llm/types.js';
 import { extractJson } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
-import type { GitHubClient } from './github.js';
+import type { GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
@@ -39,7 +39,7 @@ export interface ReviewDeps {
   db: Db;
   llm: LLMProvider;
   retrieve: RetrieveFn;
-  github: Pick<GitHubClient, 'getPull' | 'getPullDiff' | 'createReview'>;
+  github: Pick<GitHubClient, 'getPull' | 'getPullDiff' | 'createReview' | 'listReviewComments'>;
   /** Injected from search/tokenize.ts in production. */
   identifiers?: (text: string) => string[];
   /** Injected from search/retrieve.ts in production. */
@@ -198,6 +198,82 @@ function toVerdict(value: unknown): Verdict | null {
   return v === 'approve' || v === 'comment' || v === 'request_changes' ? v : null;
 }
 
+function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
+
+interface PostContext {
+  db: Db;
+  github: ReviewDeps['github'];
+  llm: LLMProvider;
+  repo: RepoRow;
+  pr: PullRequest;
+  log: (msg: string) => void;
+}
+
+/**
+ * Post `result` to GitHub, mutating it in place. Never throws: a failed post leaves
+ * `posted: false` and adds a warning so the stored review can be re-posted later.
+ */
+async function postReview(ctx: PostContext, result: ReviewResult): Promise<void> {
+  const { db, github, llm, repo, pr, log } = ctx;
+  const warnings = result.warnings;
+
+  let body = buildReviewBody({
+    summary: result.summary,
+    verdict: result.verdict,
+    findings: result.findings,
+    providerName: llm.name,
+    model: llm.model,
+  });
+  // Retrieved context comes from the last indexed commit, not the PR head.
+  if (repo.last_commit && pr.baseSha && repo.last_commit !== pr.baseSha) {
+    body += `\n<sub>Context indexed at ${shortSha(repo.last_commit)}; PR base is ${shortSha(pr.baseSha)}.</sub>`;
+  }
+
+  // Drop findings that were already commented on an earlier run (e.g. a `synchronize` event).
+  let comments = result.findings;
+  try {
+    const existing = await github.listReviewComments(repo.owner, repo.name, result.prNumber);
+    const kept = comments.filter(
+      (f) => !existing.some((c) => c.path === f.path && c.line === f.line && c.body.includes(f.title)),
+    );
+    const dropped = comments.length - kept.length;
+    if (dropped > 0) {
+      const msg = `Skipped ${dropped} findings already commented`;
+      warnings.push(msg);
+      log(`review: ${msg}`);
+    }
+    comments = kept;
+  } catch (err) {
+    const msg = `listing existing review comments failed: ${errMessage(err)}`;
+    warnings.push(msg);
+    log(`review: ${msg}`);
+  }
+
+  try {
+    // Never APPROVE automatically — an "approve" verdict still posts as a COMMENT review.
+    const created = await github.createReview(repo.owner, repo.name, result.prNumber, {
+      commitId: pr.headSha,
+      body,
+      event: result.verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT',
+      comments: comments.map((f) => ({
+        path: f.path,
+        line: f.line,
+        body: `**[${f.severity}] ${f.title}**\n\n${f.body}`,
+      })),
+    });
+    db.markReviewPosted(result.reviewId);
+    result.posted = true;
+    result.reviewUrl = created.htmlUrl;
+  } catch (err) {
+    // Keep the stored review: the next delivery for this head sha retries the post.
+    const msg = `posting the review failed: ${errMessage(err)}`;
+    warnings.push(msg);
+    log(`review: ${msg}`);
+  }
+}
+
 export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
   const { db, llm, retrieve, github } = deps;
   const log = deps.log ?? (() => {});
@@ -210,6 +286,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   if (!repo) throw new Error(`Unknown repo: ${opts.repoId}`);
 
   const pr = await github.getPull(repo.owner, repo.name, opts.prNumber);
+  const postCtx: PostContext = { db, github, llm, repo, pr, log };
 
   if (!opts.force) {
     const cached = db.findReview(opts.repoId, opts.prNumber, pr.headSha);
@@ -217,11 +294,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       log(`review: reusing review #${cached.id} for ${opts.repoId}#${opts.prNumber} @ ${pr.headSha}`);
       let findings: Finding[] = [];
       try {
-        findings = JSON.parse(cached.comments_json) as Finding[];
+        const parsedFindings = JSON.parse(cached.comments_json) as unknown;
+        if (Array.isArray(parsedFindings)) findings = parsedFindings as Finding[];
       } catch {
         findings = [];
       }
-      return {
+      const cachedResult: ReviewResult = {
         reviewId: cached.id,
         prNumber: cached.pr_number,
         headSha: cached.head_sha,
@@ -232,6 +310,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         skippedFiles: [],
         warnings: [],
       };
+      if (post && cached.posted === 0) {
+        // A previous run stored the review but failed (or was asked not) to post it.
+        log(`review: cached review #${cached.id} was never posted; posting it now`);
+        await postReview(postCtx, cachedResult);
+      }
+      return cachedResult;
     }
   }
 
@@ -337,7 +421,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   }
   if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
 
-  const body = buildReviewBody({ summary, verdict, findings, providerName: llm.name, model: llm.model });
+  if (!repo.last_commit) {
+    warnings.push('Repository has not been indexed; review ran without codebase context.');
+  }
 
   const row = db.insertReview({
     repo_id: opts.repoId,
@@ -363,22 +449,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     warnings,
   };
 
-  if (post) {
-    // Never APPROVE automatically — an "approve" verdict still posts as a COMMENT review.
-    const created = await github.createReview(repo.owner, repo.name, opts.prNumber, {
-      commitId: pr.headSha,
-      body,
-      event: verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT',
-      comments: findings.map((f) => ({
-        path: f.path,
-        line: f.line,
-        body: `**[${f.severity}] ${f.title}**\n\n${f.body}`,
-      })),
-    });
-    db.markReviewPosted(row.id);
-    result.posted = true;
-    result.reviewUrl = created.htmlUrl;
-  }
+  if (post) await postReview(postCtx, result);
 
   return result;
 }

@@ -62,7 +62,7 @@ export async function indexRepo(opts: IndexOptions): Promise<IndexResult> {
         continue;
       }
 
-      const text = await checkout.readBlob(entry.blobHash);
+      const text = await readEntry(checkout, entry.path, entry.blobHash);
       if (text.includes('\0')) {
         // Binary content that slipped past the extension filter.
         if (prior) {
@@ -123,6 +123,20 @@ export async function indexRepo(opts: IndexOptions): Promise<IndexResult> {
     const message = err instanceof Error ? err.message : String(err);
     db.setRepoStatus(repoId, 'error', { error: message });
     throw err;
+  }
+}
+
+/**
+ * Read a tree entry from the working tree, which is already checked out at the ref
+ * being indexed. Falls back to the object database when the file is absent (a
+ * sparse or partial checkout), avoiding one `git cat-file` subprocess per file.
+ */
+async function readEntry(checkout: RepoCheckout, path: string, blobHash: string): Promise<string> {
+  try {
+    return await checkout.readFile(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    return checkout.readBlob(blobHash);
   }
 }
 

@@ -223,6 +223,11 @@ export class Db {
     this.raw.prepare(`update repos set ${sets.join(', ')} where id=@id`).run(params);
   }
 
+  /** Record the branch once it is known (rows start with `''` for "the remote default"). */
+  setRepoBranch(id: string, branch: string) {
+    this.raw.prepare(`update repos set branch=? where id=?`).run(branch, id);
+  }
+
   setRepoInstructions(id: string, instructions: string | null) {
     this.raw.prepare(`update repos set instructions=? where id=?`).run(instructions, id);
   }

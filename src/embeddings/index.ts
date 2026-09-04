@@ -68,17 +68,26 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
     const payload = JSON.stringify({ model: this.model, input: batch });
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const res = await this.fetchImpl(`${this.baseUrl}/embeddings`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://github.com/repolens',
-          'X-Title': 'RepoLens',
-        },
-        body: payload,
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.baseUrl}/embeddings`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/repolens',
+            'X-Title': 'RepoLens',
+          },
+          body: payload,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        // DNS failures, resets and timeouts arrive as a thrown error, not a response.
+        const netErr = new ProviderError('embeddings', `request failed: ${err instanceof Error ? err.message : String(err)}`);
+        if (attempt === MAX_ATTEMPTS) throw netErr;
+        await this.sleep(500);
+        continue;
+      }
 
       if (res.ok) return await parseVectors(res, batch.length);
 
@@ -138,5 +147,6 @@ export function createEmbeddings(config: Config): EmbeddingProvider | null {
     baseUrl: config.embedding.baseUrl,
     apiKey: config.embedding.apiKey,
     model: config.embedding.model,
+    timeoutMs: config.llm.timeoutMs,
   });
 }

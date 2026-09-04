@@ -42,6 +42,10 @@ export const runProcess: RunProcess = (cmd, args, opts = {}) =>
       if (timer) clearTimeout(timer);
       resolve({ stdout, stderr, code, timedOut });
     });
+    // A child that exits (or is SIGKILLed by the timeout) before draining a large
+    // prompt makes the write fail with EPIPE. Swallow it: the close handler below
+    // reports the real failure.
+    child.stdin.on('error', () => {});
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
   });
@@ -57,15 +61,21 @@ export class Semaphore {
       this.active++;
       return () => this.release();
     }
+    // A waiter is woken by release() handing over its slot, so `active` is
+    // already accounted for and must not be incremented here.
     await new Promise<void>((res) => this.queue.push(res));
-    this.active++;
     return () => this.release();
   }
 
   private release() {
-    this.active--;
     const next = this.queue.shift();
-    if (next) next();
+    if (next) {
+      // Transfer the slot directly to the waiter; anything acquiring in between
+      // still sees the semaphore as full.
+      next();
+      return;
+    }
+    this.active--;
   }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {

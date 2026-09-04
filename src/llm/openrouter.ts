@@ -58,17 +58,27 @@ export class OpenRouterProvider implements LLMProvider {
     let lastError: ProviderError | undefined;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://github.com/repolens',
-          'X-Title': 'RepoLens',
-        },
-        body: payload,
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/repolens',
+            'X-Title': 'RepoLens',
+          },
+          body: payload,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        // DNS failures, resets and timeouts arrive as a thrown error, not a response.
+        const netErr = new ProviderError('openrouter', `request failed: ${err instanceof Error ? err.message : String(err)}`);
+        if (attempt === MAX_ATTEMPTS) throw netErr;
+        lastError = netErr;
+        await this.sleep(backoffMs(attempt));
+        continue;
+      }
 
       if (res.ok) return this.readContent(res);
 

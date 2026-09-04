@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { openDb, type Db } from '../../src/db.js';
 import type { CompleteRequest, LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrievedChunk } from '../../src/search/types.js';
-import type { PullRequest, CreateReviewInput } from '../../src/review/github.js';
+import type { PullRequest, CreateReviewInput, ExistingReviewComment } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import {
   reviewPullRequest,
@@ -97,8 +97,18 @@ function fakeLlm(opts: FakeLlmOptions = {}) {
   return { calls, provider, fileCalls: () => calls.filter((c) => c.system === FILE_REVIEW_SYSTEM_PROMPT) };
 }
 
-function fakeGithub(diff = DIFF, pr: PullRequest = PR) {
+interface FakeGithubOptions {
+  /** Comments already on the PR, returned by listReviewComments. */
+  existingComments?: ExistingReviewComment[];
+  /** Make createReview reject. */
+  createReviewError?: () => Error | null;
+  /** Make listReviewComments reject. */
+  listError?: Error;
+}
+
+function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions = {}) {
   const reviews: Array<{ owner: string; repo: string; number: number; input: CreateReviewInput }> = [];
+  const listCalls: Array<{ owner: string; repo: string; number: number }> = [];
   const github: ReviewDeps['github'] = {
     async getPull() {
       return pr;
@@ -106,12 +116,19 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR) {
     async getPullDiff() {
       return diff;
     },
+    async listReviewComments(owner: string, repo: string, number: number) {
+      listCalls.push({ owner, repo, number });
+      if (opts.listError) throw opts.listError;
+      return opts.existingComments ?? [];
+    },
     async createReview(owner: string, repo: string, number: number, input: CreateReviewInput) {
+      const err = opts.createReviewError?.();
+      if (err) throw err;
       reviews.push({ owner, repo, number, input });
       return { id: 7, htmlUrl: 'https://github.com/o/r/pull/42#pullrequestreview-7' };
     },
   };
-  return { reviews, github };
+  return { reviews, listCalls, github };
 }
 
 const retrieveOne: RetrieveFn = async () => [CHUNK];
@@ -126,6 +143,8 @@ describe('reviewPullRequest', () => {
   beforeEach(() => {
     db = openDb(':memory:');
     db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    // Indexed at the PR base by default, so no staleness note or "never indexed" warning.
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
   });
   afterEach(() => db.close());
 
@@ -339,6 +358,109 @@ describe('reviewPullRequest', () => {
     );
     expect(llm.fileCalls()).toHaveLength(0);
     expect(res.skippedFiles).toContain('src/app.ts');
+  });
+
+  it('keeps the stored review and warns when posting throws', async () => {
+    const llm = fakeLlm({
+      file: JSON.stringify({ findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }] }),
+    });
+    const gh = fakeGithub(DIFF, PR, { createReviewError: () => new Error('GitHub 502 POST reviews') });
+    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+      repoId: REPO_ID,
+      prNumber: 42,
+    });
+
+    expect(res.posted).toBe(false);
+    expect(res.reviewUrl).toBeUndefined();
+    expect(res.warnings.some((w) => w.includes('GitHub 502'))).toBe(true);
+    const row = db.getReview(res.reviewId)!;
+    expect(row.posted).toBe(0);
+    expect(row.status).toBe('done');
+  });
+
+  it('retries the post for a cached review that was never posted, without calling the LLM', async () => {
+    const llm = fakeLlm({
+      file: JSON.stringify({ findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }] }),
+    });
+    let fail = true;
+    const gh = fakeGithub(DIFF, PR, { createReviewError: () => (fail ? new Error('boom') : null) });
+    const deps = { db, llm: llm.provider, retrieve: retrieveOne, github: gh.github };
+
+    const first = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42 });
+    expect(first.posted).toBe(false);
+    expect(gh.reviews).toHaveLength(0);
+    const callsAfterFirst = llm.calls.length;
+
+    fail = false;
+    const second = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42 });
+    expect(llm.calls).toHaveLength(callsAfterFirst);
+    expect(second.reviewId).toBe(first.reviewId);
+    expect(second.posted).toBe(true);
+    expect(second.findings).toEqual(first.findings);
+    expect(gh.reviews).toHaveLength(1);
+    expect(gh.reviews[0]!.input.comments).toHaveLength(1);
+    expect(db.getReview(second.reviewId)!.posted).toBe(1);
+  });
+
+  it('drops findings that already have an identical review comment', async () => {
+    const llm = fakeLlm({
+      file: JSON.stringify({
+        findings: [
+          { line: 4, severity: 'warning', title: 'Assignment in condition', body: 'Use `===`.' },
+          { line: 3, severity: 'nit', title: 'Fresh one', body: 'new' },
+        ],
+      }),
+    });
+    const gh = fakeGithub(DIFF, PR, {
+      existingComments: [
+        { path: 'src/app.ts', line: 4, body: '**[warning] Assignment in condition**\n\nUse `===`.', user: 'repolens[bot]' },
+      ],
+    });
+    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+      repoId: REPO_ID,
+      prNumber: 42,
+    });
+
+    expect(gh.listCalls).toEqual([{ owner: 'o', repo: 'r', number: 42 }]);
+    expect(res.findings).toHaveLength(2);
+    expect(gh.reviews[0]!.input.comments).toEqual([
+      { path: 'src/app.ts', line: 3, body: '**[nit] Fresh one**\n\nnew' },
+    ]);
+    expect(res.warnings).toContain('Skipped 1 findings already commented');
+  });
+
+  it('posts every finding when listing existing comments fails', async () => {
+    const llm = fakeLlm({
+      file: JSON.stringify({ findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }] }),
+    });
+    const gh = fakeGithub(DIFF, PR, { listError: new Error('GitHub 403 GET comments') });
+    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+      repoId: REPO_ID,
+      prNumber: 42,
+    });
+    expect(res.posted).toBe(true);
+    expect(gh.reviews[0]!.input.comments).toHaveLength(1);
+    expect(res.warnings.some((w) => w.includes('GitHub 403'))).toBe(true);
+  });
+
+  it('notes in the body when the index is older than the PR base', async () => {
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: 'older-commit-sha' });
+    const llm = fakeLlm();
+    const gh = fakeGithub();
+    await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.reviews[0]!.input.body).toContain('<sub>Context indexed at older-c; PR base is base-sh.</sub>');
+  });
+
+  it('warns when the repository has never been indexed', async () => {
+    db.setRepoStatus(REPO_ID, 'queued', { last_commit: null });
+    const llm = fakeLlm();
+    const gh = fakeGithub();
+    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+      repoId: REPO_ID,
+      prNumber: 42,
+    });
+    expect(res.warnings).toContain('Repository has not been indexed; review ran without codebase context.');
+    expect(gh.reviews[0]!.input.body).not.toContain('Context indexed at');
   });
 
   it('throws for an unknown repo', async () => {

@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
+import { timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
@@ -59,15 +60,26 @@ const reviewSchema = z.object({
   force: z.boolean().optional(),
 });
 
+/** Constant-time comparison; differing lengths are rejected without leaking the length. */
+function secretEquals(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  if (x.length !== y.length) return false;
+  return timingSafeEqual(x, y);
+}
+
 export function checkoutFor(deps: Pick<AppDeps, 'config'>, repo: { id: string; remote: string }): RepoCheckout {
   const dir = join(deps.config.dataDir, 'repos', repo.id.replace(/[^a-zA-Z0-9._-]/g, '_'));
   return new RepoCheckout({ dir, url: repo.remote, token: deps.config.github.token || undefined });
 }
 
-/** Normalize a repository reference (`github:o/n`, `o/n`, or an object) to a repo id. */
+/**
+ * Normalize a repository reference (`github:o/n`, `o/n`, or an object) to a repo id.
+ * Ids are lowercase because GitHub owner/repo names are case-insensitive.
+ */
 export function normalizeRepoId(ref: string | { remote?: string; repository: string }): string {
   const value = typeof ref === 'string' ? ref : ref.repository;
-  return value.startsWith('github:') ? value : repoIdFor(value);
+  return value.startsWith('github:') ? value.toLowerCase() : repoIdFor(value);
 }
 
 export function enqueueIndex(deps: AppDeps, repoId: string) {
@@ -78,11 +90,17 @@ export function enqueueIndex(deps: AppDeps, repoId: string) {
     const checkout = checkoutFor(deps, repo);
     ctx.progress('cloning');
     await checkout.ensureClone();
+    // An empty branch means "whatever the remote defaults to"; resolve it once.
+    let branch = repo.branch;
+    if (!branch) {
+      branch = await checkout.defaultBranch();
+      if (branch) deps.db.setRepoBranch(repoId, branch);
+    }
     return indexRepo({
       db: deps.db,
       checkout,
       repoId,
-      ref: repo.branch,
+      ref: branch || undefined,
       embeddings: deps.embeddings,
       onProgress: ctx.progress,
     });
@@ -122,11 +140,13 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   // ---- auth ----
+  // The token is only accepted in the Authorization header: query strings leak into
+  // logs, proxies and referrers. An empty REPOLENS_API_TOKEN disables auth entirely.
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/health' || !config.apiToken) return next();
     const header = c.req.header('authorization') ?? '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : c.req.query('token') ?? '';
-    if (token !== config.apiToken) return c.json({ error: 'Unauthorized' }, 401);
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!secretEquals(token, config.apiToken)) return c.json({ error: 'Unauthorized' }, 401);
     return next();
   });
 
@@ -148,7 +168,8 @@ export function createApp(deps: AppDeps): Hono {
     if (body.data.remote !== 'github') return c.json({ error: 'Only remote "github" is supported' }, 400);
     const parsed = parseRemote(body.data.repository);
     const id = `github:${parsed.owner}/${parsed.name}`;
-    const repo = db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: body.data.branch ?? 'main' });
+    // An unset branch is stored as '' and resolved from the remote by the index job.
+    const repo = db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: body.data.branch ?? '' });
     const job = enqueueIndex(deps, id);
     return c.json({ repository: repo, jobId: job.id }, 202);
   });
@@ -242,10 +263,13 @@ export function createApp(deps: AppDeps): Hono {
   // ---- webhook ----
   app.post('/webhooks/github', async (c) => {
     const raw = await c.req.text();
-    if (config.github.webhookSecret) {
-      if (!verifyWebhookSignature(config.github.webhookSecret, raw, c.req.header('x-hub-signature-256'))) {
-        return c.json({ error: 'Invalid signature' }, 401);
-      }
+    // Fail closed: an unconfigured secret must never mean "accept everything".
+    if (!config.github.webhookSecret) {
+      log('webhook rejected: GITHUB_WEBHOOK_SECRET is not configured');
+      return c.json({ error: 'GITHUB_WEBHOOK_SECRET is not configured' }, 503);
+    }
+    if (!verifyWebhookSignature(config.github.webhookSecret, raw, c.req.header('x-hub-signature-256'))) {
+      return c.json({ error: 'Invalid signature' }, 401);
     }
     const event = c.req.header('x-github-event') ?? '';
     let payload: unknown;

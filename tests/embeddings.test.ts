@@ -159,6 +159,36 @@ describe('OpenAIEmbeddings', () => {
     expect(f.calls).toHaveLength(1);
   });
 
+  it('retries a network-layer failure then succeeds', async () => {
+    const f = embeddingFetch();
+    let calls = 0;
+    const flaky = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (++calls === 1) throw new Error('fetch failed');
+      return f.fetch(url as string, init);
+    }) as unknown as typeof fetch;
+    const e = new OpenAIEmbeddings({ baseUrl: 'http://x/v1', apiKey: 'k', model: 'm', fetch: flaky, sleep: async () => {} });
+    const v = await e.embed(['t7']);
+    expect(v[0]![0]).toBe(7);
+    expect(calls).toBe(2);
+  });
+
+  it('wraps a persistent network failure in a ProviderError', async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      throw new Error('ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const e = new OpenAIEmbeddings({ baseUrl: 'http://x/v1', apiKey: 'k', model: 'm', fetch: fetchImpl, sleep: async () => {} });
+    const err = await e.embed(['a']).then(
+      () => null,
+      (x: unknown) => x,
+    );
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).provider).toBe('embeddings');
+    expect((err as ProviderError).message).toContain('request failed: ECONNREFUSED');
+    expect(calls).toBe(2);
+  });
+
   it('throws when the batch returns the wrong number of vectors', async () => {
     const f = embeddingFetch({ failures: [jsonResponse({ data: [] })] });
     const e = new OpenAIEmbeddings({ baseUrl: 'http://x/v1', apiKey: 'k', model: 'm', fetch: f.fetch });
@@ -175,6 +205,13 @@ describe('createEmbeddings', () => {
     const e = createEmbeddings(baseConfig({ embedding: { baseUrl: 'http://x/v1', apiKey: 'k', model: 'm1' } }));
     expect(e).toBeInstanceOf(OpenAIEmbeddings);
     expect(e!.model).toBe('m1');
+  });
+
+  it('forwards the configured llm timeout', () => {
+    const cfg = baseConfig({ embedding: { baseUrl: 'http://x/v1', apiKey: 'k', model: 'm1' } });
+    cfg.llm.timeoutMs = 4321;
+    const e = createEmbeddings(cfg)!;
+    expect((e as unknown as { timeoutMs: number }).timeoutMs).toBe(4321);
   });
 });
 

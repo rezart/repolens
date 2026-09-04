@@ -26,6 +26,13 @@ describe('Db', () => {
     expect(db.getRepo('github:o/n')?.file_count).toBe(3);
   });
 
+  it('records a branch resolved after the clone', () => {
+    db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: '' });
+    expect(db.getRepo('github:o/n')?.branch).toBe('');
+    db.setRepoBranch('github:o/n', 'trunk');
+    expect(db.getRepo('github:o/n')?.branch).toBe('trunk');
+  });
+
   it('full-text searches chunks with bm25 ranking', () => {
     seed(db);
     const hits = db.ftsSearch(['github:o/n'], '"verifyToken" OR "jwt"', 10);

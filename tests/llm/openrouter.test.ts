@@ -142,6 +142,37 @@ describe('OpenRouterProvider', () => {
     expect(f.calls).toHaveLength(1);
   });
 
+  it('retries a network-layer failure then succeeds', async () => {
+    const outcomes: Array<Response | Error> = [new Error('fetch failed'), ok()];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      const next = outcomes.shift()!;
+      if (next instanceof Error) throw next;
+      return next;
+    }) as unknown as typeof fetch;
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: fetchImpl, sleep: async () => {} });
+    expect(await p.complete({ messages: [{ role: 'user', content: 'hi' }] })).toBe('hello there');
+    expect(calls).toBe(2);
+  });
+
+  it('wraps a persistent network failure in a ProviderError', async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      throw new Error('ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: fetchImpl, sleep: async () => {} });
+    const err = await p.complete({ messages: [{ role: 'user', content: 'hi' }] }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).provider).toBe('openrouter');
+    expect((err as ProviderError).message).toContain('request failed: ECONNREFUSED');
+    expect(calls).toBe(3);
+  });
+
   it('throws when the response has no content', async () => {
     const f = fakeFetch([jsonResponse({ choices: [] })]);
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });

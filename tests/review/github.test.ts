@@ -133,11 +133,46 @@ describe('GitHubClient.createReview', () => {
     });
     expect(res.id).toBe(100);
     expect(f.calls).toHaveLength(2);
-    const retry = f.calls[1]!.body as { comments: unknown[]; body: string };
+    const retry = f.calls[1]!.body as { comments: unknown[]; body: string; event: string };
     expect(retry.comments).toEqual([]);
+    expect(retry.event).toBe('COMMENT');
     expect(retry.body).toContain('summary here');
     expect(retry.body).toContain('- **src/a.ts:12** — boom');
     expect(retry.body).toContain('- **src/b.ts:3** — bang');
+  });
+
+  it('downgrades REQUEST_CHANGES to COMMENT on the 422 retry and says so in the body', async () => {
+    const { f, gh } = client([
+      jsonResponse({ message: 'Can not request changes on your own pull request' }, 422),
+      jsonResponse({ id: 101, html_url: 'https://x/101' }),
+    ]);
+    const res = await gh.createReview('o', 'r', 1, {
+      commitId: 'abc123',
+      body: 'summary here',
+      event: 'REQUEST_CHANGES',
+      comments: [{ path: 'src/a.ts', line: 12, body: 'boom' }],
+    });
+    expect(res.id).toBe(101);
+    expect((f.calls[0]!.body as { event: string }).event).toBe('REQUEST_CHANGES');
+    const retry = f.calls[1]!.body as { event: string; body: string };
+    expect(retry.event).toBe('COMMENT');
+    expect(retry.body).toContain('request_changes');
+  });
+
+  it('reports both failures when the 422 retry also fails', async () => {
+    const { f, gh } = client([
+      jsonResponse({ message: 'line must be part of the diff' }, 422),
+      textResponse('server exploded', 500),
+    ]);
+    await expect(
+      gh.createReview('o', 'r', 1, {
+        commitId: 'a',
+        body: 'b',
+        event: 'COMMENT',
+        comments: [{ path: 'src/a.ts', line: 12, body: 'boom' }],
+      }),
+    ).rejects.toThrow(/line must be part of the diff[\s\S]*server exploded/);
+    expect(f.calls).toHaveLength(2);
   });
 
   it('does not retry a 422 when there were no comments to drop', async () => {

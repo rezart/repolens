@@ -246,7 +246,7 @@ function renderRepoList() {
     return;
   }
   for (const repo of state.repos) {
-    const sub = (repo.branch || 'main') + ' · ' + fmtCount(repo.file_count) + ' files · ' + fmtCount(repo.chunk_count) + ' chunks';
+    const sub = (repo.branch || 'default branch') + ' · ' + fmtCount(repo.file_count) + ' files · ' + fmtCount(repo.chunk_count) + ' chunks';
     list.appendChild(h('li', {
       class: 'repo-item' + (repo.id === state.selectedId ? ' is-selected' : ''),
       onclick: () => selectRepo(repo.id),
@@ -278,7 +278,7 @@ function renderPanel() {
   dom.repoTitle.textContent = repo.owner + '/' + repo.name;
   dom.repoMeta.replaceChildren(
     h('span', { class: 'pill pill-' + repo.status, text: repo.status }),
-    h('span', { text: repo.branch || 'main' }),
+    h('span', { text: repo.branch || 'default branch' }),
     h('span', { text: fmtCount(repo.file_count) + ' files / ' + fmtCount(repo.chunk_count) + ' chunks' }),
     h('span', { text: 'indexed ' + fmtTime(repo.indexed_at) }),
     repo.last_commit ? h('code', { text: String(repo.last_commit).slice(0, 8) }) : null,
@@ -570,7 +570,7 @@ function buildSettingsTab(repo) {
       h('h3', { text: 'Index' }),
       h('div', { class: 'kv' }, [
         ['Remote', repo.remote || 'github'],
-        ['Branch', repo.branch || 'main'],
+        ['Branch', repo.branch || 'default branch (resolving)'],
         ['Last commit', repo.last_commit || '—'],
         ['Indexed', fmtTime(repo.indexed_at)],
         ['Added', fmtTime(repo.created_at)],

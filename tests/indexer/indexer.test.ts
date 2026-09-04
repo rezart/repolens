@@ -120,6 +120,26 @@ describe('indexRepo', () => {
     expect(db.listFiles(REPO_ID).map((f) => f.path)).toEqual(['a.ts']);
   });
 
+  it('reads content from the working tree instead of one git process per file', async () => {
+    let blobReads = 0;
+    const readBlob = checkout.readBlob.bind(checkout);
+    checkout.readBlob = async (hash: string) => {
+      blobReads++;
+      return readBlob(hash);
+    };
+    const res = await indexRepo({ db, checkout, repoId: REPO_ID });
+    expect(res.files).toBe(2);
+    expect(blobReads).toBe(0);
+  });
+
+  it('falls back to the object database when a tracked file is absent from the working tree', async () => {
+    // tracked in HEAD but deleted on disk (a partial or sparse checkout)
+    unlinkSync(join(repoDir, 'b.ts'));
+    const res = await indexRepo({ db, checkout, repoId: REPO_ID });
+    expect(res.files).toBe(2);
+    expect(db.getChunksForPath(REPO_ID, 'b.ts')[0].content).toContain('beta');
+  });
+
   it('works without an embedding provider', async () => {
     const res = await indexRepo({ db, checkout, repoId: REPO_ID });
     expect(res.files).toBe(2);

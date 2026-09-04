@@ -44,7 +44,8 @@ async function main() {
       const deps = buildDeps(config, log);
       const parsed = parseRemote(args[0]);
       const id = `github:${parsed.owner}/${parsed.name}`;
-      deps.db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: flag(args, '--branch') ?? 'main' });
+      // '' means "use the remote's default branch"; the index job resolves it.
+      deps.db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: flag(args, '--branch') ?? '' });
       const job = enqueueIndex(deps, id);
       await deps.jobs.idle();
       const done = deps.db.getJob(job.id)!;

@@ -133,13 +133,30 @@ export class GitHubClient {
     const allow = input.comments.length > 0 ? [422] : [];
     const res = await this.request(path, { method: 'POST', body: payload, allow });
     if (res.status === 422) {
-      // A comment line was probably not part of the diff; post the review body alone
-      // with the inline findings inlined so nothing is lost.
-      const retry = await this.json<{ id: number; html_url: string }>(path, {
-        method: 'POST',
-        body: { ...payload, comments: [], body: `${input.body}\n\n${renderDroppedComments(input.comments)}` },
-      });
-      return { id: retry.id, htmlUrl: retry.html_url };
+      // A comment line was probably not part of the diff, or REQUEST_CHANGES was rejected
+      // because the token owns the PR. Post the body alone, as a plain COMMENT, with the
+      // inline findings inlined so nothing is lost.
+      const retryBody = [
+        input.body,
+        input.event === 'REQUEST_CHANGES'
+          ? '_Verdict was **request_changes**; posted as a comment because the review could not be submitted as REQUEST_CHANGES._'
+          : null,
+        renderDroppedComments(input.comments),
+      ]
+        .filter((p): p is string => p !== null)
+        .join('\n\n');
+      let retry: RawResponse;
+      try {
+        retry = await this.request(path, {
+          method: 'POST',
+          body: { ...payload, event: 'COMMENT' as const, comments: [], body: retryBody },
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(`GitHub 422 POST ${path}: ${res.text.slice(0, 300)} — retry as a plain comment failed: ${reason}`);
+      }
+      const created = JSON.parse(retry.text || 'null') as { id: number; html_url: string };
+      return { id: created.id, htmlUrl: created.html_url };
     }
     const created = JSON.parse(res.text || 'null') as { id: number; html_url: string };
     return { id: created.id, htmlUrl: created.html_url };

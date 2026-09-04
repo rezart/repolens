@@ -33,6 +33,16 @@ describe('parseRemote', () => {
     }
   });
 
+  it('lowercases owner and name (github is case-insensitive)', () => {
+    expect(parseRemote('https://github.com/Acme/Widgets.git')).toEqual({
+      host: 'github',
+      owner: 'acme',
+      name: 'widgets',
+      url: 'https://github.com/acme/widgets.git',
+    });
+    expect(repoIdFor('Acme/Widgets')).toBe(repoIdFor('acme/widgets'));
+  });
+
   it('derives a repo id', () => {
     expect(repoIdFor('git@github.com:acme/widgets.git')).toBe('github:acme/widgets');
   });
@@ -117,24 +127,81 @@ describe('RepoCheckout', () => {
     expect((await c.listFiles()).length).toBe(2);
   });
 
-  it('clones with an authenticated url but redacts the token from errors', async () => {
+  it('cleans up a partial directory before cloning', async () => {
+    const bare = join(root, 'origin-partial.git');
+    await git(['clone', '-q', '--bare', repoDir, bare], root);
+    const dest = join(root, 'partial-clone');
+    mkdirSync(dest, { recursive: true });
+    writeFileSync(join(dest, 'leftover.txt'), 'junk\n');
+    const c = new RepoCheckout({ dir: dest, url: bare });
+    await c.ensureClone();
+    expect(existsSync(join(dest, '.git'))).toBe(true);
+    expect(existsSync(join(dest, 'a.ts'))).toBe(true);
+    expect(existsSync(join(dest, 'leftover.txt'))).toBe(false);
+  });
+
+  it('reports the default branch of the remote', async () => {
+    const bare = join(root, 'origin-master.git');
+    await git(['clone', '-q', '--bare', repoDir, bare], root);
+    await git(['symbolic-ref', 'HEAD', 'refs/heads/master'], bare);
+    await git(['branch', '-m', 'main', 'master'], bare);
+    const dest = join(root, 'master-clone');
+    const c = new RepoCheckout({ dir: dest, url: bare });
+    await c.ensureClone();
+    expect(await c.defaultBranch()).toBe('master');
+  });
+
+  it('passes the token as an http header and never leaks it into errors', async () => {
     const dest = join(root, 'bad-clone');
-    const seen: string[] = [];
+    const seen: string[][] = [];
+    const token = 'ghp_SECRETVALUE';
+    const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
     const c = new RepoCheckout({
       dir: dest,
       url: 'https://github.com/o/n.git',
-      token: 'ghp_SECRETVALUE',
+      token,
       git: async (args) => {
-        seen.push(args.join(' '));
-        throw new Error(`fatal: could not read from ${args[2]}`);
+        seen.push(args);
+        throw new Error(`fatal: could not read from ${args.join(' ')}`);
       },
     });
     await expect(c.ensureClone()).rejects.toThrow(/could not read/);
-    expect(seen[0]).toContain('https://x-access-token:ghp_SECRETVALUE@github.com/o/n.git');
+    expect(seen[0]!.slice(0, 2)).toEqual(['-c', `http.extraheader=Authorization: Basic ${basic}`]);
+    // the clone url stays clean, so no credential is written into .git/config
+    expect(seen[0]).toContain('https://github.com/o/n.git');
+    expect(seen[0]!.join(' ')).not.toContain(`${token}@`);
     await c.ensureClone().catch((e: Error) => {
-      expect(e.message).not.toContain('ghp_SECRETVALUE');
+      expect(e.message).not.toContain(token);
+      expect(e.message).not.toContain(basic);
       expect(e.message).toContain('***');
     });
+  });
+
+  it('rewrites a legacy remote url that still embeds a token', async () => {
+    const bare = join(root, 'origin-legacy.git');
+    await git(['clone', '-q', '--bare', repoDir, bare], root);
+    const dest = join(root, 'legacy-clone');
+    const plain = new RepoCheckout({ dir: dest, url: bare });
+    await plain.ensureClone();
+    await git(['remote', 'set-url', 'origin', `https://x-access-token:ghp_OLD@example.invalid/o/n.git`], dest);
+    const c = new RepoCheckout({ dir: dest, url: bare, token: 'ghp_NEW' });
+    await c.ensureClone();
+    const url = await exec('git', ['remote', 'get-url', 'origin'], { cwd: dest });
+    expect(url.stdout.trim()).toBe(bare);
+  });
+
+  it('omits the auth header when no token is configured', async () => {
+    const calls: string[][] = [];
+    const c = new RepoCheckout({
+      dir: '/nowhere',
+      url: 'https://github.com/o/n.git',
+      git: async (args) => {
+        calls.push(args);
+        return '';
+      },
+    });
+    await c.fetchRef('main');
+    expect(calls[0]).toEqual(['fetch', 'origin', 'main']);
   });
 
   it('uses an injected git runner', async () => {

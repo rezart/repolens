@@ -22,10 +22,29 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
 export function startServer(config: Config, log: (msg: string) => void = console.log) {
   const deps = buildDeps(config, log);
   const app = createApp(deps);
+
+  // A long-running server must survive a stray async failure (an EPIPE on a child's
+  // stdin, an abandoned fetch) rather than exiting mid-job.
+  process.on('uncaughtException', (err: Error) => {
+    log(`uncaught exception: ${err?.stack ?? err?.message ?? String(err)}`);
+  });
+  process.on('unhandledRejection', (reason: unknown) => {
+    log(`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`);
+  });
+
   const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
     log(`RepoLens listening on http://localhost:${info.port}`);
     log(`LLM: ${deps.llm.name} (${deps.llm.model}); embeddings: ${deps.embeddings?.model ?? 'off (lexical retrieval only)'}`);
-    if (!config.apiToken) log('WARNING: REPOLENS_API_TOKEN is empty; the API is unauthenticated');
+    if (!config.apiToken) {
+      log('*'.repeat(72));
+      log('*** WARNING: REPOLENS_API_TOKEN is empty. The API is UNAUTHENTICATED and');
+      log('*** anyone who can reach this port can read every indexed repository.');
+      log('*** Set REPOLENS_API_TOKEN before exposing it beyond localhost.');
+      log('*'.repeat(72));
+    }
+    if (!config.github.webhookSecret) {
+      log('WARNING: GITHUB_WEBHOOK_SECRET is empty; /webhooks/github will reject all deliveries with 503');
+    }
   });
   return { server, deps };
 }
