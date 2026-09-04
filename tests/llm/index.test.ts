@@ -29,10 +29,10 @@ describe('createProvider', () => {
   });
 
   it('rejects an openrouter override without an API key', () => {
-    const config = loadConfig({ ...base, CHAT_PROVIDER: 'openrouter', CHAT_MODEL: 'openai/gpt-4o-mini' });
-    expect(() => createProvider(config, { provider: 'openrouter', model: config.chatModel })).toThrow(
-      /OPENROUTER_API_KEY/,
-    );
+    // loadConfig now catches this for CHAT_PROVIDER; the factory still guards direct overrides.
+    expect(() => loadConfig({ ...base, CHAT_PROVIDER: 'openrouter', CHAT_MODEL: 'openai/gpt-4o-mini' })).toThrow(/OPENROUTER_API_KEY/);
+    const config = loadConfig(base);
+    expect(() => createProvider(config, { provider: 'openrouter', model: 'openai/gpt-4o-mini' })).toThrow(/OPENROUTER_API_KEY/);
   });
 
   // The effort is private on every provider; reading it is the only way to see
