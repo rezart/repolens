@@ -117,7 +117,9 @@ export class OpenRouterProvider implements LLMProvider {
   }
 
   async complete(req: CompleteRequest): Promise<string> {
-    return this.readContent(await this.post(this.buildPayload(req, false)));
+    const { content, usage } = await this.readContent(await this.post(this.buildPayload(req, false)));
+    this.reportUsage(usage);
+    return content;
   }
 
   /**
@@ -234,7 +236,8 @@ export class OpenRouterProvider implements LLMProvider {
     throw lastError ?? new ProviderError('openrouter', 'request failed');
   }
 
-  private async readContent(res: Response): Promise<string> {
+  /** The message text plus the usage block, if the response carried one. */
+  private async readContent(res: Response): Promise<{ content: string; usage: RawUsage | null | undefined }> {
     let parsed: ChatCompletionResponse;
     const text = await safeText(res);
     try {
@@ -246,8 +249,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (typeof content !== 'string') {
       throw new ProviderError('openrouter', 'response had no message content', res.status, text.slice(0, 500));
     }
-    this.reportUsage(parsed.usage);
-    return content;
+    return { content, usage: parsed.usage };
   }
 }
 

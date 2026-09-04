@@ -67,7 +67,8 @@ const reviewPullsSchema = z.object({
   force: z.boolean().optional(),
 });
 
-const usageDaysSchema = z.coerce.number().int().min(1).max(365).default(30);
+// `?days=` (empty) means the default, like an absent param; coercing '' would give 0 and fail min(1).
+const usageDaysSchema = z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(1).max(365).default(30));
 
 const reviewSchema = z.object({
   repository: z.string().min(1),
@@ -352,10 +353,7 @@ export function createApp(deps: AppDeps): Hono {
 
   // ---- usage ----
   app.get('/api/usage', async (c) => {
-    // An absent param is `undefined` and takes the default; `?days=` would coerce
-    // to 0 and fail the range check, so treat an empty string as absent too.
-    const raw = c.req.query('days');
-    const days = usageDaysSchema.safeParse(raw === '' ? undefined : raw);
+    const days = usageDaysSchema.safeParse(c.req.query('days'));
     if (!days.success) return c.json({ error: days.error.message }, 400);
     return c.json(await deps.usage.report(days.data));
   });
