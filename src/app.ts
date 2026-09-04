@@ -406,6 +406,14 @@ export function createApp(deps: AppDeps): Hono {
 
   // ---- dashboard ----
   const webDir = deps.webDir ?? join(process.cwd(), 'web');
+  // The dashboard has no build step or hashed filenames, so browsers must
+  // revalidate on every load; otherwise heuristic caching keeps serving a
+  // pre-deploy app.js and new features never appear without a hard reload.
+  // Registered after the API routes, so their responses are untouched.
+  app.use('/*', async (c, next) => {
+    await next();
+    c.res.headers.set('Cache-Control', 'no-cache');
+  });
   app.use('/*', serveStatic({ root: webDir, rewriteRequestPath: (p) => (p === '/' ? '/index.html' : p) }));
 
   return app;
