@@ -13,9 +13,30 @@ function fakeRun(result: Partial<RunResult>) {
   const calls: Recorded[] = [];
   const run = async (cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> => {
     calls.push({ cmd, args, opts });
-    return { stdout: '', stderr: '', code: 0, timedOut: false, ...result };
+    const res = { stdout: '', stderr: '', code: 0, timedOut: false, ...result };
+    // Feed stdout through the streaming callback in awkward slices so the line
+    // splitter is exercised across chunk boundaries.
+    if (opts.onStdout && res.stdout) {
+      for (let i = 0; i < res.stdout.length; i += 7) opts.onStdout(res.stdout.slice(i, i + 7));
+    }
+    return res;
   };
   return { calls, run };
+}
+
+/** Build the NDJSON a real `--output-format stream-json` run produces. */
+function streamJson(texts: string[], final: string, extra: Record<string, unknown> = {}): string {
+  const lines: string[] = [
+    JSON.stringify({ type: 'system', subtype: 'init' }),
+    JSON.stringify({ type: 'stream_event', event: { type: 'message_start' } }),
+    // A thinking block is interleaved on real runs and must be ignored.
+    JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'hmm' } } }),
+  ];
+  for (const t of texts) {
+    lines.push(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: t } } }));
+  }
+  lines.push(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: final, ...extra }));
+  return lines.join('\n') + '\n';
 }
 
 function argValue(args: string[], flag: string): string | undefined {
@@ -152,5 +173,70 @@ describe('ClaudeCliProvider', () => {
       p.complete({ messages: [{ role: 'user', content: 'c' }] }),
     ]);
     expect(maxActive).toBe(1);
+  });
+});
+
+describe('ClaudeCliProvider.stream', () => {
+  it('emits text deltas and resolves with the result event', async () => {
+    const f = fakeRun({ stdout: streamJson(['Hello ', 'there', '!'], 'Hello there!') });
+    const p = new ClaudeCliProvider({ model: 'haiku', run: f.run });
+    const deltas: string[] = [];
+    const out = await p.stream({ system: 'be terse', messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
+
+    expect(deltas).toEqual(['Hello ', 'there', '!']);
+    expect(out).toBe('Hello there!');
+
+    const args = f.calls[0]!.args;
+    expect(argValue(args, '--output-format')).toBe('stream-json');
+    // stream-json is only accepted alongside --verbose in print mode.
+    expect(args).toContain('--verbose');
+    expect(args).toContain('--include-partial-messages');
+    expect(argValue(args, '--model')).toBe('haiku');
+    expect(argValue(args, '--system-prompt')).toBe('be terse');
+    expect(f.calls[0]!.opts.stdin).toBe('hi');
+  });
+
+  it('falls back to the concatenated deltas when no result event arrives', async () => {
+    const lines = [
+      JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } }),
+      'not json at all',
+    ].join('\n');
+    const f = fakeRun({ stdout: lines });
+    const p = new ClaudeCliProvider({ run: f.run });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).resolves.toBe('partial');
+  });
+
+  it('throws when the CLI reports is_error', async () => {
+    const f = fakeRun({ stdout: streamJson([], '', { is_error: true, subtype: 'error_max_turns' }) });
+    const p = new ClaudeCliProvider({ run: f.run });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('throws when the stream ends with nothing at all', async () => {
+    const f = fakeRun({ stdout: '' });
+    const p = new ClaudeCliProvider({ run: f.run });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toThrow(/without a result/);
+  });
+
+  it('throws on a non-zero exit code', async () => {
+    const f = fakeRun({ code: 2, stderr: 'boom' });
+    const p = new ClaudeCliProvider({ run: f.run });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toThrow(/exited with code 2/);
+  });
+});
+
+describe('ClaudeCliProvider reasoning effort', () => {
+  it('passes --effort when configured', async () => {
+    const f = fakeRun({ stdout: okStdout });
+    const p = new ClaudeCliProvider({ run: f.run, reasoningEffort: 'medium' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(argValue(f.calls[0]!.args, '--effort')).toBe('medium');
+  });
+
+  it('omits --effort when blank', async () => {
+    const f = fakeRun({ stdout: okStdout });
+    const p = new ClaudeCliProvider({ run: f.run, reasoningEffort: '' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.args).not.toContain('--effort');
   });
 });

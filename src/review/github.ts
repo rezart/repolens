@@ -41,6 +41,24 @@ export interface ExistingReviewComment {
   user: string;
 }
 
+export type CommitStatusState = 'pending' | 'success' | 'failure' | 'error';
+
+export interface CommitStatusInput {
+  state: CommitStatusState;
+  /** Status check name, e.g. `repolens/review`. Branch protection matches on this. */
+  context: string;
+  description: string;
+  targetUrl?: string;
+}
+
+/** GitHub rejects commit status descriptions longer than 140 characters. */
+export const STATUS_DESCRIPTION_MAX = 140;
+
+export function truncateDescription(text: string, max = STATUS_DESCRIPTION_MAX): string {
+  const s = text.replace(/\s+/g, ' ').trim();
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
 export interface GitHubClientOptions {
   token: string;
   baseUrl?: string;
@@ -178,6 +196,19 @@ export class GitHubClient {
     }
     const created = JSON.parse(res.text || 'null') as { id: number; html_url: string };
     return { id: created.id, htmlUrl: created.html_url };
+  }
+
+  /** Report a commit status (a CI check) on `sha`. */
+  async createCommitStatus(owner: string, repo: string, sha: string, input: CommitStatusInput): Promise<void> {
+    await this.request(`/repos/${owner}/${repo}/statuses/${sha}`, {
+      method: 'POST',
+      body: {
+        state: input.state,
+        context: input.context,
+        description: truncateDescription(input.description),
+        target_url: input.targetUrl,
+      },
+    });
   }
 
   async createIssueComment(owner: string, repo: string, number: number, body: string): Promise<CreatedComment> {

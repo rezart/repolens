@@ -35,7 +35,7 @@ function makeDeps(overrides: Partial<AppDeps> = {}, env: Record<string, string> 
   const db = openDb(':memory:');
   const jobs = new JobQueue(db);
   const github = {} as GitHubClient;
-  return {
+  const base = {
     config,
     db,
     llm: fakeLlm(),
@@ -45,6 +45,8 @@ function makeDeps(overrides: Partial<AppDeps> = {}, env: Record<string, string> 
     jobs,
     ...overrides,
   };
+  // Chat shares the review backend unless a test overrides it.
+  return { chatLlm: base.llm, ...base };
 }
 
 const auth = { authorization: 'Bearer secret', 'content-type': 'application/json' };
@@ -62,6 +64,7 @@ describe('API', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.llm.provider).toBe('fake');
+    expect(body.chat).toEqual({ provider: 'fake', model: 'fake-1' });
     expect(body.embeddings).toBeNull();
   });
 
@@ -125,6 +128,75 @@ describe('API', () => {
     const body = await res.json();
     expect(body.message).toContain('src/auth.ts');
     expect(body.sources[0].filepath).toBe('src/auth.ts');
+  });
+
+  it('streams an answer as SSE: sources first, then deltas, then the full message', async () => {
+    const streaming: LLMProvider = {
+      name: 'streamy',
+      model: 's1',
+      concurrency: 1,
+      complete: async () => 'unused',
+      async stream(_req, onDelta) {
+        onDelta('Auth lives in ');
+        onDelta('src/auth.ts:1-5.');
+        return 'Auth lives in src/auth.ts:1-5.';
+      },
+    };
+    const d = makeDeps({ chatLlm: streaming });
+    d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+    const res = await createApp(d).request('/api/query', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'how does auth work?' }], repositories: ['github:o/n'], stream: true }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const body = await res.text();
+
+    expect(body).toContain('event: sources');
+    expect(body.match(/event: delta/g)).toHaveLength(2);
+    expect(body).toContain('event: message');
+    expect(body).toContain('event: done');
+    // Sources must land before the first delta so the UI can show them early.
+    expect(body.indexOf('event: sources')).toBeLessThan(body.indexOf('event: delta'));
+    expect(body.indexOf('event: delta')).toBeLessThan(body.indexOf('event: message'));
+    expect(body).toContain('Auth lives in ');
+    expect(body).toContain('src/auth.ts');
+  });
+
+  it('reports the stream error instead of failing the response', async () => {
+    const boom: LLMProvider = {
+      name: 'boom',
+      model: 'b',
+      concurrency: 1,
+      complete: async () => {
+        throw new Error('model exploded');
+      },
+    };
+    const d = makeDeps({ chatLlm: boom });
+    d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+    const res = await createApp(d).request('/api/query', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }], repositories: ['github:o/n'], stream: true }),
+    });
+    const body = await res.text();
+    expect(body).toContain('event: error');
+    expect(body).toContain('model exploded');
+  });
+
+  it('answers chat with chatLlm, leaving the review backend untouched', async () => {
+    const chat = fakeLlm();
+    const d = makeDeps({ chatLlm: chat });
+    d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+    await createApp(d).request('/api/query', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }], repositories: ['github:o/n'] }),
+    });
+    expect(chat.calls).toHaveLength(1);
+    expect((d.llm as ReturnType<typeof fakeLlm>).calls).toHaveLength(0);
   });
 
   it('rejects queries for unknown repositories', async () => {

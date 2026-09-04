@@ -211,6 +211,49 @@ describe('GitHubClient.createIssueComment / listReviewComments', () => {
   });
 });
 
+describe('GitHubClient.createCommitStatus', () => {
+  it('posts the status to the commit', async () => {
+    const { f, gh } = client([jsonResponse({ id: 1, state: 'failure' }, 201)]);
+    await gh.createCommitStatus('o', 'r', 'headsha', {
+      state: 'failure',
+      context: 'repolens/review',
+      description: '1 critical, 2 warnings',
+      targetUrl: 'https://github.com/o/r/pull/42',
+    });
+    const call = f.calls[0]!;
+    expect(call.url).toBe('https://api.github.com/repos/o/r/statuses/headsha');
+    expect(call.method).toBe('POST');
+    expect(call.headers['Authorization']).toBe('Bearer tok');
+    expect(call.body).toEqual({
+      state: 'failure',
+      context: 'repolens/review',
+      description: '1 critical, 2 warnings',
+      target_url: 'https://github.com/o/r/pull/42',
+    });
+  });
+
+  it('omits target_url when there is none and truncates the description to 140 chars', async () => {
+    const { f, gh } = client([jsonResponse({ id: 1 }, 201)]);
+    await gh.createCommitStatus('o', 'r', 'sha', {
+      state: 'pending',
+      context: 'repolens/review',
+      description: 'x'.repeat(200),
+    });
+    const body = f.calls[0]!.body as Record<string, unknown>;
+    expect(body.target_url).toBeUndefined();
+    expect(body.state).toBe('pending');
+    expect(String(body.description)).toHaveLength(140);
+    expect(String(body.description).endsWith('…')).toBe(true);
+  });
+
+  it('throws when GitHub rejects the status', async () => {
+    const { gh } = client([textResponse('Bad credentials', 403)]);
+    await expect(
+      gh.createCommitStatus('o', 'r', 'sha', { state: 'success', context: 'c', description: 'ok' }),
+    ).rejects.toThrow('GitHub 403 POST /repos/o/r/statuses/sha: Bad credentials');
+  });
+});
+
 describe('GitHubClient errors', () => {
   it('throws with status, method, path and a body excerpt', async () => {
     const { gh } = client([textResponse('Not Found', 404)]);

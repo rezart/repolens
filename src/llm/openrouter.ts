@@ -1,5 +1,6 @@
 import { ProviderError } from './types.js';
-import type { ChatMessage, CompleteRequest, LLMProvider } from './types.js';
+import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
+import type { ReasoningEffort } from './claude-cli.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -11,6 +12,8 @@ export interface OpenRouterOptions {
   timeoutMs?: number;
   /** Injectable for tests; defaults to setTimeout. */
   sleep?: Sleep;
+  /** Sent as `reasoning: { effort }`. Blank/undefined omits it. */
+  reasoningEffort?: ReasoningEffort | '';
 }
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -21,6 +24,11 @@ const defaultSleep: Sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: unknown } }>;
   error?: unknown;
+}
+
+/** One `data:` frame of a `stream: true` chat completion. */
+interface StreamChunk {
+  choices?: Array<{ delta?: { content?: unknown } }>;
 }
 
 /** OpenRouter (OpenAI-compatible) chat completions. */
@@ -34,6 +42,7 @@ export class OpenRouterProvider implements LLMProvider {
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly sleep: Sleep;
+  private readonly effort: ReasoningEffort | undefined;
 
   constructor(opts: OpenRouterOptions) {
     this.apiKey = opts.apiKey;
@@ -42,9 +51,10 @@ export class OpenRouterProvider implements LLMProvider {
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 300_000;
     this.sleep = opts.sleep ?? defaultSleep;
+    this.effort = opts.reasoningEffort || undefined;
   }
 
-  async complete(req: CompleteRequest): Promise<string> {
+  private buildPayload(req: CompleteRequest, streaming: boolean): string {
     const messages: ChatMessage[] = req.system
       ? [{ role: 'system', content: req.system }, ...req.messages]
       : [...req.messages];
@@ -53,8 +63,76 @@ export class OpenRouterProvider implements LLMProvider {
     if (req.maxTokens !== undefined) body.max_tokens = req.maxTokens;
     if (req.temperature !== undefined) body.temperature = req.temperature;
     if (req.json) body.response_format = { type: 'json_object' };
+    if (this.effort) body.reasoning = { effort: this.effort };
+    if (streaming) body.stream = true;
+    return JSON.stringify(body);
+  }
 
-    const payload = JSON.stringify(body);
+  async complete(req: CompleteRequest): Promise<string> {
+    return this.readContent(await this.post(this.buildPayload(req, false)));
+  }
+
+  /**
+   * Server-sent chat completions. Retries only cover the initial response
+   * status: once the body starts flowing a failure is surfaced to the caller,
+   * because deltas have already been handed out.
+   */
+  async stream(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
+    const res = await this.post(this.buildPayload(req, true));
+    const body = res.body;
+    if (!body) throw new ProviderError('openrouter', 'streaming response had no body', res.status);
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    let done = false;
+
+    const consumeLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':')) return; // keep-alive comment
+      if (!trimmed.startsWith('data:')) return;
+      const data = trimmed.slice(5).trim();
+      if (data === '[DONE]') {
+        done = true;
+        return;
+      }
+      let chunk: StreamChunk;
+      try {
+        chunk = JSON.parse(data) as StreamChunk;
+      } catch {
+        return;
+      }
+      const delta = chunk.choices?.[0]?.delta?.content;
+      if (typeof delta !== 'string' || !delta) return;
+      text += delta;
+      onDelta(delta);
+    };
+
+    for (;;) {
+      const { value, done: finished } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: true });
+        let nl = buffer.indexOf('\n');
+        while (nl >= 0) {
+          consumeLine(buffer.slice(0, nl));
+          buffer = buffer.slice(nl + 1);
+          nl = buffer.indexOf('\n');
+        }
+      }
+      if (finished) break;
+      if (done) {
+        // The server may hold the connection open after [DONE]; stop reading.
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
+    if (buffer) consumeLine(buffer);
+    return text;
+  }
+
+  /** POST with retries, returning the successful response. */
+  private async post(payload: string): Promise<Response> {
     let lastError: ProviderError | undefined;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -80,7 +158,7 @@ export class OpenRouterProvider implements LLMProvider {
         continue;
       }
 
-      if (res.ok) return this.readContent(res);
+      if (res.ok) return res;
 
       const detail = await safeText(res);
       const err = new ProviderError('openrouter', `HTTP ${res.status}`, res.status, detail);

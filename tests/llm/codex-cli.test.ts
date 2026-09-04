@@ -22,7 +22,11 @@ function fakeRun(opts: { output?: string; result?: Partial<RunResult> } = {}) {
     calls.push({ cmd, args, opts: runOpts });
     const out = argValue(args, '-o');
     if (opts.output !== undefined && out) fs.writeFileSync(out, opts.output);
-    return { stdout: '', stderr: '', code: 0, timedOut: false, ...opts.result };
+    const res = { stdout: '', stderr: '', code: 0, timedOut: false, ...opts.result };
+    if (runOpts.onStdout && res.stdout) {
+      for (let i = 0; i < res.stdout.length; i += 11) runOpts.onStdout(res.stdout.slice(i, i + 11));
+    }
+    return res;
   };
   return { calls, run };
 }
@@ -151,5 +155,57 @@ describe('CodexCliProvider', () => {
     ]);
     expect(outs).toEqual(['ok', 'ok']);
     expect(maxActive).toBe(1);
+  });
+});
+
+describe('CodexCliProvider.stream', () => {
+  it('forwards completed agent messages and still returns the output file', async () => {
+    const ndjson = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({ type: 'item.started', item: { id: 'i0', type: 'command_execution' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'the answer' } }),
+      JSON.stringify({ type: 'turn.completed' }),
+    ].join('\n') + '\n';
+    const f = fakeRun({ output: 'the answer\n', result: { stdout: ndjson } });
+    const p = new CodexCliProvider({ run: f.run });
+    const deltas: string[] = [];
+    const out = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
+
+    expect(deltas).toEqual(['the answer']);
+    expect(out).toBe('the answer');
+    expect(f.calls[0]!.args).toContain('--json');
+  });
+
+  it('emits the whole answer once when the NDJSON carries no agent message', async () => {
+    const f = fakeRun({ output: 'fallback answer', result: { stdout: JSON.stringify({ type: 'turn.completed' }) } });
+    const p = new CodexCliProvider({ run: f.run });
+    const deltas: string[] = [];
+    await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
+    expect(deltas).toEqual(['fallback answer']);
+  });
+
+  it('does not pass --json for a plain complete()', async () => {
+    const f = fakeRun({ output: 'x' });
+    const p = new CodexCliProvider({ run: f.run });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.args).not.toContain('--json');
+  });
+});
+
+describe('CodexCliProvider reasoning effort', () => {
+  it('passes model_reasoning_effort as a quoted TOML string', async () => {
+    const f = fakeRun({ output: 'x' });
+    const p = new CodexCliProvider({ run: f.run, reasoningEffort: 'medium' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.args).toContain('-c');
+    expect(f.calls[0]!.args).toContain('model_reasoning_effort="medium"');
+  });
+
+  it('omits the config override when blank', async () => {
+    const f = fakeRun({ output: 'x' });
+    const p = new CodexCliProvider({ run: f.run, reasoningEffort: '' });
+    await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    expect(f.calls[0]!.args.some((a) => a.startsWith('model_reasoning_effort'))).toBe(false);
   });
 });

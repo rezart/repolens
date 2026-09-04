@@ -123,14 +123,14 @@ function handleIssueComment(deps: AppDeps, p: IssueCommentEvent): WebhookOutcome
       .join('\n\n')
       .slice(0, 30000);
     const answer = await answerQuestion({
-      llm: deps.llm,
+      llm: deps.chatLlm,
       retrieve: deps.retrieve,
       repoIds: [repoId],
       messages: [{ role: 'user', content: question }],
       extraContext,
     });
     const sources = answer.sources.map((s) => `- \`${s.filepath}:${s.linestart}-${s.lineend}\``).join('\n');
-    const text = `${answer.message}\n\n${sources ? `<details><summary>Sources</summary>\n\n${sources}\n\n</details>\n\n` : ''}<sub>RepoLens (${deps.llm.name}/${deps.llm.model})</sub>`;
+    const text = `${answer.message}\n\n${sources ? `<details><summary>Sources</summary>\n\n${sources}\n\n</details>\n\n` : ''}<sub>RepoLens (${deps.chatLlm.name}/${deps.chatLlm.model})</sub>`;
     const posted = await deps.github.createIssueComment(repo.owner, repo.name, number, text);
     return { commentUrl: posted.htmlUrl };
   });

@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { openDb, type Db } from '../../src/db.js';
 import type { CompleteRequest, LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrievedChunk } from '../../src/search/types.js';
-import type { PullRequest, CreateReviewInput, ExistingReviewComment } from '../../src/review/github.js';
+import type {
+  PullRequest,
+  CreateReviewInput,
+  ExistingReviewComment,
+  CommitStatusInput,
+} from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import {
   reviewPullRequest,
@@ -10,6 +15,7 @@ import {
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
+  statusForFindings,
   type ReviewDeps,
   type Finding,
 } from '../../src/review/reviewer.js';
@@ -105,17 +111,34 @@ interface FakeGithubOptions {
   createReviewError?: () => Error | null;
   /** Make listReviewComments reject. */
   listError?: Error;
+  /** Make getPullDiff reject (stands in for any failure inside the review). */
+  diffError?: Error;
+  /** Make createCommitStatus reject. */
+  statusError?: Error;
+}
+
+interface StatusCall {
+  owner: string;
+  repo: string;
+  sha: string;
+  input: CommitStatusInput;
 }
 
 function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions = {}) {
   const reviews: Array<{ owner: string; repo: string; number: number; input: CreateReviewInput }> = [];
   const listCalls: Array<{ owner: string; repo: string; number: number }> = [];
+  const statuses: StatusCall[] = [];
   const github: ReviewDeps['github'] = {
     async getPull() {
       return pr;
     },
     async getPullDiff() {
+      if (opts.diffError) throw opts.diffError;
       return diff;
+    },
+    async createCommitStatus(owner: string, repo: string, sha: string, input: CommitStatusInput) {
+      statuses.push({ owner, repo, sha, input });
+      if (opts.statusError) throw opts.statusError;
     },
     async listReviewComments(owner: string, repo: string, number: number) {
       listCalls.push({ owner, repo, number });
@@ -129,7 +152,7 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
       return { id: 7, htmlUrl: 'https://github.com/o/r/pull/42#pullrequestreview-7' };
     },
   };
-  return { reviews, listCalls, github };
+  return { reviews, listCalls, statuses, github };
 }
 
 const retrieveOne: RetrieveFn = async () => [CHUNK];
@@ -466,6 +489,177 @@ describe('reviewPullRequest', () => {
 
   it('throws for an unknown repo', async () => {
     await expect(reviewPullRequest(makeDeps(db), { repoId: 'github:nope/nope', prNumber: 1 })).rejects.toThrow(/Unknown repo/);
+  });
+});
+
+describe('statusForFindings', () => {
+  const critical: Finding = { path: 'a.ts', line: 1, severity: 'critical', title: 'Boom', body: 'b' };
+  const warning: Finding = { path: 'a.ts', line: 2, severity: 'warning', title: 'Hmm', body: 'b' };
+  const nit: Finding = { path: 'a.ts', line: 3, severity: 'nit', title: 'Tiny', body: 'b' };
+
+  it('fails on criticals in the default mode', () => {
+    expect(statusForFindings([critical, warning, warning, nit], 'critical')).toEqual({
+      state: 'failure',
+      description: '1 critical, 2 warnings, 1 nit',
+    });
+    expect(statusForFindings([warning, nit], 'critical')).toEqual({ state: 'success', description: '1 warning, 1 nit' });
+    expect(statusForFindings([], 'critical')).toEqual({ state: 'success', description: 'No blocking findings' });
+  });
+
+  it('fails on warnings too when failOn is warning', () => {
+    expect(statusForFindings([warning], 'warning')).toEqual({ state: 'failure', description: '1 warning' });
+    expect(statusForFindings([critical], 'warning')).toEqual({ state: 'failure', description: '1 critical' });
+    expect(statusForFindings([nit], 'warning')).toEqual({ state: 'success', description: '1 nit' });
+  });
+
+  it('never fails when failOn is never', () => {
+    expect(statusForFindings([critical, warning], 'never')).toEqual({
+      state: 'success',
+      description: '1 critical, 1 warning',
+    });
+    expect(statusForFindings([], 'never')).toEqual({ state: 'success', description: 'No blocking findings' });
+  });
+
+  it('defaults to critical', () => {
+    expect(statusForFindings([critical]).state).toBe('failure');
+    expect(statusForFindings([warning]).state).toBe('success');
+  });
+});
+
+describe('reviewPullRequest commit statuses', () => {
+  let db: Db;
+  beforeEach(() => {
+    db = openDb(':memory:');
+    db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+  });
+  afterEach(() => db.close());
+
+  const CONTEXT = 'repolens/review';
+  const criticalFinding = JSON.stringify({
+    findings: [{ line: 4, severity: 'critical', title: 'Assignment', body: 'Use `===`.' }],
+  });
+  const warningFinding = JSON.stringify({
+    findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }],
+  });
+
+  function deps(gh: ReturnType<typeof fakeGithub>, llm: ReturnType<typeof fakeLlm>, overrides: Partial<ReviewDeps> = {}): ReviewDeps {
+    return {
+      db,
+      llm: llm.provider,
+      retrieve: retrieveOne,
+      github: gh.github,
+      statusContext: CONTEXT,
+      ...overrides,
+    };
+  }
+
+  it('posts pending then success for a clean review', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub();
+    const res = await reviewPullRequest(deps(gh, llm), { repoId: REPO_ID, prNumber: 42 });
+
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
+    expect(gh.statuses[0]).toEqual({
+      owner: 'o',
+      repo: 'r',
+      sha: 'head-sha-1',
+      input: {
+        state: 'pending',
+        context: CONTEXT,
+        description: 'RepoLens review in progress',
+        targetUrl: PR.htmlUrl,
+      },
+    });
+    expect(gh.statuses[1]!.input).toEqual({
+      state: 'success',
+      context: CONTEXT,
+      description: 'No blocking findings',
+      targetUrl: 'https://github.com/o/r/pull/42#pullrequestreview-7',
+    });
+    expect(res.status).toEqual({ state: 'success', description: 'No blocking findings' });
+    expect(res.warnings).toEqual([]);
+  });
+
+  it('fails the check when a critical finding is present', async () => {
+    const llm = fakeLlm({ file: criticalFinding });
+    const gh = fakeGithub();
+    const res = await reviewPullRequest(deps(gh, llm), { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'failure']);
+    expect(gh.statuses[1]!.input.description).toBe('1 critical');
+    expect(res.status).toEqual({ state: 'failure', description: '1 critical' });
+  });
+
+  it('fails on a warning only when failOn is warning', async () => {
+    const clean = fakeGithub();
+    await reviewPullRequest(deps(clean, fakeLlm({ file: warningFinding })), { repoId: REPO_ID, prNumber: 42 });
+    expect(clean.statuses[1]!.input.state).toBe('success');
+
+    const strict = fakeGithub();
+    const res = await reviewPullRequest(
+      deps(strict, fakeLlm({ file: warningFinding }), { failOn: 'warning' }),
+      { repoId: REPO_ID, prNumber: 42, force: true },
+    );
+    expect(strict.statuses[1]!.input).toMatchObject({ state: 'failure', description: '1 warning' });
+    expect(res.status!.state).toBe('failure');
+  });
+
+  it('always succeeds when failOn is never', async () => {
+    const llm = fakeLlm({ file: criticalFinding });
+    const gh = fakeGithub();
+    const res = await reviewPullRequest(deps(gh, llm, { failOn: 'never' }), { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
+    expect(res.status).toEqual({ state: 'success', description: '1 critical' });
+  });
+
+  it('reports a single final status for a cached, already posted review', async () => {
+    const llm = fakeLlm({ file: criticalFinding });
+    const gh = fakeGithub();
+    const d = deps(gh, llm);
+    await reviewPullRequest(d, { repoId: REPO_ID, prNumber: 42 });
+    gh.statuses.length = 0;
+
+    const second = await reviewPullRequest(d, { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.statuses).toHaveLength(1);
+    expect(gh.statuses[0]!.input).toMatchObject({ state: 'failure', description: '1 critical', targetUrl: PR.htmlUrl });
+    expect(second.status).toEqual({ state: 'failure', description: '1 critical' });
+  });
+
+  it('sets an error status and rethrows when the review blows up', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, PR, { diffError: new Error('GitHub 500 GET diff') });
+    await expect(reviewPullRequest(deps(gh, llm), { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('GitHub 500 GET diff');
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.statuses[1]!.input.description).toBe('RepoLens review failed: GitHub 500 GET diff');
+  });
+
+  it('completes the review with a warning when the status endpoint fails', async () => {
+    const llm = fakeLlm({ file: criticalFinding });
+    const gh = fakeGithub(DIFF, PR, { statusError: new Error('GitHub 403 POST statuses') });
+    const res = await reviewPullRequest(deps(gh, llm), { repoId: REPO_ID, prNumber: 42 });
+
+    expect(res.posted).toBe(true);
+    expect(gh.reviews).toHaveLength(1);
+    // One warning for the pending call, one for the final call.
+    const statusWarnings = res.warnings.filter((w) => w.startsWith('posting commit status failed:'));
+    expect(statusWarnings).toHaveLength(2);
+    expect(statusWarnings[0]).toContain('GitHub 403 POST statuses');
+    expect(res.status).toEqual({ state: 'failure', description: '1 critical' });
+  });
+
+  it('reports nothing when the status context is blank', async () => {
+    const llm = fakeLlm({ file: criticalFinding });
+    const gh = fakeGithub();
+    const res = await reviewPullRequest(deps(gh, llm, { statusContext: '' }), { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.statuses).toEqual([]);
+    expect(res.status).toBeUndefined();
+  });
+
+  it('falls back to the dashboard url when the PR has no html url', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, { ...PR, htmlUrl: '' }, { createReviewError: () => new Error('nope') });
+    await reviewPullRequest(deps(gh, llm, { publicUrl: 'https://repolens.example/' }), { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.statuses[0]!.input.targetUrl).toBe(`https://repolens.example/#/reviews/${REPO_ID}`);
   });
 });
 

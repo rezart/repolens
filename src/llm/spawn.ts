@@ -5,6 +5,11 @@ export interface RunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  /**
+   * Called with each stdout chunk as it arrives, for streaming callers.
+   * stdout is still buffered into the result either way.
+   */
+  onStdout?: (chunk: string) => void;
 }
 
 export interface RunResult {
@@ -32,7 +37,17 @@ export const runProcess: RunProcess = (cmd, args, opts = {}) =>
           child.kill('SIGKILL');
         }, opts.timeoutMs)
       : undefined;
-    child.stdout.setEncoding('utf8').on('data', (d) => (stdout += d));
+    child.stdout.setEncoding('utf8').on('data', (d: string) => {
+      stdout += d;
+      // A throwing consumer must not take down the whole run.
+      if (opts.onStdout) {
+        try {
+          opts.onStdout(d);
+        } catch {
+          // ignore
+        }
+      }
+    });
     child.stderr.setEncoding('utf8').on('data', (d) => (stderr += d));
     child.on('error', (err) => {
       if (timer) clearTimeout(timer);
@@ -49,6 +64,32 @@ export const runProcess: RunProcess = (cmd, args, opts = {}) =>
     if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
     else child.stdin.end();
   });
+
+/**
+ * Reassemble a chunked byte stream into whole lines. A chunk boundary can fall
+ * anywhere, so the trailing partial line is held back until it is completed.
+ * `flush()` releases whatever is left when the stream ends.
+ */
+export function lineSplitter(onLine: (line: string) => void): { push: (chunk: string) => void; flush: () => void } {
+  let buffer = '';
+  return {
+    push(chunk: string) {
+      buffer += chunk;
+      let nl = buffer.indexOf('\n');
+      while (nl >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (line.trim()) onLine(line);
+        nl = buffer.indexOf('\n');
+      }
+    },
+    flush() {
+      const rest = buffer;
+      buffer = '';
+      if (rest.trim()) onLine(rest);
+    },
+  };
+}
 
 /** Simple counting semaphore used to cap concurrent CLI processes. */
 export class Semaphore {

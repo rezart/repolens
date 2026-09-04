@@ -2,7 +2,7 @@ import type { Db, RepoRow } from '../db.js';
 import type { LLMProvider } from '../llm/types.js';
 import { extractJson } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
-import type { GitHubClient, PullRequest } from './github.js';
+import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
@@ -13,6 +13,13 @@ import {
 
 export type Severity = 'critical' | 'warning' | 'nit';
 export type Verdict = 'approve' | 'comment' | 'request_changes';
+/** Which findings make the commit status fail. */
+export type FailOn = 'critical' | 'warning' | 'never';
+
+export interface ReviewStatus {
+  state: CommitStatusState;
+  description: string;
+}
 
 export interface Finding {
   path: string;
@@ -33,18 +40,26 @@ export interface ReviewResult {
   reviewUrl?: string;
   skippedFiles: string[];
   warnings: string[];
+  /** The commit status reported on the PR head, when statuses are enabled. */
+  status?: ReviewStatus;
 }
 
 export interface ReviewDeps {
   db: Db;
   llm: LLMProvider;
   retrieve: RetrieveFn;
-  github: Pick<GitHubClient, 'getPull' | 'getPullDiff' | 'createReview' | 'listReviewComments'>;
+  github: Pick<GitHubClient, 'getPull' | 'getPullDiff' | 'createReview' | 'listReviewComments' | 'createCommitStatus'>;
   /** Injected from search/tokenize.ts in production. */
   identifiers?: (text: string) => string[];
   /** Injected from search/retrieve.ts in production. */
   formatContext?: (chunks: RetrievedChunk[]) => string;
   maxFiles?: number;
+  /** Commit status context reported on the PR head; blank/undefined disables statuses. */
+  statusContext?: string;
+  /** Which findings turn the commit status red (default `critical`). */
+  failOn?: FailOn;
+  /** Base URL of this RepoLens install, used as a status target when the PR has no URL. */
+  publicUrl?: string;
   log?: (msg: string) => void;
 }
 
@@ -188,6 +203,29 @@ function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Findi
   return out;
 }
 
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * Map findings onto the commit status RepoLens reports on the PR head.
+ * `failOn: 'never'` keeps the check informational (always green).
+ */
+export function statusForFindings(findings: Finding[], failOn: FailOn = 'critical'): ReviewStatus {
+  const counts = { critical: 0, warning: 0, nit: 0 };
+  for (const f of findings) counts[f.severity]++;
+  const parts: string[] = [];
+  if (counts.critical) parts.push(`${counts.critical} critical`);
+  if (counts.warning) parts.push(plural(counts.warning, 'warning'));
+  if (counts.nit) parts.push(plural(counts.nit, 'nit'));
+  const blocking =
+    failOn === 'critical' ? counts.critical > 0 : failOn === 'warning' ? counts.critical + counts.warning > 0 : false;
+  return {
+    state: blocking ? 'failure' : 'success',
+    description: parts.length ? parts.join(', ') : 'No blocking findings',
+  };
+}
+
 function severityRank(s: Severity): number {
   return s === 'critical' ? 0 : s === 'warning' ? 1 : 2;
 }
@@ -281,177 +319,225 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const formatContext = deps.formatContext ?? defaultFormatContext;
   const maxFiles = deps.maxFiles ?? 40;
   const post = opts.post ?? true;
+  const failOn = deps.failOn ?? 'critical';
+  const statusContext = (deps.statusContext ?? '').trim();
 
-  const repo = db.getRepo(opts.repoId);
-  if (!repo) throw new Error(`Unknown repo: ${opts.repoId}`);
+  const found = db.getRepo(opts.repoId);
+  if (!found) throw new Error(`Unknown repo: ${opts.repoId}`);
+  // Aliased so the type stays narrowed inside the nested runReview().
+  const repo: RepoRow = found;
 
   const pr = await github.getPull(repo.owner, repo.name, opts.prNumber);
   const postCtx: PostContext = { db, github, llm, repo, pr, log };
 
-  if (!opts.force) {
-    const cached = db.findReview(opts.repoId, opts.prNumber, pr.headSha);
-    if (cached) {
-      log(`review: reusing review #${cached.id} for ${opts.repoId}#${opts.prNumber} @ ${pr.headSha}`);
-      let findings: Finding[] = [];
-      try {
-        const parsedFindings = JSON.parse(cached.comments_json) as unknown;
-        if (Array.isArray(parsedFindings)) findings = parsedFindings as Finding[];
-      } catch {
-        findings = [];
-      }
-      const cachedResult: ReviewResult = {
-        reviewId: cached.id,
-        prNumber: cached.pr_number,
-        headSha: cached.head_sha,
-        summary: cached.summary ?? '',
-        verdict: toVerdict(cached.verdict) ?? 'comment',
-        findings,
-        posted: cached.posted === 1,
-        skippedFiles: [],
-        warnings: [],
-      };
-      if (post && cached.posted === 0) {
-        // A previous run stored the review but failed (or was asked not) to post it.
-        log(`review: cached review #${cached.id} was never posted; posting it now`);
-        await postReview(postCtx, cachedResult);
-      }
-      return cachedResult;
-    }
-  }
-
-  const diffText = await github.getPullDiff(repo.owner, repo.name, opts.prNumber);
-  const parsed = parseUnifiedDiff(diffText);
-
-  const skippedFiles: string[] = [];
-  const reviewable: DiffFile[] = [];
-  for (const f of parsed) {
-    const path = f.newPath;
-    if (f.binary || f.status === 'deleted' || !path || !isReviewablePath(path)) {
-      const label = path ?? f.oldPath ?? '(unknown)';
-      skippedFiles.push(label);
-      continue;
-    }
-    if (changedNewLines(f).size === 0) {
-      skippedFiles.push(path);
-      continue;
-    }
-    reviewable.push(f);
-  }
-
-  const files = reviewable.slice(0, maxFiles);
-  for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
-
-  const warnings: string[] = [];
-
-  const perFile = await mapPool(files, llm.concurrency, async (file) => {
-    const path = file.newPath!;
-    const allowed = changedNewLines(file);
-    const addedText = file.hunks
-      .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
-      .join('\n');
-    const query = [path, ...identifiers(addedText)].join(' ');
-    let context = '';
+  // Commit statuses need a GitHub repository and a head commit to attach to.
+  const statusEnabled = Boolean(statusContext) && opts.repoId.startsWith('github:') && Boolean(repo.owner && repo.name && pr.headSha);
+  const dashboardUrl = deps.publicUrl ? `${deps.publicUrl.replace(/\/+$/, '')}/#/reviews/${opts.repoId}` : undefined;
+  /** Reporting a status must never fail a review: failures become warnings. */
+  const setStatus = async (status: ReviewStatus, targetUrl: string | undefined, warnings: string[]): Promise<void> => {
+    if (!statusEnabled) return;
     try {
-      const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePath: path });
-      context = formatContext(chunks);
+      await github.createCommitStatus(repo.owner, repo.name, pr.headSha, {
+        state: status.state,
+        context: statusContext,
+        description: status.description,
+        targetUrl: targetUrl || dashboardUrl,
+      });
+      log(`review: commit status ${status.state} on ${pr.headSha} (${statusContext})`);
     } catch (err) {
-      warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
+      const msg = `posting commit status failed: ${errMessage(err)}`;
+      warnings.push(msg);
+      log(`review: ${msg}`);
     }
+  };
+
+  const cached = opts.force ? null : db.findReview(opts.repoId, opts.prNumber, pr.headSha);
+  const statusWarnings: string[] = [];
+  // A cached, already-posted review is not "in progress": go straight to its final state.
+  if (!cached || cached.posted !== 1) {
+    await setStatus({ state: 'pending', description: 'RepoLens review in progress' }, pr.htmlUrl, statusWarnings);
+  }
+
+  if (cached) {
+    log(`review: reusing review #${cached.id} for ${opts.repoId}#${opts.prNumber} @ ${pr.headSha}`);
+    let findings: Finding[] = [];
+    try {
+      const parsedFindings = JSON.parse(cached.comments_json) as unknown;
+      if (Array.isArray(parsedFindings)) findings = parsedFindings as Finding[];
+    } catch {
+      findings = [];
+    }
+    const cachedResult: ReviewResult = {
+      reviewId: cached.id,
+      prNumber: cached.pr_number,
+      headSha: cached.head_sha,
+      summary: cached.summary ?? '',
+      verdict: toVerdict(cached.verdict) ?? 'comment',
+      findings,
+      posted: cached.posted === 1,
+      skippedFiles: [],
+      warnings: statusWarnings,
+    };
+    if (post && cached.posted === 0) {
+      // A previous run stored the review but failed (or was asked not) to post it.
+      log(`review: cached review #${cached.id} was never posted; posting it now`);
+      await postReview(postCtx, cachedResult);
+    }
+    const cachedStatus = statusForFindings(cachedResult.findings, failOn);
+    await setStatus(cachedStatus, cachedResult.reviewUrl ?? pr.htmlUrl, cachedResult.warnings);
+    if (statusEnabled) cachedResult.status = cachedStatus;
+    return cachedResult;
+  }
+
+  let result: ReviewResult;
+  try {
+    result = await runReview();
+  } catch (err) {
+    // The check must not stay pending forever when the review itself blows up.
+    await setStatus({ state: 'error', description: `RepoLens review failed: ${errMessage(err)}` }, pr.htmlUrl, statusWarnings);
+    throw err;
+  }
+
+  const status = statusForFindings(result.findings, failOn);
+  await setStatus(status, result.reviewUrl ?? pr.htmlUrl, result.warnings);
+  if (statusEnabled) result.status = status;
+  return result;
+
+  async function runReview(): Promise<ReviewResult> {
+    const diffText = await github.getPullDiff(repo.owner, repo.name, opts.prNumber);
+    const parsed = parseUnifiedDiff(diffText);
+
+    const skippedFiles: string[] = [];
+    const reviewable: DiffFile[] = [];
+    for (const f of parsed) {
+      const path = f.newPath;
+      if (f.binary || f.status === 'deleted' || !path || !isReviewablePath(path)) {
+        const label = path ?? f.oldPath ?? '(unknown)';
+        skippedFiles.push(label);
+        continue;
+      }
+      if (changedNewLines(f).size === 0) {
+        skippedFiles.push(path);
+        continue;
+      }
+      reviewable.push(f);
+    }
+
+    const files = reviewable.slice(0, maxFiles);
+    for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
+
+    const warnings: string[] = [...statusWarnings];
+
+    const perFile = await mapPool(files, llm.concurrency, async (file) => {
+      const path = file.newPath!;
+      const allowed = changedNewLines(file);
+      const addedText = file.hunks
+        .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
+        .join('\n');
+      const query = [path, ...identifiers(addedText)].join(' ');
+      let context = '';
+      try {
+        const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePath: path });
+        context = formatContext(chunks);
+      } catch (err) {
+        warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
+      }
+      try {
+        const raw = await llm.complete({
+          system: FILE_REVIEW_SYSTEM_PROMPT,
+          messages: [
+            {
+              role: 'user',
+              content: buildFileReviewMessage({
+                prTitle: pr.title,
+                prBody: pr.body,
+                path,
+                status: file.status,
+                hunkText: hunkText(file),
+                context,
+                instructions: repo.instructions,
+              }),
+            },
+          ],
+          json: true,
+          maxTokens: 2000,
+        });
+        return parseFindings(raw, file, allowed);
+      } catch (err) {
+        const msg = `${path}: ${errMessage(err)}`;
+        warnings.push(msg);
+        log(`review: ${msg}`);
+        return [] as Finding[];
+      }
+    });
+
+    const findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    const hasCritical = findings.some((f) => f.severity === 'critical');
+
+    let summary = '';
+    let verdict: Verdict = 'comment';
     try {
       const raw = await llm.complete({
-        system: FILE_REVIEW_SYSTEM_PROMPT,
+        system: SUMMARY_SYSTEM_PROMPT,
         messages: [
           {
             role: 'user',
-            content: buildFileReviewMessage({
+            content: buildSummaryMessage({
               prTitle: pr.title,
               prBody: pr.body,
-              path,
-              status: file.status,
-              hunkText: hunkText(file),
-              context,
-              instructions: repo.instructions,
+              files: files.map((f) => ({ path: f.newPath!, status: f.status })),
+              findings,
             }),
           },
         ],
         json: true,
-        maxTokens: 2000,
+        maxTokens: 800,
       });
-      return parseFindings(raw, file, allowed);
+      const obj = extractJson(raw) as Record<string, unknown>;
+      summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
+      verdict = toVerdict(obj?.verdict) ?? 'comment';
+      if (!summary) throw new Error('summary missing from model output');
     } catch (err) {
-      const msg = `${path}: ${errMessage(err)}`;
+      const msg = `summary: ${errMessage(err)}`;
       warnings.push(msg);
       log(`review: ${msg}`);
-      return [] as Finding[];
+      summary = `Reviewed ${files.length} files, ${findings.length} findings.`;
+      verdict = 'comment';
     }
-  });
+    if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
 
-  const findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-  const hasCritical = findings.some((f) => f.severity === 'critical');
+    if (!repo.last_commit) {
+      warnings.push('Repository has not been indexed; review ran without codebase context.');
+    }
 
-  let summary = '';
-  let verdict: Verdict = 'comment';
-  try {
-    const raw = await llm.complete({
-      system: SUMMARY_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: buildSummaryMessage({
-            prTitle: pr.title,
-            prBody: pr.body,
-            files: files.map((f) => ({ path: f.newPath!, status: f.status })),
-            findings,
-          }),
-        },
-      ],
-      json: true,
-      maxTokens: 800,
+    const row = db.insertReview({
+      repo_id: opts.repoId,
+      pr_number: opts.prNumber,
+      head_sha: pr.headSha,
+      status: 'done',
+      summary,
+      verdict,
+      comments_json: JSON.stringify(findings),
+      posted: 0,
+      error: null,
     });
-    const obj = extractJson(raw) as Record<string, unknown>;
-    summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
-    verdict = toVerdict(obj?.verdict) ?? 'comment';
-    if (!summary) throw new Error('summary missing from model output');
-  } catch (err) {
-    const msg = `summary: ${errMessage(err)}`;
-    warnings.push(msg);
-    log(`review: ${msg}`);
-    summary = `Reviewed ${files.length} files, ${findings.length} findings.`;
-    verdict = 'comment';
+
+    const result: ReviewResult = {
+      reviewId: row.id,
+      prNumber: opts.prNumber,
+      headSha: pr.headSha,
+      summary,
+      verdict,
+      findings,
+      posted: false,
+      skippedFiles,
+      warnings,
+    };
+
+    if (post) await postReview(postCtx, result);
+
+    return result;
   }
-  if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
-
-  if (!repo.last_commit) {
-    warnings.push('Repository has not been indexed; review ran without codebase context.');
-  }
-
-  const row = db.insertReview({
-    repo_id: opts.repoId,
-    pr_number: opts.prNumber,
-    head_sha: pr.headSha,
-    status: 'done',
-    summary,
-    verdict,
-    comments_json: JSON.stringify(findings),
-    posted: 0,
-    error: null,
-  });
-
-  const result: ReviewResult = {
-    reviewId: row.id,
-    prNumber: opts.prNumber,
-    headSha: pr.headSha,
-    summary,
-    verdict,
-    findings,
-    posted: false,
-    skippedFiles,
-    warnings,
-  };
-
-  if (post) await postReview(postCtx, result);
-
-  return result;
 }
 
 function errMessage(err: unknown): string {

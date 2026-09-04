@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runProcess, Semaphore, childEnv } from '../../src/llm/spawn.js';
+import { runProcess, Semaphore, childEnv, lineSplitter } from '../../src/llm/spawn.js';
 
 describe('runProcess', () => {
   it('resolves when the child exits before reading a large stdin (EPIPE)', async () => {
@@ -7,6 +7,27 @@ describe('runProcess', () => {
     const res = await runProcess(process.execPath, ['-e', 'process.exit(1)'], { stdin: big });
     expect(res.code).toBe(1);
     expect(res.timedOut).toBe(false);
+  });
+
+  it('forwards stdout chunks to onStdout while still buffering them', async () => {
+    const chunks: string[] = [];
+    const res = await runProcess(
+      process.execPath,
+      ['-e', 'process.stdout.write("one\\n");setTimeout(()=>process.stdout.write("two\\n"),10)'],
+      { onStdout: (c) => chunks.push(c) },
+    );
+    expect(chunks.join('')).toBe('one\ntwo\n');
+    expect(res.stdout).toBe('one\ntwo\n');
+  });
+
+  it('survives a throwing onStdout consumer', async () => {
+    const res = await runProcess(process.execPath, ['-e', 'process.stdout.write("x")'], {
+      onStdout: () => {
+        throw new Error('consumer blew up');
+      },
+    });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe('x');
   });
 
   it('captures stdout and stderr', async () => {
@@ -84,5 +105,26 @@ describe('childEnv', () => {
   it('strips nested-session markers', () => {
     const env = childEnv({ PATH: '/bin', CLAUDECODE: '1', CLAUDE_CODE_X: '1', CLAUDE_PID: '2', CLAUDE_EFFORT: 'high' });
     expect(env).toEqual({ PATH: '/bin' });
+  });
+});
+
+describe('lineSplitter', () => {
+  it('reassembles lines split across chunk boundaries', () => {
+    const lines: string[] = [];
+    const s = lineSplitter((l) => lines.push(l));
+    s.push('{"a":1}\n{"b":');
+    expect(lines).toEqual(['{"a":1}']);
+    s.push('2}\n{"c":3}');
+    expect(lines).toEqual(['{"a":1}', '{"b":2}']);
+    s.flush();
+    expect(lines).toEqual(['{"a":1}', '{"b":2}', '{"c":3}']);
+  });
+
+  it('skips blank lines and flushes nothing when the buffer is empty', () => {
+    const lines: string[] = [];
+    const s = lineSplitter((l) => lines.push(l));
+    s.push('\n\n  \n');
+    s.flush();
+    expect(lines).toEqual([]);
   });
 });

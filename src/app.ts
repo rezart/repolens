@@ -23,7 +23,10 @@ import { listPullStatuses, reviewPulls } from './review/pulls.js';
 export interface AppDeps {
   config: Config;
   db: Db;
+  /** Backend used for pull request reviews. */
   llm: LLMProvider;
+  /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
+  chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
   retrieve: RetrieveFn;
   github: GitHubClient;
@@ -131,6 +134,9 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           github: deps.github,
           identifiers: identifiersFromCode,
           formatContext: (chunks) => formatContext(chunks, 16000),
+          statusContext: deps.config.review.statusContext,
+          failOn: deps.config.review.failOn,
+          publicUrl: deps.config.publicUrl,
           log: (m) => ctx.progress(m),
         },
         { repoId, prNumber, post: opts.post ?? true, force: opts.force },
@@ -167,7 +173,8 @@ export function createApp(deps: AppDeps): Hono {
     c.json({
       ok: true,
       version: VERSION,
-      llm: { provider: deps.llm.name, model: deps.llm.model },
+      llm: { provider: deps.llm.name, model: deps.llm.model, effort: config.llm.reasoningEffort || null },
+      chat: { provider: deps.chatLlm.name, model: deps.chatLlm.model },
       embeddings: deps.embeddings?.model ?? null,
     }),
   );
@@ -257,24 +264,34 @@ export function createApp(deps: AppDeps): Hono {
     const repoIds = body.data.repositories.map(normalizeRepoId);
     const missing = repoIds.filter((id) => !db.getRepo(id));
     if (missing.length) return c.json({ error: `Unknown repositories: ${missing.join(', ')}` }, 404);
-    const run = () =>
+    const run = (hooks: Pick<Parameters<typeof answerQuestion>[0], 'onDelta' | 'onSources'> = {}) =>
       answerQuestion({
-        llm: deps.llm,
+        llm: deps.chatLlm,
         retrieve: deps.retrieve,
         repoIds,
         messages: body.data.messages,
         limit: body.data.limit,
+        ...hooks,
       });
     if (body.data.stream) {
       return streamSSE(c, async (stream) => {
+        // Writes are queued rather than awaited inline: the provider callbacks
+        // are synchronous, and a delta must never be dropped or reordered.
+        let pending: Promise<void> = Promise.resolve();
+        const send = (event: string, data: unknown) => {
+          pending = pending.then(() => stream.writeSSE({ event, data: JSON.stringify(data) })).catch(() => {});
+        };
         try {
-          const result = await run();
-          await stream.writeSSE({ event: 'sources', data: JSON.stringify(result.sources) });
-          await stream.writeSSE({ event: 'message', data: JSON.stringify({ content: result.message }) });
-          await stream.writeSSE({ event: 'done', data: '{}' });
+          const result = await run({
+            onSources: (sources) => send('sources', sources),
+            onDelta: (text) => send('delta', { text }),
+          });
+          send('message', { content: result.message });
+          send('done', {});
         } catch (err) {
-          await stream.writeSSE({ event: 'error', data: JSON.stringify({ error: (err as Error).message }) });
+          send('error', { error: (err as Error).message });
         }
+        await pending;
       });
     }
     return c.json(await run());

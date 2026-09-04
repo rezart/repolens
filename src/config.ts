@@ -24,6 +24,15 @@ const envSchema = z.object({
   REVIEW_BOT_HANDLE: z.string().default('@repolens'),
   /** Seconds between GitHub polls for new commits and pull requests. 0 disables polling. */
   REPOLENS_POLL_INTERVAL: z.coerce.number().int().min(0).default(300),
+  /** Provider and model used for chat answers; blank = same as LLM_PROVIDER / LLM_MODEL. */
+  CHAT_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', '']).default(''),
+  CHAT_MODEL: z.string().default(''),
+  /** Reasoning effort for the review provider (codex: model_reasoning_effort; openrouter: reasoning.effort). Blank = provider default. */
+  LLM_REASONING_EFFORT: z.enum(['low', 'medium', 'high', '']).default(''),
+  /** Commit status context reported on reviewed PR heads; blank disables statuses. */
+  REVIEW_STATUS_CONTEXT: z.string().default('repolens/review'),
+  /** Which finding severity makes the status fail: critical | warning | never. */
+  REVIEW_FAIL_ON: z.enum(['critical', 'warning', 'never']).default('critical'),
 });
 
 export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli';
@@ -41,10 +50,15 @@ export interface Config {
     openrouterBaseUrl: string;
     claudeBin: string;
     codexBin: string;
+    reasoningEffort: 'low' | 'medium' | 'high' | '';
   };
   embedding: { baseUrl: string; apiKey: string; model: string } | null;
   github: { token: string; apiUrl: string; webhookSecret: string; botHandle: string };
   pollIntervalSeconds: number;
+  /** Provider/model for chat answers ('' = same as llm). */
+  chatProvider: LLMProviderName | '';
+  chatModel: string;
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never' };
 }
 
 export class ConfigError extends Error {}
@@ -74,11 +88,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       openrouterBaseUrl: e.OPENROUTER_BASE_URL,
       claudeBin: e.CLAUDE_BIN,
       codexBin: e.CODEX_BIN,
+      reasoningEffort: e.LLM_REASONING_EFFORT,
     },
     embedding: e.EMBEDDING_MODEL
       ? { baseUrl: e.EMBEDDING_BASE_URL, apiKey: e.EMBEDDING_API_KEY, model: e.EMBEDDING_MODEL }
       : null,
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
+    chatProvider: e.CHAT_PROVIDER,
+    chatModel: e.CHAT_MODEL,
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON },
     github: {
       token: e.GITHUB_TOKEN,
       apiUrl: e.GITHUB_API_URL,

@@ -39,6 +39,9 @@ function baseConfig(overrides: Partial<Config> = {}): Config {
     dataDir: './data',
     apiToken: '',
     pollIntervalSeconds: 0,
+    chatProvider: '',
+    chatModel: '',
+    review: { statusContext: 'repolens/review', failOn: 'critical' },
     port: 3000,
     publicUrl: '',
     llm: {
@@ -49,6 +52,7 @@ function baseConfig(overrides: Partial<Config> = {}): Config {
       openrouterBaseUrl: 'https://openrouter.ai/api/v1',
       claudeBin: 'claude',
       codexBin: 'codex',
+      reasoningEffort: '',
     },
     embedding: null,
     github: { token: '', apiUrl: 'https://api.github.com', webhookSecret: '', botHandle: '@repolens' },
