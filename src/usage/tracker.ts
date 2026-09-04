@@ -82,7 +82,9 @@ export class UsageTracker {
   }
 
   async report(days: number): Promise<UsageReport> {
-    const since = new Date(this.now() - days * DAY_MS).toISOString();
+    // Rows are grouped by UTC day, so the window opens at UTC midnight `days - 1`
+    // days ago: today plus the previous whole days, never a partial oldest day.
+    const since = new Date(startOfUtcDay(this.now()) - (days - 1) * DAY_MS).toISOString();
     const rows = this.db.usageByDay(since);
     // A missing price list is not an error the report can fail on: rows still
     // carry whatever costs the backends reported themselves.
@@ -112,13 +114,18 @@ function priceRow(row: UsageDayRow, list: PriceList | null): UsageReportRow {
     estimatedCostUsd,
     costUsd:
       estimatedCostUsd === null
-        ? // Nothing to add: only show a cost if some call reported one.
-          row.reported_cost_usd > 0
+        ? // Nothing to add: show the reported total (even a free model's 0) as long as
+          // at least one call in the row was priced by its backend.
+          row.calls > row.unpriced_calls
           ? row.reported_cost_usd
           : null
         : row.reported_cost_usd + estimatedCostUsd,
     priced: row.unpriced_calls === 0 || estimatedCostUsd !== null,
   };
+}
+
+function startOfUtcDay(ms: number): number {
+  return ms - (ms % DAY_MS);
 }
 
 /** Zero when every call reported its own cost, null when no list price resolves. */

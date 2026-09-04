@@ -113,7 +113,7 @@ integer 1 to 365, default 30):
 ```json
 {
   "days": 30,
-  "since": "2026-08-05T16:00:00.000Z",
+  "since": "2026-08-06T00:00:00.000Z",
   "pricing": { "fetchedAt": "2026-09-04T16:00:00.000Z", "error": null },
   "rows": [
     {
@@ -125,7 +125,9 @@ integer 1 to 365, default 30):
 }
 ```
 
-`priced` is false when some calls in the row could not be priced; `costUsd` then
+`since` is UTC midnight `days - 1` days ago, so the report covers today plus the
+previous whole UTC days and the oldest day section is never partial. `priced` is
+false when some calls in the row could not be priced; `costUsd` then
 covers only the calls that could. `pricing.error` carries the last fetch error
 when the list is stale or missing so the page can say why figures are missing.
 

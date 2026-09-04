@@ -233,6 +233,19 @@ describe('UsageTracker.report', () => {
     db.close();
   });
 
+  it('keeps a free reported call visible as $0 next to an unpriceable one', async () => {
+    const db = openDb(':memory:');
+    const tracker = new UsageTracker({ db, pricing: null });
+    const sink = tracker.sinkFor('chat');
+    sink({ provider: 'openrouter', model: 'free/model', inputTokens: 5, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 5, costUsd: 0 });
+    sink({ provider: 'openrouter', model: 'free/model', inputTokens: 5, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 5, costUsd: null });
+    const [row] = (await tracker.report(1)).rows;
+    // One call was priced (at zero) by its backend, so the row has a cost; the
+    // other could not be priced, so that cost is a floor.
+    expect(row).toMatchObject({ calls: 2, reportedCostUsd: 0, costUsd: 0, estimatedCostUsd: null, priced: false });
+    db.close();
+  });
+
   it('windows rows by the injected clock', async () => {
     const db = openDb(':memory:');
     const now = Date.parse('2026-03-10T12:00:00.000Z');
@@ -250,13 +263,13 @@ describe('UsageTracker.report', () => {
     db.raw.prepare('update llm_usage set ts=? where id=?').run('2026-03-09T00:00:00.000Z', recent.id);
 
     const report = await tracker.report(7);
-    expect(report.since).toBe(new Date(now - 7 * DAY).toISOString());
+    expect(report.since).toBe('2026-03-04T00:00:00.000Z');
     expect(report.rows.map((r) => r.model)).toEqual(['sonnet']);
     expect(report.rows[0]!.day).toBe('2026-03-09');
     db.close();
   });
 
-  it('covers exactly `days` days, not the whole calendar day the window starts in', async () => {
+  it('covers `days` whole UTC days ending today, so the oldest day is never partial', async () => {
     const db = openDb(':memory:');
     const now = Date.parse('2026-03-10T12:00:00.000Z');
     const tracker = new UsageTracker({ db, pricing: null, now: () => now });
@@ -267,9 +280,10 @@ describe('UsageTracker.report', () => {
     const ids = db.raw.prepare('select id, model from llm_usage order by id').all() as Array<{ id: number; model: string }>;
     const at = (model: string, ts: string) =>
       db.raw.prepare('update llm_usage set ts=? where id=?').run(ts, ids.find((r) => r.model === model)!.id);
-    // Both fall on 2026-03-03, the calendar day the 7-day window opens in.
-    at('inside', '2026-03-03T18:00:00.000Z');
-    at('outside', '2026-03-03T06:00:00.000Z');
+    // A 7-day window at 2026-03-10T12:00Z opens at 2026-03-04T00:00Z: the first
+    // moment of that day is in, the last moment of the day before is out.
+    at('inside', '2026-03-04T00:00:00.000Z');
+    at('outside', '2026-03-03T23:59:59.999Z');
 
     const report = await tracker.report(7);
     expect(report.rows.map((r) => r.model)).toEqual(['inside']);
