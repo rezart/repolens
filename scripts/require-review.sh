@@ -21,7 +21,7 @@ head=${info%% *}
 # The PR's own URL names the repository, so a merge by URL checks that repo, not the cwd's.
 repo=${info#* }; repo=${repo#https://github.com/}; repo=${repo%/pull/*}
 state=$(gh api "repos/$repo/commits/$head/status" --jq '[.statuses[] | select(.context=="repolens/review") | .state] | first // "missing"' 2>/dev/null) || state='unknown'
-[ "$state" = success ] || deny "repolens/review is '$state' on head ${head:0:8}; wait for RepoLens to review this commit (status success) before merging."
+[ "$state" = "success" ] || deny "repolens/review is '$state' on head ${head:0:8}; wait for RepoLens to review this commit (status success) before merging."
 
 # Pin the merge to the commit that was checked, so a push between check and merge fails instead of slipping through.
 case "$cmd" in *--match-head-commit*) exit 0 ;; esac
