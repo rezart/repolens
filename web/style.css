@@ -100,9 +100,18 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 .dot-ok { background: var(--ok); }
 .dot-error { background: var(--err); }
 
+/* A muted text link here read as a label, not a page; make it an obvious row. */
 .side-nav { display: flex; flex-direction: column; gap: 2px; margin-top: -8px; }
-.side-nav .btn { display: block; width: 100%; text-align: left; padding: 5px 8px; }
-.side-nav .btn.is-active { background: var(--accent-soft); color: var(--accent); }
+.side-nav .btn {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 7px 10px; font-weight: 600; color: var(--text);
+  background: var(--panel-2); border-color: var(--border);
+}
+.side-nav .btn:hover:not(:disabled) { border-color: var(--border-strong); background: var(--panel-2); }
+.side-nav .btn.is-active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.side-nav-icon { color: var(--accent); font-size: 13px; }
+.side-nav-label { flex: 1; }
+.side-nav-chevron { color: var(--muted); font-size: 15px; line-height: 1; }
 
 .side-section { display: flex; flex-direction: column; gap: 6px; }
 .side-head { display: flex; align-items: center; justify-content: space-between; }
