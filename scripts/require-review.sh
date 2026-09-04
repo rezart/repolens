@@ -14,9 +14,15 @@ deny() {
 
 # First non-flag token after "merge" is the PR (number, URL or branch); none means the current branch.
 pr=$(printf '%s' "$cmd" | sed -n 's/.*gh pr merge//p' | tr -s ' ' '\n' | grep -v '^-' | grep -m1 .)
-head=$(gh pr view ${pr:+"$pr"} --json headRefOid --jq .headRefOid 2>/dev/null) || head=''
+info=$(gh pr view ${pr:+"$pr"} --json headRefOid,url --jq '.headRefOid + " " + .url' 2>/dev/null) || info=''
+head=${info%% *}
 [ -n "$head" ] || deny "Could not resolve the pull request for '$cmd'; pass the PR number to gh pr merge."
 
-state=$(gh api "repos/{owner}/{repo}/commits/$head/status" --jq '[.statuses[] | select(.context=="repolens/review") | .state] | first // "missing"' 2>/dev/null) || state='unknown'
+# The PR's own URL names the repository, so a merge by URL checks that repo, not the cwd's.
+repo=${info#* }; repo=${repo#https://github.com/}; repo=${repo%/pull/*}
+state=$(gh api "repos/$repo/commits/$head/status" --jq '[.statuses[] | select(.context=="repolens/review") | .state] | first // "missing"' 2>/dev/null) || state='unknown'
 [ "$state" = success ] || deny "repolens/review is '$state' on head ${head:0:8}; wait for RepoLens to review this commit (status success) before merging."
-exit 0
+
+# Pin the merge to the commit that was checked, so a push between check and merge fails instead of slipping through.
+case "$cmd" in *--match-head-commit*) exit 0 ;; esac
+jq -n --arg command "$cmd --match-head-commit $head" '{hookSpecificOutput:{hookEventName:"PreToolUse",updatedInput:{command:$command}}}'
