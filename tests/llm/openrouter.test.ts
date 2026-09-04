@@ -212,13 +212,50 @@ describe('OpenRouterProvider.stream', () => {
     expect(sent.max_tokens).toBe(100);
   });
 
-  it('ignores keep-alive comments and unparsable frames', async () => {
-    const body = ': ping\n\n' + 'data: {not json}\n\n' + dataFrame('ok') + 'data: [DONE]\n\n';
+  it('ignores keep-alive comments and blank lines', async () => {
+    const body = ': ping\n\n' + '\n' + dataFrame('ok') + 'data: [DONE]\n\n';
     const f = fakeFetch([sseResponse([body])]);
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
     const deltas: string[] = [];
     expect(await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t))).toBe('ok');
     expect(deltas).toEqual(['ok']);
+  });
+
+  it('throws on a malformed data frame instead of truncating the answer', async () => {
+    const body = dataFrame('ok') + 'data: {not json}\n\n' + 'data: [DONE]\n\n';
+    const f = fakeFetch([sseResponse([body])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const err = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {}).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).message).toContain('malformed stream frame: {not json}');
+  });
+
+  it('bounds the malformed frame it reports to 200 characters', async () => {
+    const f = fakeFetch([sseResponse(['data: {' + 'x'.repeat(500) + '\n\n'])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    const err = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {}).then(
+      () => null,
+      (e: unknown) => e as ProviderError,
+    );
+    expect(err!.message.length).toBeLessThan(260);
+  });
+
+  it('throws when the body ends before [DONE]', async () => {
+    const f = fakeFetch([sseResponse([dataFrame('half an ans')])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await expect(p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).rejects.toThrow(
+      /stream ended before \[DONE\]/,
+    );
+  });
+
+  it('accepts a stream that ends after a finish_reason but without [DONE]', async () => {
+    const finish = 'data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\n\n';
+    const f = fakeFetch([sseResponse([dataFrame('all of it'), finish])]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    expect(await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {})).toBe('all of it');
   });
 
   it('retries a 429 before the stream starts', async () => {

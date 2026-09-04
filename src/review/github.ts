@@ -169,27 +169,40 @@ export class GitHubClient {
     const allow = input.comments.length > 0 ? [422] : [];
     const res = await this.request(path, { method: 'POST', body: payload, allow });
     if (res.status === 422) {
-      // A comment line was probably not part of the diff, or REQUEST_CHANGES was rejected
-      // because the token owns the PR. Post the body alone, as a plain COMMENT, with the
-      // inline findings inlined so nothing is lost.
-      const retryBody = [
-        input.body,
+      // Two likely causes: REQUEST_CHANGES was rejected because the token owns the PR,
+      // or a comment line was not part of the diff. Retry as a plain COMMENT with the
+      // inline comments intact first; only if that fails too are they folded into the
+      // body, because rendering them there loses their position in the diff.
+      const note =
         input.event === 'REQUEST_CHANGES'
           ? '_Verdict was **request_changes**; posted as a comment because the review could not be submitted as REQUEST_CHANGES._'
-          : null,
-        renderDroppedComments(input.comments),
-      ]
-        .filter((p): p is string => p !== null)
-        .join('\n\n');
+          : null;
+      const bodyWith = (extra: string | null): string =>
+        [input.body, note, extra].filter((p): p is string => p !== null).join('\n\n');
+      const failed = (reason: string): Error =>
+        new Error(`GitHub 422 POST ${path}: ${res.text.slice(0, 300)} — retry as a plain comment failed: ${reason}`);
+
       let retry: RawResponse;
       try {
         retry = await this.request(path, {
           method: 'POST',
-          body: { ...payload, event: 'COMMENT' as const, comments: [], body: retryBody },
+          body: { ...payload, event: 'COMMENT' as const, body: bodyWith(null) },
+          allow: [422],
         });
       } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        throw new Error(`GitHub 422 POST ${path}: ${res.text.slice(0, 300)} — retry as a plain comment failed: ${reason}`);
+        throw failed(errText(err));
+      }
+      if (retry.status === 422) {
+        // The inline comments themselves are the problem: drop them into the body.
+        const second = retry.text;
+        try {
+          retry = await this.request(path, {
+            method: 'POST',
+            body: { ...payload, event: 'COMMENT' as const, comments: [], body: bodyWith(renderDroppedComments(input.comments)) },
+          });
+        } catch (err) {
+          throw failed(`${second.slice(0, 300)} — retry without inline comments failed: ${errText(err)}`);
+        }
       }
       const created = JSON.parse(retry.text || 'null') as { id: number; html_url: string };
       return { id: created.id, htmlUrl: created.html_url };
@@ -242,6 +255,10 @@ interface PullApiPayload {
   user: { login: string } | null;
   head: { sha: string; ref: string } | null;
   base: { sha: string; ref: string } | null;
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 export function renderDroppedComments(comments: ReviewComment[]): string {

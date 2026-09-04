@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runProcess, Semaphore, childEnv, lineSplitter } from '../../src/llm/spawn.js';
+import { runProcess, Semaphore, sharedSemaphore, childEnv, lineSplitter } from '../../src/llm/spawn.js';
 
 describe('runProcess', () => {
   it('resolves when the child exits before reading a large stdin (EPIPE)', async () => {
@@ -20,14 +20,18 @@ describe('runProcess', () => {
     expect(res.stdout).toBe('one\ntwo\n');
   });
 
-  it('survives a throwing onStdout consumer', async () => {
-    const res = await runProcess(process.execPath, ['-e', 'process.stdout.write("x")'], {
-      onStdout: () => {
-        throw new Error('consumer blew up');
-      },
-    });
-    expect(res.code).toBe(0);
-    expect(res.stdout).toBe('x');
+  it('rejects with the first onStdout error instead of swallowing it', async () => {
+    let calls = 0;
+    await expect(
+      runProcess(process.execPath, ['-e', 'process.stdout.write("x");setTimeout(()=>process.stdout.write("y"),20)'], {
+        onStdout: () => {
+          calls++;
+          throw new Error('consumer blew up');
+        },
+      }),
+    ).rejects.toThrow('consumer blew up');
+    // The child is killed, so the consumer is not called again.
+    expect(calls).toBe(1);
   });
 
   it('captures stdout and stderr', async () => {
@@ -98,6 +102,13 @@ describe('Semaphore', () => {
     const sem = new Semaphore(1);
     await expect(sem.run(async () => { throw new Error('boom'); })).rejects.toThrow('boom');
     expect(await sem.run(async () => 'ok')).toBe('ok');
+  });
+});
+
+describe('sharedSemaphore', () => {
+  it('hands out one gate per key', () => {
+    expect(sharedSemaphore('cli:one')).toBe(sharedSemaphore('cli:one'));
+    expect(sharedSemaphore('cli:one')).not.toBe(sharedSemaphore('cli:two'));
   });
 });
 

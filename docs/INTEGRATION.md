@@ -72,7 +72,15 @@ EOF
 Notes:
 - With an active ruleset and no bypass actors, repository admins are blocked too. To let admins bypass, add `"bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]` (5 = admin role).
 - To also require a pull request (no direct pushes), add a second rule `{ "type": "pull_request", "parameters": { "required_approving_review_count": 0, "dismiss_stale_reviews_on_push": false, "require_code_owner_review": false, "require_last_push_approval": false, "required_review_thread_resolution": false } }`.
-- Classic branch protection works as well: `gh api -X PUT repos/$REPO/branches/main/protection` with `required_status_checks.contexts: ["repolens/review"]`. Rulesets are preferred.
+- Classic branch protection works as well, but it names the branch explicitly, so resolve the default branch first instead of assuming `main`:
+
+  ```bash
+  DEFAULT_BRANCH=$(gh repo view "$REPO" --json defaultBranchRef --jq .defaultBranchRef.name)
+  echo '{"required_status_checks":{"strict":false,"contexts":["repolens/review"]},"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}' \
+    | gh api -X PUT "repos/$REPO/branches/$DEFAULT_BRANCH/protection" --input -
+  ```
+
+  Rulesets are preferred: `~DEFAULT_BRANCH` above needs no lookup.
 
 Verify:
 

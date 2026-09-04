@@ -174,6 +174,46 @@ describe('ClaudeCliProvider', () => {
     ]);
     expect(maxActive).toBe(1);
   });
+
+  it('serialises two provider instances that drive the same binary', async () => {
+    let active = 0;
+    let maxActive = 0;
+    const run = async (): Promise<RunResult> => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active--;
+      return { stdout: okStdout, stderr: '', code: 0, timedOut: false };
+    };
+    // The review and chat roles each build their own provider; only one `claude`
+    // process may run at a time across both.
+    const review = new ClaudeCliProvider({ run, bin: '/opt/claude' });
+    const chat = new ClaudeCliProvider({ run, bin: '/opt/claude', model: 'haiku' });
+    await Promise.all([
+      review.complete({ messages: [{ role: 'user', content: 'a' }] }),
+      chat.complete({ messages: [{ role: 'user', content: 'b' }] }),
+    ]);
+    expect(maxActive).toBe(1);
+  });
+
+  it('does not serialise providers that drive different binaries', async () => {
+    let active = 0;
+    let maxActive = 0;
+    const run = async (): Promise<RunResult> => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active--;
+      return { stdout: okStdout, stderr: '', code: 0, timedOut: false };
+    };
+    const a = new ClaudeCliProvider({ run, bin: '/opt/claude-a' });
+    const b = new ClaudeCliProvider({ run, bin: '/opt/claude-b' });
+    await Promise.all([
+      a.complete({ messages: [{ role: 'user', content: 'a' }] }),
+      b.complete({ messages: [{ role: 'user', content: 'b' }] }),
+    ]);
+    expect(maxActive).toBe(2);
+  });
 });
 
 describe('ClaudeCliProvider.stream', () => {

@@ -136,11 +136,14 @@ async function apiStream(path, body, onEvent, onJson) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  // SSE frames are separated by a blank line; a chunk can split one anywhere.
+  // SSE frames are separated by a blank line; a chunk can split one anywhere, and
+  // line ends may be CRLF as well as LF.
+  const FRAME_SEP = /\r?\n\r?\n/;
   const flushFrame = (frame) => {
     let name = 'message';
     const dataLines = [];
-    for (const line of frame.split('\n')) {
+    for (const raw of frame.split('\n')) {
+      const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
       if (line.startsWith('event:')) name = line.slice(6).trim();
       else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
     }
@@ -153,11 +156,11 @@ async function apiStream(path, body, onEvent, onJson) {
   for (;;) {
     const { value, done } = await reader.read();
     if (value) buffer += decoder.decode(value, { stream: true });
-    let sep = buffer.indexOf('\n\n');
-    while (sep >= 0) {
-      flushFrame(buffer.slice(0, sep));
-      buffer = buffer.slice(sep + 2);
-      sep = buffer.indexOf('\n\n');
+    for (;;) {
+      const sep = FRAME_SEP.exec(buffer);
+      if (!sep) break;
+      flushFrame(buffer.slice(0, sep.index));
+      buffer = buffer.slice(sep.index + sep[0].length);
     }
     if (done) break;
   }

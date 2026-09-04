@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { openDb, type Db } from '../src/db.js';
 import { loadConfig } from '../src/config.js';
 import { JobQueue } from '../src/jobs.js';
-import { createApp, type AppDeps } from '../src/app.js';
+import { createApp, streamAnswer, type AppDeps } from '../src/app.js';
+import { buildDeps } from '../src/server.js';
 import type { LLMProvider, CompleteRequest } from '../src/llm/types.js';
 import type { GitHubClient } from '../src/review/github.js';
 
@@ -465,5 +466,83 @@ describe('API', () => {
       expect(prompt.messages.at(-1)?.content).toContain('why was this added?');
       expect(prompt.messages.at(-1)?.content).not.toContain('@repolens');
     });
+  });
+});
+
+describe('streamAnswer', () => {
+  /** A stream whose nth write rejects, as a disconnected client's would. */
+  function fakeStream(failOn: number) {
+    const written: string[] = [];
+    let n = 0;
+    return {
+      written,
+      attempts: () => n,
+      stream: {
+        async writeSSE(message: { event: string; data: string }) {
+          n++;
+          if (n === failOn) throw new Error('client went away');
+          written.push(message.event);
+        },
+      },
+    };
+  }
+
+  it('stops writing once a write fails', async () => {
+    const f = fakeStream(2);
+    await streamAnswer(f.stream, async (hooks) => {
+      hooks.onSources?.([]);
+      hooks.onDelta?.('a');
+      // Everything from here on must be dropped: the connection is gone.
+      for (const t of ['b', 'c', 'd']) hooks.onDelta?.(t);
+      await new Promise((r) => setTimeout(r, 0));
+      hooks.onDelta?.('e');
+      return { message: 'the whole answer', sources: [], query: 'q' };
+    });
+    expect(f.written).toEqual(['sources']);
+    expect(f.attempts()).toBe(2);
+  });
+
+  it('writes sources, deltas, message and done on a healthy stream', async () => {
+    const f = fakeStream(0);
+    await streamAnswer(f.stream, async (hooks) => {
+      hooks.onSources?.([]);
+      hooks.onDelta?.('a');
+      return { message: 'a', sources: [], query: 'q' };
+    });
+    expect(f.written).toEqual(['sources', 'delta', 'message', 'done']);
+  });
+
+  it('reports a failed answer as an error event', async () => {
+    const f = fakeStream(0);
+    await streamAnswer(f.stream, async () => {
+      throw new Error('model exploded');
+    });
+    expect(f.written).toEqual(['error']);
+  });
+});
+
+describe('buildDeps', () => {
+  // The effort is private on the provider; reading it is the only way to see it
+  // without spawning the CLI.
+  const effortOf = (p: LLMProvider): string | undefined => (p as unknown as { effort?: string }).effort;
+
+  it('always gives chat its own low-effort provider, even without CHAT_PROVIDER/CHAT_MODEL', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'claude-cli',
+      LLM_MODEL: 'sonnet',
+      LLM_REASONING_EFFORT: 'high',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.chatLlm).not.toBe(deps.llm);
+      expect(deps.chatLlm.name).toBe('claude-cli');
+      expect(deps.chatLlm.model).toBe('sonnet');
+      // Reviews keep the configured budget; chat must not inherit it.
+      expect(effortOf(deps.llm)).toBe('high');
+      expect(effortOf(deps.chatLlm)).toBe('low');
+    } finally {
+      deps.db.close();
+    }
   });
 });

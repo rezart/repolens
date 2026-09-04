@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runProcess, Semaphore, childEnv, lineSplitter } from './spawn.js';
-import type { RunProcess } from './spawn.js';
+import { runProcess, sharedSemaphore, childEnv, lineSplitter } from './spawn.js';
+import type { RunProcess, Semaphore } from './spawn.js';
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 
@@ -78,7 +78,8 @@ export class ClaudeCliProvider implements LLMProvider {
   private readonly cwdOption: string | undefined;
   private readonly effort: ReasoningEffort | undefined;
   private tempDir: string | undefined;
-  private readonly gate = new Semaphore(1);
+  /** Shared per binary: two providers on the same CLI still run one process at a time. */
+  private readonly gate: Semaphore;
 
   constructor(opts: CliProviderOptions = {}) {
     this.rawModel = opts.model || undefined;
@@ -88,6 +89,7 @@ export class ClaudeCliProvider implements LLMProvider {
     this.run = opts.run ?? runProcess;
     this.cwdOption = opts.cwd;
     this.effort = opts.reasoningEffort || undefined;
+    this.gate = sharedSemaphore(`${this.name}:${this.bin}`);
   }
 
   /** An empty scratch directory so the CLI has no project context to read. */

@@ -1,23 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runProcess, Semaphore, childEnv, lineSplitter } from './spawn.js';
-import type { RunProcess } from './spawn.js';
+import { runProcess, sharedSemaphore, childEnv } from './spawn.js';
+import type { RunProcess, Semaphore } from './spawn.js';
 import { flattenMessages, withJsonInstruction } from './claude-cli.js';
 import type { CliProviderOptions, ReasoningEffort } from './claude-cli.js';
 import { ProviderError } from './types.js';
 import type { CompleteRequest, LLMProvider, OnDelta } from './types.js';
-
-/**
- * One line of `codex exec --json`. Observed on a live run: an assistant turn
- * arrives as `{type:'item.completed',item:{type:'agent_message',text}}`.
- * Codex does not emit token-level deltas in this mode, so streaming degrades
- * to "emit each completed agent message as it lands".
- */
-interface CodexEvent {
-  type?: string;
-  item?: { id?: string; type?: string; text?: unknown; delta?: unknown };
-}
 
 /** Runs completions through the local `codex` CLI (uses the user's ChatGPT subscription). */
 export class CodexCliProvider implements LLMProvider {
@@ -32,7 +21,8 @@ export class CodexCliProvider implements LLMProvider {
   private readonly cwdOption: string | undefined;
   private readonly effort: ReasoningEffort | undefined;
   private tempDir: string | undefined;
-  private readonly gate = new Semaphore(1);
+  /** Shared per binary: two providers on the same CLI still run one process at a time. */
+  private readonly gate: Semaphore;
 
   constructor(opts: CliProviderOptions = {}) {
     this.rawModel = opts.model || undefined;
@@ -42,6 +32,7 @@ export class CodexCliProvider implements LLMProvider {
     this.run = opts.run ?? runProcess;
     this.cwdOption = opts.cwd;
     this.effort = opts.reasoningEffort || undefined;
+    this.gate = sharedSemaphore(`${this.name}:${this.bin}`);
   }
 
   /** Scratch directory used both as cwd and to hold the output file. */
@@ -58,6 +49,7 @@ export class CodexCliProvider implements LLMProvider {
     return this.gate.run(() => this.runOnce(req));
   }
 
+  /** Codex has no token-level output, so the whole answer arrives as one delta. */
   stream(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
     return this.gate.run(() => this.runOnce(req, onDelta));
   }
@@ -83,38 +75,10 @@ export class CodexCliProvider implements LLMProvider {
     if (this.rawModel) args.push('-m', this.rawModel);
     // `-c` values are TOML, so the effort level has to be a quoted string.
     if (this.effort) args.push('-c', `model_reasoning_effort="${this.effort}"`);
-    if (onDelta) args.push('--json');
     args.push('-');
 
     const task = flattenMessages(req.messages);
     const stdin = system ? `# System instructions\n${system}\n\n# Task\n${task}` : task;
-
-    // Codex emits whole assistant messages, not token deltas, so track what was
-    // already forwarded and top it up from the output file at the end.
-    let emitted = '';
-    const splitter = onDelta
-      ? lineSplitter((line) => {
-          let event: CodexEvent;
-          try {
-            event = JSON.parse(line) as CodexEvent;
-          } catch {
-            return;
-          }
-          if (event.item?.type !== 'agent_message') return;
-          // Prefer an incremental field if a future Codex build provides one.
-          const delta = typeof event.item.delta === 'string' ? event.item.delta : undefined;
-          if (delta) {
-            emitted += delta;
-            onDelta(delta);
-            return;
-          }
-          if (event.type !== 'item.completed') return;
-          const text = typeof event.item.text === 'string' ? event.item.text : '';
-          if (!text) return;
-          emitted += text;
-          onDelta(text);
-        })
-      : undefined;
 
     try {
       const res = await this.run(this.bin, args, {
@@ -122,9 +86,7 @@ export class CodexCliProvider implements LLMProvider {
         cwd,
         env: childEnv(),
         timeoutMs: this.timeoutMs,
-        onStdout: splitter ? (chunk) => splitter.push(chunk) : undefined,
       });
-      splitter?.flush();
       const detail = tail(`${res.stderr}\n${res.stdout}`.trim());
 
       if (res.timedOut) {
@@ -142,10 +104,10 @@ export class CodexCliProvider implements LLMProvider {
       }
       const trimmed = output.trim();
       if (!trimmed) throw new ProviderError('codex-cli', 'CLI output was empty', undefined, detail);
-      // The output file is authoritative. If the NDJSON gave us nothing to
-      // forward (unknown event shapes, older CLI), emit the answer in one go so
-      // streaming callers still receive it.
-      if (onDelta && !emitted) onDelta(trimmed);
+      // The output file is authoritative and Codex emits no token deltas, only whole
+      // (sometimes intermediate) assistant messages. Forwarding those would show text
+      // that is absent from the final answer, so streaming is a single delta at the end.
+      if (onDelta) onDelta(trimmed);
       return trimmed;
     } finally {
       try {

@@ -31,6 +31,7 @@ export const runProcess: RunProcess = (cmd, args, opts = {}) =>
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let callbackError: unknown;
     const timer = opts.timeoutMs
       ? setTimeout(() => {
           timedOut = true;
@@ -39,12 +40,14 @@ export const runProcess: RunProcess = (cmd, args, opts = {}) =>
       : undefined;
     child.stdout.setEncoding('utf8').on('data', (d: string) => {
       stdout += d;
-      // A throwing consumer must not take down the whole run.
-      if (opts.onStdout) {
+      // A throwing consumer means the caller cannot use the output: keep the first
+      // error, stop the child and surface it instead of silently continuing.
+      if (opts.onStdout && callbackError === undefined) {
         try {
           opts.onStdout(d);
-        } catch {
-          // ignore
+        } catch (err) {
+          callbackError = err ?? new Error('onStdout threw');
+          child.kill('SIGKILL');
         }
       }
     });
@@ -55,6 +58,10 @@ export const runProcess: RunProcess = (cmd, args, opts = {}) =>
     });
     child.on('close', (code) => {
       if (timer) clearTimeout(timer);
+      if (callbackError !== undefined) {
+        reject(callbackError);
+        return;
+      }
       resolve({ stdout, stderr, code, timedOut });
     });
     // A child that exits (or is SIGKILLed by the timeout) before draining a large
@@ -127,6 +134,22 @@ export class Semaphore {
       release();
     }
   }
+}
+
+const sharedGates = new Map<string, Semaphore>();
+
+/**
+ * Semaphore shared by every provider instance that drives the same CLI binary.
+ * Two providers on the same binary (reviews and chat, say) must still run one
+ * process at a time, so the gate cannot live on the instance.
+ */
+export function sharedSemaphore(key: string, limit = 1): Semaphore {
+  let gate = sharedGates.get(key);
+  if (!gate) {
+    gate = new Semaphore(limit);
+    sharedGates.set(key, gate);
+  }
+  return gate;
 }
 
 /**

@@ -35,6 +35,24 @@ describe('createProvider', () => {
     );
   });
 
+  // The effort is private on every provider; reading it is the only way to see
+  // what the factory picked without spawning a CLI.
+  const effortOf = (p: LLMProvider): string | undefined => (p as unknown as { effort?: string }).effort;
+
+  it('defaults the reasoning effort to LLM_REASONING_EFFORT', () => {
+    expect(effortOf(createProvider(loadConfig({ ...base, LLM_REASONING_EFFORT: 'high' })))).toBe('high');
+  });
+
+  it('lets an explicit effort override the configured one', () => {
+    const config = loadConfig({ ...base, LLM_REASONING_EFFORT: 'high' });
+    expect(effortOf(createProvider(config, { reasoningEffort: 'low' }))).toBe('low');
+  });
+
+  it('keeps a blank override meaning "leave the backend default alone"', () => {
+    const config = loadConfig({ ...base, LLM_REASONING_EFFORT: 'high' });
+    expect(effortOf(createProvider(config, { reasoningEffort: '' }))).toBeUndefined();
+  });
+
   it('rejects an openrouter override without a model', () => {
     const config = loadConfig({ ...base, OPENROUTER_API_KEY: 'k' });
     expect(() => createProvider(config, { provider: 'openrouter', model: '' })).toThrow(/model is required/i);

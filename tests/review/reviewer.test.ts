@@ -633,6 +633,39 @@ describe('reviewPullRequest commit statuses', () => {
     expect(gh.statuses[1]!.input.description).toBe('RepoLens review failed: GitHub 500 GET diff');
   });
 
+  it('sets an error status and rethrows when posting a cached review blows up', async () => {
+    const llm = fakeLlm({ file: criticalFinding });
+    const gh = fakeGithub();
+    const d = deps(gh, llm);
+    // Store a review that was never posted, so the next run takes the cached posting path.
+    await reviewPullRequest(d, { repoId: REPO_ID, prNumber: 42, post: false });
+    gh.statuses.length = 0;
+
+    // Anything that throws after the `pending` status must still report a terminal
+    // state, or a required check blocks the PR forever. The throwing provider stands
+    // in for any unexpected failure while posting the cached review.
+    const brokenLlm: LLMProvider = {
+      ...llm.provider,
+      get model(): string {
+        throw new Error('provider went away');
+      },
+    };
+    await expect(reviewPullRequest({ ...d, llm: brokenLlm }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow(
+      'provider went away',
+    );
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.statuses[1]!.input.description).toBe('RepoLens review failed: provider went away');
+  });
+
+  it('truncates a long error description to the 140 characters GitHub allows', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, PR, { diffError: new Error('x'.repeat(300)) });
+    await expect(reviewPullRequest(deps(gh, llm), { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow(/x{300}/);
+    const description = gh.statuses[1]!.input.description;
+    expect(description).toHaveLength(140);
+    expect(description.endsWith('…')).toBe(true);
+  });
+
   it('completes the review with a warning when the status endpoint fails', async () => {
     const llm = fakeLlm({ file: criticalFinding });
     const gh = fakeGithub(DIFF, PR, { statusError: new Error('GitHub 403 POST statuses') });

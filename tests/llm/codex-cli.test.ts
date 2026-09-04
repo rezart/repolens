@@ -159,37 +159,38 @@ describe('CodexCliProvider', () => {
 });
 
 describe('CodexCliProvider.stream', () => {
-  it('forwards completed agent messages and still returns the output file', async () => {
-    const ndjson = [
-      JSON.stringify({ type: 'thread.started', thread_id: 't' }),
-      JSON.stringify({ type: 'turn.started' }),
-      JSON.stringify({ type: 'item.started', item: { id: 'i0', type: 'command_execution' } }),
-      JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'the answer' } }),
-      JSON.stringify({ type: 'turn.completed' }),
-    ].join('\n') + '\n';
-    const f = fakeRun({ output: 'the answer\n', result: { stdout: ndjson } });
+  it('emits the final answer as a single delta', async () => {
+    const f = fakeRun({ output: 'the answer\n' });
     const p = new CodexCliProvider({ run: f.run });
     const deltas: string[] = [];
     const out = await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
 
     expect(deltas).toEqual(['the answer']);
     expect(out).toBe('the answer');
-    expect(f.calls[0]!.args).toContain('--json');
   });
 
-  it('emits the whole answer once when the NDJSON carries no agent message', async () => {
-    const f = fakeRun({ output: 'fallback answer', result: { stdout: JSON.stringify({ type: 'turn.completed' }) } });
+  it('never forwards intermediate agent messages from the NDJSON', async () => {
+    // Codex reports whole assistant turns, and the intermediate ones are absent
+    // from the final `-o` file: forwarding them would show text that is not part
+    // of the answer.
+    const ndjson = [
+      JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'let me look…' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'i2', type: 'agent_message', text: 'the answer' } }),
+    ].join('\n') + '\n';
+    const f = fakeRun({ output: 'the answer', result: { stdout: ndjson } });
     const p = new CodexCliProvider({ run: f.run });
     const deltas: string[] = [];
     await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, (t) => deltas.push(t));
-    expect(deltas).toEqual(['fallback answer']);
+    expect(deltas).toEqual(['the answer']);
   });
 
-  it('does not pass --json for a plain complete()', async () => {
+  it('never passes --json: the NDJSON stream is not consumed', async () => {
     const f = fakeRun({ output: 'x' });
     const p = new CodexCliProvider({ run: f.run });
     await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
+    await p.stream({ messages: [{ role: 'user', content: 'hi' }] }, () => {});
     expect(f.calls[0]!.args).not.toContain('--json');
+    expect(f.calls[1]!.args).not.toContain('--json');
   });
 });
 

@@ -28,7 +28,7 @@ interface ChatCompletionResponse {
 
 /** One `data:` frame of a `stream: true` chat completion. */
 interface StreamChunk {
-  choices?: Array<{ delta?: { content?: unknown } }>;
+  choices?: Array<{ delta?: { content?: unknown }; finish_reason?: unknown }>;
 }
 
 /** OpenRouter (OpenAI-compatible) chat completions. */
@@ -87,6 +87,7 @@ export class OpenRouterProvider implements LLMProvider {
     let buffer = '';
     let text = '';
     let done = false;
+    let finishReason = false;
 
     const consumeLine = (line: string) => {
       const trimmed = line.trim();
@@ -101,8 +102,11 @@ export class OpenRouterProvider implements LLMProvider {
       try {
         chunk = JSON.parse(data) as StreamChunk;
       } catch {
-        return;
+        // A frame we cannot parse may be the one carrying the answer: fail loudly
+        // rather than returning a silently truncated response.
+        throw new ProviderError('openrouter', `malformed stream frame: ${data.slice(0, 200)}`, res.status);
       }
+      if (chunk.choices?.[0]?.finish_reason) finishReason = true;
       const delta = chunk.choices?.[0]?.delta?.content;
       if (typeof delta !== 'string' || !delta) return;
       text += delta;
@@ -128,6 +132,11 @@ export class OpenRouterProvider implements LLMProvider {
       }
     }
     if (buffer) consumeLine(buffer);
+    // A body that ends without [DONE] (or a finish_reason) was cut short; the text
+    // gathered so far is an incomplete answer, not a successful one.
+    if (!done && !finishReason) {
+      throw new ProviderError('openrouter', 'stream ended before [DONE]', res.status, text.slice(0, 200));
+    }
     return text;
   }
 

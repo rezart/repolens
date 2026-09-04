@@ -18,7 +18,7 @@ export interface CreateProviderOptions {
   provider?: LLMProviderName;
   /** Use a different model than LLM_MODEL. */
   model?: string;
-  /** Thinking budget; blank/undefined leaves the backend default alone. */
+  /** Thinking budget; omitted means LLM_REASONING_EFFORT, `''` leaves the backend default alone. */
   reasoningEffort?: ReasoningEffort | '';
 }
 
@@ -30,7 +30,8 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
   const llm = config.llm;
   const provider = opts.provider ?? llm.provider;
   const model = opts.model ?? llm.model;
-  const reasoningEffort = opts.reasoningEffort ?? '';
+  // `??` so an explicit '' override still means "leave the backend default alone".
+  const reasoningEffort = opts.reasoningEffort ?? llm.reasoningEffort;
 
   switch (provider) {
     case 'openrouter':

@@ -13,6 +13,7 @@ import { JobQueue } from './jobs.js';
 import { parseRemote, repoIdFor, repoIdOf, RepoCheckout } from './indexer/git.js';
 import { indexRepo } from './indexer/indexer.js';
 import { answerQuestion } from './query/answer.js';
+import type { AnswerOptions, AnswerResult } from './query/answer.js';
 import { reviewPullRequest } from './review/reviewer.js';
 import { formatContext } from './search/retrieve.js';
 import { identifiersFromCode } from './search/tokenize.js';
@@ -147,6 +148,49 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
   );
 }
 
+/** The part of hono's SSE stream this module uses, so the pump is testable on its own. */
+export interface SSEWriter {
+  writeSSE(message: { event: string; data: string }): Promise<void>;
+}
+
+type AnswerHooks = Pick<AnswerOptions, 'onDelta' | 'onSources'>;
+
+/**
+ * Stream one answer as SSE events. Writes are queued rather than awaited inline:
+ * the provider callbacks are synchronous, and a delta must never be dropped or
+ * reordered. The first write failure (usually a disconnected client) is kept and
+ * stops every later write, so a dead connection is not written to for the rest of
+ * the generation.
+ */
+export async function streamAnswer(stream: SSEWriter, run: (hooks: AnswerHooks) => Promise<AnswerResult>): Promise<void> {
+  let pending: Promise<void> = Promise.resolve();
+  let writeFailed = false;
+  const send = (event: string, data: unknown) => {
+    if (writeFailed) return;
+    pending = pending
+      // Checked again here: events queued before the failure surfaced must not be written.
+      .then(() => (writeFailed ? undefined : stream.writeSSE({ event, data: JSON.stringify(data) })))
+      .catch(() => {
+        writeFailed = true;
+      });
+  };
+  try {
+    const result = await run({
+      onSources: (sources) => send('sources', sources),
+      onDelta: (text) => send('delta', { text }),
+    });
+    // Queued writes may still be in flight; a failure among them must be seen
+    // before the closing events are queued.
+    await pending;
+    send('message', { content: result.message });
+    send('done', {});
+  } catch (err) {
+    await pending;
+    send('error', { error: (err as Error).message });
+  }
+  await pending;
+}
+
 export function createApp(deps: AppDeps): Hono {
   const { config, db } = deps;
   const log = deps.log ?? (() => {});
@@ -264,7 +308,7 @@ export function createApp(deps: AppDeps): Hono {
     const repoIds = body.data.repositories.map(normalizeRepoId);
     const missing = repoIds.filter((id) => !db.getRepo(id));
     if (missing.length) return c.json({ error: `Unknown repositories: ${missing.join(', ')}` }, 404);
-    const run = (hooks: Pick<Parameters<typeof answerQuestion>[0], 'onDelta' | 'onSources'> = {}) =>
+    const run = (hooks: AnswerHooks = {}) =>
       answerQuestion({
         llm: deps.chatLlm,
         retrieve: deps.retrieve,
@@ -274,25 +318,7 @@ export function createApp(deps: AppDeps): Hono {
         ...hooks,
       });
     if (body.data.stream) {
-      return streamSSE(c, async (stream) => {
-        // Writes are queued rather than awaited inline: the provider callbacks
-        // are synchronous, and a delta must never be dropped or reordered.
-        let pending: Promise<void> = Promise.resolve();
-        const send = (event: string, data: unknown) => {
-          pending = pending.then(() => stream.writeSSE({ event, data: JSON.stringify(data) })).catch(() => {});
-        };
-        try {
-          const result = await run({
-            onSources: (sources) => send('sources', sources),
-            onDelta: (text) => send('delta', { text }),
-          });
-          send('message', { content: result.message });
-          send('done', {});
-        } catch (err) {
-          send('error', { error: (err as Error).message });
-        }
-        await pending;
-      });
+      return streamSSE(c, (stream) => streamAnswer(stream, run));
     }
     return c.json(await run());
   });

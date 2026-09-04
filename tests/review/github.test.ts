@@ -119,10 +119,35 @@ describe('GitHubClient.createReview', () => {
     });
   });
 
-  it('retries without inline comments when GitHub answers 422', async () => {
+  it('keeps the inline comments on the first 422 retry, only downgrading the event', async () => {
+    const { f, gh } = client([
+      jsonResponse({ message: 'Can not request changes on your own pull request' }, 422),
+      jsonResponse({ id: 100, html_url: 'https://x/100' }),
+    ]);
+    const comments = [
+      { path: 'src/a.ts', line: 12, body: 'boom' },
+      { path: 'src/b.ts', line: 3, body: 'bang' },
+    ];
+    const res = await gh.createReview('o', 'r', 1, { commitId: 'abc123', body: 'summary here', event: 'REQUEST_CHANGES', comments });
+    expect(res.id).toBe(100);
+    expect(f.calls).toHaveLength(2);
+    const retry = f.calls[1]!.body as { comments: unknown[]; body: string; event: string };
+    expect(retry.event).toBe('COMMENT');
+    expect(retry.comments).toEqual([
+      { path: 'src/a.ts', line: 12, side: 'RIGHT', body: 'boom' },
+      { path: 'src/b.ts', line: 3, side: 'RIGHT', body: 'bang' },
+    ]);
+    expect(retry.body).toContain('summary here');
+    expect(retry.body).toContain('request_changes');
+    // Nothing was dropped, so the findings are not repeated in the body.
+    expect(retry.body).not.toContain('- **src/a.ts:12** — boom');
+  });
+
+  it('drops the inline comments into the body only when the second attempt 422s too', async () => {
     const { f, gh } = client([
       jsonResponse({ message: 'line must be part of the diff' }, 422),
-      jsonResponse({ id: 100, html_url: 'https://x/100' }),
+      jsonResponse({ message: 'line must be part of the diff' }, 422),
+      jsonResponse({ id: 101, html_url: 'https://x/101' }),
     ]);
     const res = await gh.createReview('o', 'r', 1, {
       commitId: 'abc123',
@@ -133,32 +158,15 @@ describe('GitHubClient.createReview', () => {
         { path: 'src/b.ts', line: 3, body: 'bang' },
       ],
     });
-    expect(res.id).toBe(100);
-    expect(f.calls).toHaveLength(2);
-    const retry = f.calls[1]!.body as { comments: unknown[]; body: string; event: string };
-    expect(retry.comments).toEqual([]);
-    expect(retry.event).toBe('COMMENT');
-    expect(retry.body).toContain('summary here');
-    expect(retry.body).toContain('- **src/a.ts:12** — boom');
-    expect(retry.body).toContain('- **src/b.ts:3** — bang');
-  });
-
-  it('downgrades REQUEST_CHANGES to COMMENT on the 422 retry and says so in the body', async () => {
-    const { f, gh } = client([
-      jsonResponse({ message: 'Can not request changes on your own pull request' }, 422),
-      jsonResponse({ id: 101, html_url: 'https://x/101' }),
-    ]);
-    const res = await gh.createReview('o', 'r', 1, {
-      commitId: 'abc123',
-      body: 'summary here',
-      event: 'REQUEST_CHANGES',
-      comments: [{ path: 'src/a.ts', line: 12, body: 'boom' }],
-    });
     expect(res.id).toBe(101);
-    expect((f.calls[0]!.body as { event: string }).event).toBe('REQUEST_CHANGES');
-    const retry = f.calls[1]!.body as { event: string; body: string };
-    expect(retry.event).toBe('COMMENT');
-    expect(retry.body).toContain('request_changes');
+    expect(f.calls).toHaveLength(3);
+    expect((f.calls[1]!.body as { comments: unknown[] }).comments).toHaveLength(2);
+    const last = f.calls[2]!.body as { comments: unknown[]; body: string; event: string };
+    expect(last.comments).toEqual([]);
+    expect(last.event).toBe('COMMENT');
+    expect(last.body).toContain('summary here');
+    expect(last.body).toContain('- **src/a.ts:12** — boom');
+    expect(last.body).toContain('- **src/b.ts:3** — bang');
   });
 
   it('reports both failures when the 422 retry also fails', async () => {
@@ -175,6 +183,26 @@ describe('GitHubClient.createReview', () => {
       }),
     ).rejects.toThrow(/line must be part of the diff[\s\S]*server exploded/);
     expect(f.calls).toHaveLength(2);
+  });
+
+  it('reports every body when all three attempts fail', async () => {
+    const { f, gh } = client([
+      textResponse('first failure', 422),
+      textResponse('second failure', 422),
+      textResponse('third failure', 422),
+    ]);
+    const err = await gh
+      .createReview('o', 'r', 1, {
+        commitId: 'a',
+        body: 'b',
+        event: 'REQUEST_CHANGES',
+        comments: [{ path: 'src/a.ts', line: 12, body: 'boom' }],
+      })
+      .then(() => null, (e: unknown) => e as Error);
+    expect(f.calls).toHaveLength(3);
+    expect(err!.message).toContain('first failure');
+    expect(err!.message).toContain('second failure');
+    expect(err!.message).toContain('third failure');
   });
 
   it('does not retry a 422 when there were no comments to drop', async () => {

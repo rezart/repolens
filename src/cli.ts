@@ -70,20 +70,27 @@ async function main() {
       const repoId = normalizeRepoId(args[0]);
       if (!deps.db.getRepo(repoId)) throw new Error(`${repoId} is not indexed; run: repolens index ${args[0]}`);
       // Stream straight to stdout so the answer appears as it is generated.
-      let streamed = false;
+      let streamed = '';
       const result = await answerQuestion({
         llm: deps.chatLlm,
         retrieve: deps.retrieve,
         repoIds: [repoId],
         messages: [{ role: 'user', content: args.slice(1).join(' ') }],
         onDelta: (text) => {
-          streamed = true;
+          streamed += text;
           process.stdout.write(text);
         },
       });
       // The provider's final text is authoritative; only reprint if it differs.
-      if (streamed) process.stdout.write('\n');
-      else console.log(result.message);
+      if (!streamed) {
+        console.log(result.message);
+      } else {
+        process.stdout.write('\n');
+        if (streamed.trim() !== result.message.trim()) {
+          console.log('\n--- final answer ---');
+          console.log(result.message);
+        }
+      }
       if (result.sources.length) {
         console.log('\nSources:');
         for (const s of result.sources) console.log(`  ${s.filepath}:${s.linestart}-${s.lineend}`);

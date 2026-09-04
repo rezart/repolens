@@ -2,6 +2,7 @@ import type { Db, RepoRow } from '../db.js';
 import type { LLMProvider } from '../llm/types.js';
 import { extractJson } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
+import { truncateDescription } from './github.js';
 import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import {
@@ -358,50 +359,56 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     await setStatus({ state: 'pending', description: 'RepoLens review in progress' }, pr.htmlUrl, statusWarnings);
   }
 
-  if (cached) {
-    log(`review: reusing review #${cached.id} for ${opts.repoId}#${opts.prNumber} @ ${pr.headSha}`);
-    let findings: Finding[] = [];
-    try {
-      const parsedFindings = JSON.parse(cached.comments_json) as unknown;
-      if (Array.isArray(parsedFindings)) findings = parsedFindings as Finding[];
-    } catch {
-      findings = [];
-    }
-    const cachedResult: ReviewResult = {
-      reviewId: cached.id,
-      prNumber: cached.pr_number,
-      headSha: cached.head_sha,
-      summary: cached.summary ?? '',
-      verdict: toVerdict(cached.verdict) ?? 'comment',
-      findings,
-      posted: cached.posted === 1,
-      skippedFiles: [],
-      warnings: statusWarnings,
-    };
-    if (post && cached.posted === 0) {
-      // A previous run stored the review but failed (or was asked not) to post it.
-      log(`review: cached review #${cached.id} was never posted; posting it now`);
-      await postReview(postCtx, cachedResult);
-    }
-    const cachedStatus = statusForFindings(cachedResult.findings, failOn);
-    await setStatus(cachedStatus, cachedResult.reviewUrl ?? pr.htmlUrl, cachedResult.warnings);
-    if (statusEnabled) cachedResult.status = cachedStatus;
-    return cachedResult;
-  }
-
-  let result: ReviewResult;
+  // Everything below the `pending` status runs inside this try: any escape without a
+  // terminal status would leave a required check pending, blocking the PR forever.
   try {
-    result = await runReview();
+    if (cached) {
+      log(`review: reusing review #${cached.id} for ${opts.repoId}#${opts.prNumber} @ ${pr.headSha}`);
+      let findings: Finding[] = [];
+      try {
+        const parsedFindings = JSON.parse(cached.comments_json) as unknown;
+        if (Array.isArray(parsedFindings)) findings = parsedFindings as Finding[];
+      } catch {
+        findings = [];
+      }
+      const cachedResult: ReviewResult = {
+        reviewId: cached.id,
+        prNumber: cached.pr_number,
+        headSha: cached.head_sha,
+        summary: cached.summary ?? '',
+        verdict: toVerdict(cached.verdict) ?? 'comment',
+        findings,
+        posted: cached.posted === 1,
+        skippedFiles: [],
+        warnings: statusWarnings,
+      };
+      if (post && cached.posted === 0) {
+        // A previous run stored the review but failed (or was asked not) to post it.
+        log(`review: cached review #${cached.id} was never posted; posting it now`);
+        await postReview(postCtx, cachedResult);
+      }
+      const cachedStatus = statusForFindings(cachedResult.findings, failOn);
+      await setStatus(cachedStatus, cachedResult.reviewUrl ?? pr.htmlUrl, cachedResult.warnings);
+      if (statusEnabled) cachedResult.status = cachedStatus;
+      return cachedResult;
+    }
+
+    const result = await runReview();
+    const status = statusForFindings(result.findings, failOn);
+    await setStatus(status, result.reviewUrl ?? pr.htmlUrl, result.warnings);
+    if (statusEnabled) result.status = status;
+    return result;
   } catch (err) {
     // The check must not stay pending forever when the review itself blows up.
-    await setStatus({ state: 'error', description: `RepoLens review failed: ${errMessage(err)}` }, pr.htmlUrl, statusWarnings);
+    // Descriptions are capped at 140 characters, so a long message would make the
+    // status call fail too and leave the check pending.
+    await setStatus(
+      { state: 'error', description: truncateDescription(`RepoLens review failed: ${errMessage(err)}`) },
+      pr.htmlUrl,
+      statusWarnings,
+    );
     throw err;
   }
-
-  const status = statusForFindings(result.findings, failOn);
-  await setStatus(status, result.reviewUrl ?? pr.htmlUrl, result.warnings);
-  if (statusEnabled) result.status = status;
-  return result;
 
   async function runReview(): Promise<ReviewResult> {
     const diffText = await github.getPullDiff(repo.owner, repo.name, opts.prNumber);
