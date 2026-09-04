@@ -10,7 +10,7 @@ Verified on 2026-09-04 with live calls:
 | Backend | Where usage arrives | Fields | Cost |
 |---|---|---|---|
 | OpenRouter | `usage` in the JSON body; in streaming mode on the last frame before `[DONE]` when the request sets `usage: { include: true }` | `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens` | `usage.cost` (USD) |
-| Claude CLI | the `result` object (`--output-format json`) or the `result` event (`stream-json`) | `usage.input_tokens` (uncached), `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`; `modelUsage[<full id>].canonicalModel` names the model actually used | `total_cost_usd` (exact, list price) |
+| Claude CLI | the `result` object (`--output-format json`) or the `result` event (`stream-json`) | `usage.input_tokens` (uncached), `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens` for the whole call; `modelUsage[<full id>]` repeats them per model with `canonicalModel` naming the model actually used | `total_cost_usd` for the call, `modelUsage[<id>].costUSD` per model (exact, list price) |
 | Codex CLI | a `{"type":"turn.completed","usage":{...}}` line on stdout, only with `--json` | `input_tokens` (includes cached), `cached_input_tokens`, `output_tokens` | none |
 | Embeddings | `usage.prompt_tokens` in the `/embeddings` body | prompt tokens only | none |
 
@@ -42,6 +42,14 @@ interface UsageRecord {
   costUsd: number | null;  // reported by the backend, null when it reports none
 }
 ```
+
+The Claude CLI's `usage` and `total_cost_usd` are call-level aggregates across
+every model the call touched, while `modelUsage` breaks the same call down per
+model with its own `inputTokens`, `outputTokens`, cache counts and `costUSD`. The
+provider emits one record per `modelUsage` entry from that entry's own fields,
+so per-model figures are right and the call's cost is never counted twice. The
+aggregate `usage` and `total_cost_usd` are used only when `modelUsage` is absent
+or carries no usable entry, and then exactly one record is emitted.
 
 The Codex provider adds `--json` to its argv and parses stdout as line-delimited
 JSON for the `turn.completed` event. The output file stays authoritative for the
