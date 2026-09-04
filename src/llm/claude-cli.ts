@@ -147,38 +147,51 @@ export class ClaudeCliProvider implements LLMProvider {
    * two-model call entirely to the first one misprices both.
    */
   private usageRecords(final: ClaudeCliResult): UsageRecord[] {
+    const usage = final.usage;
+    const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
     const perModel: UsageRecord[] = [];
+    let soleEntryLacksCacheCounts = false;
     for (const [key, entry] of Object.entries(final.modelUsage ?? {})) {
       if (!entry) continue;
-      const inputTokens = entry.inputTokens;
-      const outputTokens = entry.outputTokens;
-      if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') continue;
+      const inputTokens = num(entry.inputTokens);
+      const outputTokens = num(entry.outputTokens);
+      if (inputTokens === null || outputTokens === null) continue;
+      const cacheRead = num(entry.cacheReadInputTokens);
+      const cacheWrite = num(entry.cacheCreationInputTokens);
+      soleEntryLacksCacheCounts = cacheRead === null && cacheWrite === null;
       perModel.push({
         provider: this.name,
         model: typeof entry.canonicalModel === 'string' ? entry.canonicalModel : key,
         inputTokens,
-        cachedInputTokens: typeof entry.cacheReadInputTokens === 'number' ? entry.cacheReadInputTokens : 0,
-        cacheWriteTokens: typeof entry.cacheCreationInputTokens === 'number' ? entry.cacheCreationInputTokens : 0,
+        cachedInputTokens: cacheRead ?? 0,
+        cacheWriteTokens: cacheWrite ?? 0,
         outputTokens,
-        costUsd: typeof entry.costUSD === 'number' ? entry.costUSD : null,
+        costUsd: num(entry.costUSD),
       });
+    }
+    if (perModel.length === 1 && soleEntryLacksCacheCounts && usage) {
+      // A lone entry that omits its cache counts still owns the whole call, so the
+      // aggregate cache figures (and cost, if the entry has none) are its own.
+      const only = perModel[0]!;
+      only.cachedInputTokens = num(usage.cache_read_input_tokens) ?? 0;
+      only.cacheWriteTokens = num(usage.cache_creation_input_tokens) ?? 0;
+      only.costUsd ??= num(final.total_cost_usd);
     }
     if (perModel.length) return perModel;
 
-    const usage = final.usage;
     if (!usage) return [];
-    const inputTokens = usage.input_tokens;
-    const outputTokens = usage.output_tokens;
-    if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') return [];
+    const inputTokens = num(usage.input_tokens);
+    const outputTokens = num(usage.output_tokens);
+    if (inputTokens === null || outputTokens === null) return [];
     return [
       {
         provider: this.name,
         model: this.model,
         inputTokens,
-        cachedInputTokens: typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0,
-        cacheWriteTokens: typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0,
+        cachedInputTokens: num(usage.cache_read_input_tokens) ?? 0,
+        cacheWriteTokens: num(usage.cache_creation_input_tokens) ?? 0,
         outputTokens,
-        costUsd: typeof final.total_cost_usd === 'number' ? final.total_cost_usd : null,
+        costUsd: num(final.total_cost_usd),
       },
     ];
   }

@@ -1182,7 +1182,7 @@ function usageTable(rows) {
   const flush = () => {
     if (!group.length) return;
     body.push(h('tr', { class: 'usage-day' }, [
-      h('td', { colspan: 7, text: day }),
+      h('td', { colspan: 8, text: day }),
       h('td', { class: 'num mono', text: usageCostText(usageTotals(group)) }),
     ]));
     for (const row of group) {
@@ -1193,6 +1193,7 @@ function usageTable(rows) {
         h('td', { class: 'num mono', text: fmtCount(row.calls) }),
         h('td', { class: 'num mono', text: fmtCount(row.inputTokens) }),
         h('td', { class: 'num mono', text: fmtCount(row.cachedInputTokens) }),
+        h('td', { class: 'num mono', text: fmtCount(row.cacheWriteTokens) }),
         h('td', { class: 'num mono', text: fmtCount(row.outputTokens) }),
         usageCostCell(row),
       ]));
@@ -1206,7 +1207,7 @@ function usageTable(rows) {
   }
   flush();
 
-  const head = ['Provider', 'Model', 'Role', 'Calls', 'Input', 'Cached', 'Output', 'Cost'];
+  const head = ['Provider', 'Model', 'Role', 'Calls', 'Input', 'Cached', 'Cache write', 'Output', 'Cost'];
   return h('div', { class: 'usage-scroll' }, [
     h('table', { class: 'usage-table' }, [
       h('thead', {}, [h('tr', {}, head.map((label, i) => h('th', { class: i >= 3 ? 'num' : null, text: label })))]),

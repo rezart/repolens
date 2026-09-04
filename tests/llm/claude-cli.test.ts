@@ -326,6 +326,26 @@ describe('ClaudeCliProvider usage reporting', () => {
     ]);
   });
 
+  it('takes cache counts and cost from the aggregate when the sole modelUsage entry omits them', async () => {
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'pong',
+      total_cost_usd: 0.016316,
+      usage: { input_tokens: 10, cache_creation_input_tokens: 7508, cache_read_input_tokens: 0, output_tokens: 258 },
+      // Older CLIs list only the token totals per model.
+      modelUsage: { 'claude-haiku-4-5-20251001': { inputTokens: 10, outputTokens: 258, canonicalModel: 'claude-haiku-4-5' } },
+    });
+    const f = fakeRun({ stdout });
+    const seen: UsageRecord[] = [];
+    const p = new ClaudeCliProvider({ model: 'haiku', run: f.run, onUsage: (r) => seen.push(r) });
+    await p.complete({ messages: [{ role: 'user', content: 'ping' }] });
+    expect(seen).toEqual([
+      { provider: 'claude-cli', model: 'claude-haiku-4-5', inputTokens: 10, cachedInputTokens: 0, cacheWriteTokens: 7508, outputTokens: 258, costUsd: 0.016316 },
+    ]);
+  });
+
   it('emits one record per model when the call used more than one', async () => {
     const f = fakeRun({
       stdout: JSON.stringify({
