@@ -99,6 +99,21 @@ describe('Db', () => {
     expect(db.listReviews('github:o/n', 2, 2).map((r) => r.id)).toEqual([ids[0]]);
   });
 
+  it('finds the latest done review of a pull request across head shas', () => {
+    seed(db);
+    const row = (head: string, status: 'done' | 'error') => db.insertReview({
+      repo_id: 'github:o/n', pr_number: 7, head_sha: head, status, summary: null, verdict: null,
+      comments_json: '[]', posted: 0, error: null,
+    });
+    expect(db.findLatestReview('github:o/n', 7)).toBeUndefined();
+    row('h1', 'done');
+    const second = row('h2', 'done');
+    row('h3', 'error');
+    expect(db.findLatestReview('github:o/n', 7)?.id).toBe(second.id);
+    expect(db.findLatestReview('github:o/n', 8)).toBeUndefined();
+    expect(db.countPrReviews('github:o/n', 7)).toBe(2);
+  });
+
   it('tags review jobs with their pull request number', () => {
     seed(db);
     db.createJob('index', 'github:o/n');
