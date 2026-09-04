@@ -278,7 +278,8 @@ function errText(err: unknown): string {
 }
 
 export function renderDroppedComments(comments: ReviewComment[]): string {
-  const list = comments.map((c) => `- **${c.path}:${c.line}** — ${c.body.replace(/\n+/g, ' ').trim()}`).join('\n');
+  // Continuation lines are indented so multi-line Markdown (fenced snippets) stays inside the list item.
+  const list = comments.map((c) => `- **${c.path}:${c.line}** — ${c.body.trim().replace(/\n/g, '\n  ')}`).join('\n');
   return `**Inline comments could not be attached to the diff:**\n\n${list}`;
 }
 
