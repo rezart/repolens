@@ -120,6 +120,10 @@ interface FakeGithubOptions {
   headFiles?: Record<string, string>;
   /** Make getFileContent reject for the given path. */
   fileContentError?: (path: string) => Error | null;
+  /** Commits returned by listPullCommits. */
+  commits?: Array<{ sha: string; message: string }>;
+  /** Diff returned by compareDiff (null = GitHub cannot compare). */
+  compare?: string | null;
 }
 
 interface StatusCall {
@@ -134,7 +138,15 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
   const listCalls: Array<{ owner: string; repo: string; number: number }> = [];
   const statuses: StatusCall[] = [];
   const contentCalls: Array<{ path: string; ref: string }> = [];
+  const compareCalls: Array<{ base: string; head: string }> = [];
   const github: ReviewDeps['github'] = {
+    async listPullCommits() {
+      return opts.commits ?? [];
+    },
+    async compareDiff(_owner: string, _repo: string, base: string, head: string) {
+      compareCalls.push({ base, head });
+      return opts.compare === undefined ? null : opts.compare;
+    },
     async getPull() {
       return pr;
     },
@@ -164,7 +176,7 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
       return { id: 7, htmlUrl: 'https://github.com/o/r/pull/42#pullrequestreview-7' };
     },
   };
-  return { reviews, listCalls, statuses, contentCalls, github };
+  return { reviews, listCalls, statuses, contentCalls, compareCalls, github };
 }
 
 const retrieveOne: RetrieveFn = async () => [CHUNK];
@@ -577,8 +589,9 @@ describe('reviewPullRequest PR-head context', () => {
       { repoId: REPO_ID, prNumber: 42 },
     );
 
-    expect(gh.contentCalls.map((c) => c.path).sort()).toEqual(['src/a.ts', 'src/b.ts']);
-    expect(gh.contentCalls.every((c) => c.ref === PR.headSha)).toBe(true);
+    // Lineage reads overview docs at the base sha; the post-change fetches are the head ones.
+    const headCalls = gh.contentCalls.filter((c) => c.ref === PR.headSha);
+    expect(headCalls.map((c) => c.path).sort()).toEqual(['src/a.ts', 'src/b.ts']);
 
     const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
     // b.ts's new content is present, under the authoritative heading and before the index one.
@@ -656,6 +669,79 @@ describe('reviewPullRequest PR-head context', () => {
     const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
     expect(msg).toContain('### src/a.ts (content after this pull request)');
     expect(msg).not.toContain('### src/b.ts');
+  });
+});
+
+describe('reviewPullRequest lineage', () => {
+  let db: Db;
+  beforeEach(() => {
+    db = openDb(':memory:');
+    db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+  });
+  afterEach(() => db.close());
+
+  const DELTA = [
+    'diff --git a/src/app.ts b/src/app.ts',
+    '--- a/src/app.ts',
+    '+++ b/src/app.ts',
+    '@@ -4,2 +4,2 @@',
+    '-  if (n = 0) return;',
+    '+  if (n === 0) return;',
+    '',
+  ].join('\n');
+
+  it('feeds the previous review, the delta and the commits to the prompts and notes the review number in the body', async () => {
+    db.insertReview({
+      repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done', summary: 'First pass.', verdict: 'request_changes',
+      comments_json: JSON.stringify([{ path: 'src/app.ts', line: 5, severity: 'critical', title: 'Assignment in condition', body: 'Use ===.' }]),
+      posted: 1, error: null,
+    });
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, PR, {
+      commits: [{ sha: 'head-sha-0', message: 'feat: run' }, { sha: 'head-sha-1', message: 'fix: compare' }],
+      compare: DELTA,
+    });
+    const result = await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
+
+    expect(gh.compareCalls).toEqual([{ base: 'head-sha-0', head: 'head-sha-1' }]);
+    const file = llm.fileCalls()[0]!.messages[0]!.content as string;
+    expect(file).toContain('review 1 at head-sh');
+    expect(file).toContain('- [critical] src/app.ts:5 — Assignment in condition');
+    expect(file).toMatch(/\+\s+if \(n === 0\) return;/);
+    expect(file).toContain('- head-sh fix: compare');
+    const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content as string;
+    expect(summary).toContain('First pass.');
+    expect(summary).toContain('1 commit since that review');
+    expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('reads overview docs at the base sha and puts them in the file prompt', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, PR, { headFiles: { 'CLAUDE.md': 'One Node process, no external services.' } });
+    await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.contentCalls).toContainEqual({ path: 'CLAUDE.md', ref: 'base-sha-1' });
+    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('One Node process, no external services.');
+  });
+
+  it('carries no previous review on a first review and does not call compare', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub();
+    await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
+    expect(gh.compareCalls).toEqual([]);
+    expect(llm.fileCalls()[0]!.messages[0]!.content).not.toContain('Previous RepoLens review');
+    expect(gh.reviews[0]!.input.body).not.toContain('Review 1 of');
+  });
+
+  it('warns and still reviews when lineage fetches fail', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done', summary: 's', verdict: 'comment', comments_json: '[]', posted: 1, error: null });
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, PR, {});
+    gh.github.listPullCommits = async () => { throw new Error('commits down'); };
+    const result = await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
+    expect(result.warnings.join('\n')).toContain('commits down');
+    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('Delta unavailable');
   });
 });
 
