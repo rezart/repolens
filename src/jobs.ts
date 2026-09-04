@@ -6,6 +6,11 @@ export interface JobContext {
 
 type JobFn = (ctx: JobContext) => Promise<unknown>;
 
+export interface JobMeta {
+  /** Pull request the job is about; lets the API tell which PRs have a review in flight. */
+  prNumber?: number;
+}
+
 /**
  * In-process job queue. Jobs of the same kind run one at a time in FIFO order;
  * different kinds run independently. State is persisted in the `jobs` table so
@@ -20,8 +25,8 @@ export class JobQueue {
     private readonly log: (msg: string) => void = () => {},
   ) {}
 
-  enqueue(kind: JobKind, repoId: string | null, fn: JobFn): JobRow {
-    const job = this.db.createJob(kind, repoId);
+  enqueue(kind: JobKind, repoId: string | null, fn: JobFn, meta: JobMeta = {}): JobRow {
+    const job = this.db.createJob(kind, repoId, meta.prNumber ?? null);
     const q = this.queues.get(kind) ?? [];
     q.push({ id: job.id, fn });
     this.queues.set(kind, q);

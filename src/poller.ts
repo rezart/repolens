@@ -30,11 +30,10 @@ export async function pollOnce(deps: AppDeps): Promise<PollOutcome> {
       const pulls = await deps.github.listOpenPulls(repo.owner, repo.name);
       for (const pr of pulls) {
         if (pr.draft || !pr.headSha) continue;
-        const key = `${repo.id}#${pr.number}@${pr.headSha}`;
+        const key = `${repo.id}#${pr.number}`;
         if (busyReviews.has(key)) continue;
         if (deps.db.findReview(repo.id, pr.number, pr.headSha)?.posted) continue;
-        const job = enqueueReview(deps, repo.id, pr.number, { post: true });
-        deps.db.updateJob(job.id, { progress: `poll:${key}` });
+        enqueueReview(deps, repo.id, pr.number, { post: true });
         busyReviews.add(key);
         out.reviewed.push({ repository: repo.id, prNumber: pr.number });
       }
@@ -50,7 +49,8 @@ function pendingReviews(deps: AppDeps): Set<string> {
   const keys = new Set<string>();
   for (const job of deps.db.listJobs(200)) {
     if (job.kind !== 'review' || (job.status !== 'queued' && job.status !== 'running')) continue;
-    if (job.progress?.startsWith('poll:')) keys.add(job.progress.slice(5));
+    // A queued review always fetches the current head, so one per PR is enough.
+    if (job.repo_id && job.pr_number !== null) keys.add(`${job.repo_id}#${job.pr_number}`);
   }
   return keys;
 }

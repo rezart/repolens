@@ -14,6 +14,10 @@ const state = {
   reviews: {},      // repoId -> review rows
   busy: {},         // repoId -> { review, reindex, instructions }
   note: {},         // repoId -> transient job progress text
+  pulls: {},        // repoId -> { rows, loading, error }
+  pullJobs: {},     // repoId -> { prNumber: { jobId, progress } } for in-flight reviews
+  pullJobsSeen: {}, // repoId -> { jobId: true } jobs already followed to completion
+  postToGithub: true, // shared "Post to GitHub" preference
   mountKey: null,   // repoId + '|' + tab currently mounted in the panel
 };
 
@@ -48,6 +52,31 @@ function fmtTime(value) {
 
 function fmtCount(n) {
   return typeof n === 'number' ? n.toLocaleString() : '0';
+}
+
+function fmtRelative(value) {
+  if (!value) return 'unknown';
+  const d = typeof value === 'number' ? new Date(value) : new Date(String(value).replace(' ', 'T'));
+  if (isNaN(d.getTime())) return String(value);
+  const secs = Math.round((Date.now() - d.getTime()) / 1000);
+  if (secs < 60) return 'just now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + 'm ago';
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + 'h ago';
+  const days = Math.floor(hours / 24);
+  if (days < 30) return days + 'd ago';
+  const months = Math.floor(days / 30);
+  if (months < 12) return months + 'mo ago';
+  return Math.floor(days / 365) + 'y ago';
+}
+
+function slug(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z]+/g, '-');
+}
+
+function safeUrl(value) {
+  return /^https?:\/\//i.test(String(value || '')) ? String(value) : null;
 }
 
 /* ------------------------------------------------------------ api client */
@@ -143,6 +172,25 @@ function busyFor(repoId) {
   return state.busy[repoId];
 }
 
+function pullsFor(repoId) {
+  if (!state.pulls[repoId]) state.pulls[repoId] = { rows: null, loading: false, error: null };
+  return state.pulls[repoId];
+}
+
+function pullJobsFor(repoId) {
+  if (!state.pullJobs[repoId]) state.pullJobs[repoId] = {};
+  return state.pullJobs[repoId];
+}
+
+function pullJobsSeenFor(repoId) {
+  if (!state.pullJobsSeen[repoId]) state.pullJobsSeen[repoId] = {};
+  return state.pullJobsSeen[repoId];
+}
+
+function isGithubRepo(repo) {
+  return !!repo && String(repo.id || '').startsWith('github:');
+}
+
 async function loadHealth() {
   try {
     state.health = await api('/api/health');
@@ -179,6 +227,30 @@ async function loadReviews(repoId) {
     handleError(err);
   }
   if (state.selectedId === repoId && state.tab === 'reviews') renderReviewList();
+}
+
+async function loadPulls(repoId) {
+  const st = pullsFor(repoId);
+  if (st.loading) return;
+  st.loading = true;
+  st.error = null;
+  renderPulls();
+  try {
+    const data = await api('/api/repositories/' + encodeURIComponent(repoId) + '/pulls');
+    st.rows = (data && data.pulls) || [];
+    // Reviews queued elsewhere (webhook, another tab) still get followed to completion here.
+    for (const pr of st.rows) {
+      const review = pr.review || {};
+      if (review.status === 'pending' && review.jobId) trackPullJob(repoId, pr.number, review.jobId);
+    }
+  } catch (err) {
+    st.rows = st.rows || [];
+    st.error = err.message || 'Could not load pull requests';
+    handleError(err);
+  } finally {
+    st.loading = false;
+    renderPulls();
+  }
 }
 
 /* --------------------------------------------------------------- polling */
@@ -296,7 +368,7 @@ function renderTabBody() {
   if (state.mountKey === key) {
     // Already mounted: refresh only the dynamic sections so inputs keep focus/value.
     if (state.tab === 'chat') renderChatLog();
-    if (state.tab === 'reviews') renderReviewList();
+    if (state.tab === 'reviews') { renderPulls(); renderReviewList(); }
     return;
   }
   state.mountKey = key;
@@ -425,9 +497,46 @@ async function askQuestion(repoId, question) {
 
 /* ---------------------------------------------------------- reviews tab */
 
+function postCheckbox(id) {
+  const box = h('input', { type: 'checkbox', class: 'post-check', id, checked: state.postToGithub !== false });
+  box.addEventListener('change', () => {
+    state.postToGithub = box.checked;
+    for (const other of document.querySelectorAll('.post-check')) other.checked = state.postToGithub;
+  });
+  return box;
+}
+
+function buildPullsCard(repo) {
+  const github = isGithubRepo(repo);
+
+  const refreshBtn = h('button', {
+    class: 'btn btn-ghost btn-sm', type: 'button', title: 'Refresh', text: '\u21bb',
+    hidden: !github, onclick: () => loadPulls(repo.id),
+  });
+
+  const allBtn = h('button', { class: 'btn btn-primary btn-sm', id: 'pulls-review-all', type: 'button', text: 'Review all unreviewed' });
+  allBtn.addEventListener('click', () => reviewPulls(repo.id, null, false, allBtn));
+
+  const toolbar = h('div', { class: 'row-form', id: 'pulls-toolbar', hidden: !github }, [
+    allBtn,
+    h('label', { class: 'check' }, [postCheckbox('pulls-post'), h('span', { text: 'Post to GitHub' })]),
+    h('span', { class: 'job-note', id: 'pulls-count' }),
+  ]);
+
+  const card = h('section', { class: 'card' }, [
+    h('div', { class: 'card-head' }, [h('h3', { text: 'Open pull requests' }), refreshBtn]),
+    toolbar,
+    h('div', { class: 'pulls', id: 'pulls-list' }, [h('p', { class: 'muted', text: github ? 'Loading\u2026' : '' })]),
+  ]);
+
+  if (github) loadPulls(repo.id);
+  else setTimeout(renderPulls, 0);
+  return card;
+}
+
 function buildReviewsTab(repo) {
   const prInput = h('input', { type: 'number', min: '1', id: 'pr-number', placeholder: 'PR number', required: true });
-  const postBox = h('input', { type: 'checkbox', id: 'pr-post', checked: true });
+  const postBox = postCheckbox('pr-post');
   const runBtn = h('button', { class: 'btn btn-primary', type: 'submit', text: 'Run review' });
 
   const form = h('form', { class: 'row-form', onsubmit: (e) => {
@@ -443,17 +552,178 @@ function buildReviewsTab(repo) {
   ]);
 
   const wrap = h('div', { class: 'tab-pane' }, [
-    h('section', { class: 'card' }, [h('h3', { text: 'Run a pull request review' }), form]),
+    buildPullsCard(repo),
+    h('section', { class: 'card' }, [h('h3', { text: 'Run a review by pull request number' }), form]),
     h('section', { class: 'card' }, [
       h('div', { class: 'card-head' }, [
         h('h3', { text: 'Past reviews' }),
-        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: '↻', onclick: () => loadReviews(repo.id) }),
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', text: '\u21bb', onclick: () => loadReviews(repo.id) }),
       ]),
-      h('div', { class: 'review-list', id: 'review-list' }, [h('p', { class: 'muted', text: 'Loading…' })]),
+      h('div', { class: 'review-list', id: 'review-list' }, [h('p', { class: 'muted', text: 'Loading\u2026' })]),
     ]),
   ]);
   loadReviews(repo.id);
   return wrap;
+}
+
+/* ------------------------------------------------------ open pull requests */
+
+function findingCount(review) {
+  if (Array.isArray(review.findings)) return review.findings.length;
+  return typeof review.findings === 'number' ? review.findings : null;
+}
+
+function pullStatusBits(review, job) {
+  const status = job ? 'pending' : String(review.status || 'none');
+  if (status === 'pending') {
+    const bits = [h('span', { class: 'pill pill-queued', text: 'queued' })];
+    if (job && job.progress) bits.push(h('span', { class: 'pull-progress', text: job.progress }));
+    return bits;
+  }
+  if (status === 'reviewed') {
+    const bits = [h('span', { class: 'pill pill-done', text: 'reviewed' })];
+    if (review.verdict) bits.push(h('span', { class: 'badge badge-' + slug(review.verdict), text: String(review.verdict).replace(/_/g, ' ') }));
+    const n = findingCount(review);
+    if (n !== null) bits.push(h('span', { class: 'pull-findings', text: n + (n === 1 ? ' finding' : ' findings') }));
+    bits.push(h('span', {
+      class: 'review-posted' + (review.posted ? ' is-posted' : ''),
+      text: review.posted ? 'posted' : 'not posted',
+    }));
+    return bits;
+  }
+  if (status === 'error') {
+    return [h('span', { class: 'pill pill-error', title: review.error || 'Review failed', text: 'error' })];
+  }
+  return [h('span', { class: 'pill', text: 'not reviewed' })];
+}
+
+function pullRow(repo, pr, job) {
+  const review = pr.review || { status: 'none' };
+  const pending = !!job || review.status === 'pending';
+  const reviewed = !pending && review.status === 'reviewed';
+  const href = safeUrl(pr.htmlUrl);
+
+  const btn = h('button', {
+    class: 'btn btn-sm' + (reviewed ? '' : ' btn-primary'),
+    type: 'button',
+    text: reviewed ? 'Re-review' : 'Review',
+    disabled: pending,
+  });
+  btn.addEventListener('click', () => reviewPulls(repo.id, [pr.number], reviewed, btn));
+
+  const link = (cls, textContent) => (href
+    ? h('a', { class: cls, href, target: '_blank', rel: 'noopener noreferrer', text: textContent })
+    : h('span', { class: cls, text: textContent }));
+
+  return h('div', { class: 'pull' }, [
+    h('div', { class: 'pull-main' }, [
+      h('div', { class: 'pull-title' }, [
+        link('pull-num', '#' + pr.number),
+        link('pull-name', pr.title || '(untitled)'),
+        pr.draft ? h('span', { class: 'badge badge-draft', text: 'draft' }) : null,
+      ]),
+      h('div', { class: 'pull-meta' }, [
+        h('span', { text: pr.author ? '@' + pr.author : 'unknown author' }),
+        h('span', { text: '\u2192 ' + (pr.baseRef || 'default branch') }),
+        h('span', { title: fmtTime(pr.updatedAt), text: 'updated ' + fmtRelative(pr.updatedAt) }),
+      ]),
+    ]),
+    h('div', { class: 'pull-status' }, pullStatusBits(review, job)),
+    btn,
+  ]);
+}
+
+function renderPulls() {
+  const repo = selectedRepo();
+  const box = $('pulls-list');
+  if (!box || !repo) return;
+  const countLine = $('pulls-count');
+  const allBtn = $('pulls-review-all');
+  box.replaceChildren();
+
+  if (!isGithubRepo(repo)) {
+    box.appendChild(h('p', { class: 'muted', text: 'Pull requests need a GitHub repository \u2014 this repository was indexed from a local path.' }));
+    if (countLine) countLine.textContent = '';
+    return;
+  }
+
+  const st = pullsFor(repo.id);
+  const jobs = pullJobsFor(repo.id);
+  const rows = st.rows;
+
+  if (st.error) box.appendChild(h('p', { class: 'pulls-err', text: st.error }));
+  if (!rows) {
+    box.appendChild(h('p', { class: 'muted', text: st.loading ? 'Loading\u2026' : 'No pull requests loaded.' }));
+    if (countLine) countLine.textContent = '';
+    if (allBtn) allBtn.disabled = true;
+    return;
+  }
+  if (!rows.length && !st.error) box.appendChild(h('p', { class: 'muted', text: 'No open pull requests.' }));
+
+  let queued = 0;
+  let unreviewed = 0;
+  for (const pr of rows) {
+    const job = jobs[pr.number];
+    const review = pr.review || { status: 'none' };
+    if (job || review.status === 'pending') queued += 1;
+    else if (!pr.draft && review.status !== 'reviewed') unreviewed += 1;
+    box.appendChild(pullRow(repo, pr, job));
+  }
+
+  if (countLine) {
+    countLine.textContent = rows.length + ' open \u00b7 ' + unreviewed + ' unreviewed \u00b7 ' + queued + ' queued';
+  }
+  if (allBtn) allBtn.disabled = st.loading || unreviewed === 0;
+}
+
+async function reviewPulls(repoId, prNumbers, force, btn) {
+  const body = { post: state.postToGithub !== false };
+  if (prNumbers && prNumbers.length) body.prNumbers = prNumbers;
+  if (force) body.force = true;
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api('/api/repositories/' + encodeURIComponent(repoId) + '/pulls/review', { method: 'POST', body });
+    const jobs = (data && data.jobs) || [];
+    const skipped = (data && data.skipped) || [];
+    let message = jobs.length
+      ? jobs.length + (jobs.length === 1 ? ' review queued.' : ' reviews queued.')
+      : 'Nothing queued.';
+    if (skipped.length) {
+      message += ' Skipped ' + skipped.map((s) => '#' + s.prNumber + ' (' + (s.reason || 'no reason given') + ')').join(', ') + '.';
+    }
+    toast(message);
+    for (const job of jobs) trackPullJob(repoId, job.prNumber, job.jobId);
+  } catch (err) {
+    handleError(err);
+  } finally {
+    if (btn) btn.disabled = false;
+    renderPulls();
+  }
+}
+
+function trackPullJob(repoId, prNumber, jobId) {
+  const jobs = pullJobsFor(repoId);
+  const seen = pullJobsSeenFor(repoId);
+  if (!jobId || jobs[prNumber] || seen[jobId]) return;
+  seen[jobId] = true;
+  jobs[prNumber] = { jobId, progress: 'queued' };
+  const repaint = () => { if (state.selectedId === repoId && state.tab === 'reviews') renderPulls(); };
+  repaint();
+
+  pollJob(jobId, (job) => {
+    const tracked = pullJobsFor(repoId)[prNumber];
+    if (tracked) tracked.progress = job.status + (job.progress ? ' \u2014 ' + job.progress : '');
+    repaint();
+  }).catch((err) => {
+    toast('Review of #' + prNumber + ' failed: ' + ((err && err.message) || 'unknown error'));
+  }).then(() => {
+    delete pullJobsFor(repoId)[prNumber];
+    if (Object.keys(pullJobsFor(repoId)).length) return repaint();
+    loadReviews(repoId);
+    const repo = state.repos.find((r) => r.id === repoId);
+    if (isGithubRepo(repo)) loadPulls(repoId);
+    else repaint();
+  });
 }
 
 function severityRank(s) {

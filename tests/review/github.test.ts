@@ -44,6 +44,7 @@ const PULL_PAYLOAD = {
   body: null,
   draft: false,
   html_url: 'https://github.com/o/r/pull/42',
+  updated_at: '2026-01-02T03:04:05Z',
   user: { login: 'octocat' },
   head: { sha: 'headsha', ref: 'feature' },
   base: { sha: 'basesha', ref: 'main' },
@@ -69,6 +70,7 @@ describe('GitHubClient.getPull', () => {
       author: 'octocat',
       htmlUrl: 'https://github.com/o/r/pull/42',
       draft: false,
+      updatedAt: '2026-01-02T03:04:05Z',
     });
     const call = f.calls[0]!;
     expect(call.url).toBe('https://api.github.com/repos/o/r/pulls/42');
