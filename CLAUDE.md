@@ -46,6 +46,8 @@ Tests never touch the network or real CLIs: providers take an injected `fetch` o
 
 **Triggers.** Three paths lead to `enqueueReview`/`enqueueIndex` in `src/app.ts`: the GitHub webhook (`src/review/webhook.ts`, HMAC-verified, refuses to run without a secret), the poller (`src/poller.ts`, default every 300 s, needs no inbound network; reindexes when the tracked branch moves and reviews open PRs whose head has no posted review), and the API/CLI/dashboard (`src/review/pulls.ts` lists open PRs with status and reviews one or all). `JobQueue` (`src/jobs.ts`) runs one job per kind at a time and tags review jobs with `pr_number` so pending reviews are detectable.
 
+**Usage** (`src/usage/`). Every provider and the embedding client take an `onUsage` callback and emit one normalised `UsageRecord` per call (fresh input, cache reads, cache writes, output, and the cost when the backend reports one: OpenRouter via `usage.include`, the Claude CLI via `total_cost_usd`; Codex reports tokens only, read from the `turn.completed` event that `--json` adds to its stdout). `buildDeps` binds one sink per role (`review`, `chat`, `embed`) through `UsageTracker`, which writes `llm_usage` rows and builds the `GET /api/usage` report per UTC day, provider, model and role. Calls without a reported cost are priced from OpenRouter's public `/models` list (`OpenRouterPricing`, cached in `meta` under `openrouter_pricing`, refreshed daily, never fetched at startup); CLI model names are mapped to OpenRouter ids by `candidateIds`, and a model with no match is reported as unpriced rather than free.
+
 **Dashboard** (`web/`) is vanilla JS served statically; it talks to the same API with a bearer token kept in localStorage and reads SSE via `fetch` + `ReadableStream`.
 
 ## Workflow
