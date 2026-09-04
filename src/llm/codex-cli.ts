@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runProcess, Semaphore } from './spawn.js';
+import { runProcess, Semaphore, childEnv } from './spawn.js';
 import type { RunProcess } from './spawn.js';
 import { flattenMessages, withJsonInstruction } from './claude-cli.js';
 import type { CliProviderOptions } from './claude-cli.js';
@@ -70,7 +70,7 @@ export class CodexCliProvider implements LLMProvider {
     const stdin = system ? `# System instructions\n${system}\n\n# Task\n${task}` : task;
 
     try {
-      const res = await this.run(this.bin, args, { stdin, cwd, timeoutMs: this.timeoutMs });
+      const res = await this.run(this.bin, args, { stdin, cwd, env: childEnv(), timeoutMs: this.timeoutMs });
       const detail = tail(`${res.stderr}\n${res.stdout}`.trim());
 
       if (res.timedOut) {

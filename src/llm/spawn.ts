@@ -77,3 +77,16 @@ export class Semaphore {
     }
   }
 }
+
+/**
+ * Environment for child CLI processes. Strips variables that mark a nested
+ * Claude Code / Codex session so the CLI behaves like a fresh top-level run.
+ */
+export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (k === 'CLAUDECODE' || k.startsWith('CLAUDE_CODE_') || k === 'CLAUDE_PID' || k === 'CLAUDE_EFFORT') continue;
+    env[k] = v;
+  }
+  return env;
+}

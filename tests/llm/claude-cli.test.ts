@@ -68,7 +68,7 @@ describe('ClaudeCliProvider', () => {
     expect(args).toContain('-p');
     expect(argValue(args, '--output-format')).toBe('json');
     expect(argValue(args, '--tools')).toBe('');
-    expect(args).toContain('--bare');
+    expect(args).not.toContain('--bare');
     expect(args).toContain('--no-session-persistence');
     expect(argValue(args, '--permission-mode')).toBe('dontAsk');
     expect(argValue(args, '--model')).toBe('sonnet');

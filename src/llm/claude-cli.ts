@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runProcess, Semaphore } from './spawn.js';
+import { runProcess, Semaphore, childEnv } from './spawn.js';
 import type { RunProcess } from './spawn.js';
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider } from './types.js';
@@ -88,7 +88,6 @@ export class ClaudeCliProvider implements LLMProvider {
       'json',
       '--tools',
       '',
-      '--bare',
       '--no-session-persistence',
       '--permission-mode',
       'dontAsk',
@@ -100,6 +99,7 @@ export class ClaudeCliProvider implements LLMProvider {
     const res = await this.run(this.bin, args, {
       stdin: prompt,
       cwd: this.workDir(),
+      env: childEnv(),
       timeoutMs: this.timeoutMs,
     });
 
