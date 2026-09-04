@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { ProviderError } from '../../src/llm/types.js';
 import type { UsageRecord } from '../../src/usage/types.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from '../../src/review/budget.js';
 
 interface Call {
   url: string;
@@ -27,6 +28,44 @@ function fakeFetch(responses: Response[]) {
 }
 
 const ok = () => jsonResponse({ choices: [{ message: { role: 'assistant', content: 'hello there' } }] });
+
+describe('Qwen review budget', () => {
+  const req = { messages: [{ role: 'user' as const, content: 'review this' }], reviewBudget: true, maxTokens: REVIEW_MAX_OUTPUT };
+
+  it('enforces routing prices and counts UTF-8 bytes before making a request', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, reasoningEffort: 'high' });
+    await p.complete(req);
+    const body = JSON.parse(String(f.calls[0]!.init.body));
+    expect(body.provider).toEqual({ sort: 'price', require_parameters: true, allow_fallbacks: false, max_price: { prompt: 0.4, completion: 2, request: 0 } });
+    expect(body.reasoning).toBeUndefined();
+    const huge = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(20000) }] };
+    expect(reviewCostUpperBound(huge)).toBeGreaterThan(REVIEW_MAX_USD);
+    await expect(p.complete(huge)).rejects.toThrow('$0.05');
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('does not retry an ambiguous network failure or server failure', async () => {
+    for (const failure of [new Error('timeout'), jsonResponse({}, 503)]) {
+      let calls = 0;
+      const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: (async () => {
+        calls++;
+        if (failure instanceof Error) throw failure;
+        return failure;
+      }) as typeof fetch, sleep: async () => {} });
+      await expect(p.complete(req)).rejects.toThrow();
+      expect(calls).toBe(1);
+    }
+  });
+
+  it('records billed usage but rejects a truncated response', async () => {
+    const seen: UsageRecord[] = [];
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'length' }], usage: { prompt_tokens: 100, completion_tokens: 8000, cost: 0.01604 } })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, onUsage: (r) => seen.push(r) });
+    await expect(p.complete(req)).rejects.toThrow('incomplete review');
+    expect(seen[0]?.costUsd).toBe(0.01604);
+  });
+});
 
 describe('OpenRouterProvider', () => {
   it('exposes name, model and concurrency', () => {

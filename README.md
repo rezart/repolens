@@ -101,6 +101,14 @@ Prefer `message` over concatenating deltas: the Codex CLI can only stream a prev
 
 ## Using it
 
+With `LLM_PROVIDER=openrouter` and `LLM_MODEL=qwen/qwen3-coder`, a review uses one request for all files and the summary. Shared context is sent once, and retrieval uses the local lexical index without paid query embeddings. Other models keep the per-file pipeline.
+
+Qwen review requests reserve at most **$0.045**, below the $0.05 per-run limit: UTF-8 bytes conservatively bound input tokens (plus message overhead), output is limited to 8,000 tokens, and OpenRouter routing is capped at $0.40/M input and $2/M output with no per-request fee. Retries and provider fallbacks are disabled to avoid duplicate charges after an ambiguous failure. If no provider meets those prices, the run fails rather than exceeding the budget. This covers review inference, not separate repository indexing jobs.
+
+All selected file diffs are included in full; optional post-change and indexed context is added only while it fits. Reviews exceeding the budget or the 40-file limit fail with an explicit error asking for a smaller PR. Truncated responses or responses missing a reviewed path also fail without posting or caching a clean review.
+
+Run the opt-in paid check with `node --env-file=.env --import tsx scripts/check-review-cost.ts`. It sends only generated synthetic code, reviews 40 files, checks for a planted authorization bug in the last file, asserts the reported cost is at most $0.05, and never posts to GitHub. A run on 2026-09-04 cost **$0.00608** (23,749 input tokens, 509 output tokens), with a conservative reservation of $0.04278.
+
 Set `REPOLENS_API_TOKEN` in `.env`; the API and dashboard use it as a bearer token.
 
 ```bash

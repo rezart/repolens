@@ -12,6 +12,8 @@ export interface CompleteRequest {
   json?: boolean;
   maxTokens?: number;
   temperature?: number;
+  /** Single-request Qwen review budget; disables retries and caps routing prices. */
+  reviewBudget?: boolean;
 }
 
 /** Receives incremental text as the model produces it. */

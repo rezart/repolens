@@ -123,6 +123,17 @@ describe('createRetriever', () => {
     expect(one).toHaveLength(1);
   });
 
+  it('does not buy query embeddings for lexical-only reviews', async () => {
+    const { auth } = seed(db);
+    db.ensureVecTable(3);
+    let calls = 0;
+    const embeddings = fakeEmbeddings([1, 0, 0]);
+    embeddings.embed = async () => { calls++; return [[1, 0, 0]]; };
+    const hits = await createRetriever({ db, embeddings })({ repoIds: [REPO], query: 'token verification', lexicalOnly: true });
+    expect(hits.map((h) => h.chunkId)).toContain(auth);
+    expect(calls).toBe(0);
+  });
+
   it('honours excludePaths, on top of excludePath', async () => {
     seed(db);
     const retrieve = createRetriever({ db });
