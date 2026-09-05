@@ -144,7 +144,7 @@ npm run cli -- review github:owner/name --all --post  # every unreviewed open PR
 
 RepoLens can learn about new changes two ways. **Polling** (default, every 5 minutes) needs no inbound network access: it reindexes when the tracked branch moves and reviews any open, non-draft PR whose head commit hasn't been reviewed. **Webhooks** react instantly but need the server reachable from the internet (a reverse proxy or a Cloudflare Tunnel). Both can be on at once; reviews are deduped by head commit.
 
-1. Create a token with `repo` scope (classic PAT) or a fine-grained token with *Contents: read*, *Pull requests: read & write* and *Commit statuses: read & write* (the last one for the [blocking check](#blocking-merges-on-the-review)). Put it in `GITHUB_TOKEN`. Private repos are cloned with this token.
+1. For a dedicated bot identity, [configure a GitHub App](docs/INTEGRATION.md#github-app-authentication). Alternatively, create a token with `repo` scope (classic PAT) or a fine-grained token with *Contents: read*, *Pull requests: read & write* and *Commit statuses: read & write* (the last one for the [blocking check](#blocking-merges-on-the-review)). Put it in `GITHUB_TOKEN`. Private repos are cloned with this token.
 2. (Webhooks only) In the repository (or org) settings add a webhook:
    - Payload URL: `https://<your host>/webhooks/github`
    - Content type: `application/json`
@@ -190,7 +190,10 @@ See `.env.example` for every variable. The important ones:
 | `LLM_MODEL` | | Model id (OpenRouter) or model name (CLIs, optional) |
 | `LLM_TIMEOUT_MS` | `300000` | Per-completion timeout |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | OpenRouter / empty / empty | OpenAI-compatible embeddings. Blank model = lexical only |
-| `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews |
+| `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews (PAT fallback) |
+| `GITHUB_APP_ID` | | GitHub App ID; App authentication takes precedence over the PAT |
+| `GITHUB_APP_INSTALLATION_ID` | | Installation ID for this instance's account |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | | Path to the App's RSA PEM private key; all three App fields are required |
 | `GITHUB_WEBHOOK_SECRET` | | Verifies webhook payloads. The webhook endpoint refuses requests until this is set |
 | `REVIEW_BOT_HANDLE` | `@repolens` | Mention that triggers PR chat |
 | `REPOLENS_POLL_INTERVAL` | `300` | Seconds between GitHub polls for new commits and PRs. `0` disables polling |
