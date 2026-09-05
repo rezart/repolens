@@ -169,7 +169,7 @@ function matchesIgnorePattern(path: string, patterns: string[]): boolean {
 /** Detect standard generated-file notices in the first five diff lines. */
 export function hasGeneratedHeader(file: DiffFile): boolean {
   return file.hunks.flatMap((hunk) => hunk.lines)
-    .filter((line) => line.newLine !== undefined && line.newLine <= 5)
+    .filter((line) => (line.newLine ?? line.oldLine) !== undefined && (line.newLine ?? line.oldLine)! <= 5)
     .some((line) => /^\s*(?:(?:\/\/|#|;|--)\s*)?(?:code\s+generated\b.*\bdo not edit\b.*|@generated\b.*)$/i.test(line.content));
 }
 
