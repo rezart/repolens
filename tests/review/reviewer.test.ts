@@ -17,16 +17,86 @@ import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
 import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
 import {
-  reviewPullRequest,
+  reviewPullRequest as runReviewPullRequest,
   ReviewSupersededError,
   isReviewablePath,
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
   statusForFindings,
+  selectPostedFindings,
+  parseFindings,
   type ReviewDeps,
   type Finding,
 } from '../../src/review/reviewer.js';
+
+describe('review finding posting', () => {
+  it('keeps at most three root causes and folds related locations into the strongest comment', () => {
+    const finding = (path: string, line: number, severity: Finding['severity'], rootCause: string): Finding => ({
+      path, line, severity, title: `${rootCause} at ${path}`, body: 'Fix it.', rootCause,
+      category: 'correctness', confidence: 'high', evidence: { path, line, trigger: 'input', consequence: 'failure' },
+    });
+    const selected = selectPostedFindings([
+      finding('a.ts', 1, 'warning', 'shared'), finding('b.ts', 2, 'critical', 'shared'),
+      finding('c.ts', 3, 'warning', 'second'), finding('d.ts', 4, 'nit', 'third'), finding('e.ts', 5, 'warning', 'fourth'),
+    ]);
+    expect(selected).toHaveLength(3);
+    expect(selected[0]).toMatchObject({ path: 'b.ts', line: 2, rootCause: 'shared' });
+    expect(selected[0]!.body).toContain('Related locations: a.ts:1');
+    expect(selected.map((f) => f.rootCause)).toEqual(['shared', 'second', 'fourth']);
+  });
+});
+
+describe('fresh finding evidence validation', () => {
+  const file = parseUnifiedDiff(DIFF).find((entry) => entry.newPath === 'src/app.ts')!;
+  const base = { line: 4, severity: 'warning', category: 'correctness', confidence: 'high', rootCause: 'bad guard',
+    evidence: { path: 'src/app.ts', line: 4, trigger: 'n is zero', consequence: 'the guard assigns instead of compares' }, title: 'Bad guard', body: 'Use ===.' };
+
+  it('rejects an unknown category', () => {
+    expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'style' }] }), file)).toThrow('category');
+  });
+
+  it('rejects evidence that does not cite the changed finding line', () => {
+    expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, evidence: { ...base.evidence, line: 3 } }] }), file)).toThrow('evidence');
+  });
+
+  it('requires an exact repository rule citation', () => {
+    expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'repository_rule' }] }), file)).toThrow('evidence');
+    expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'repository_rule', evidence: { ...base.evidence, rule: { path: 'CLAUDE.md', line: 0, quote: '' } } }] }), file)).toThrow('evidence');
+  });
+
+  it('suppresses repository-rule findings whose base rule citation is fabricated', async () => {
+    const llm = fakeLlm({ file: JSON.stringify({ findings: [{ ...base, category: 'repository_rule', evidence: {
+      ...base.evidence, rule: { path: 'CLAUDE.md', line: 999, quote: 'made up rule' },
+    } }] }) });
+    const ruleDb = openDb(':memory:');
+    ruleDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    ruleDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const result = await reviewPullRequest({ db: ruleDb, llm: llm.provider, retrieve: retrieveOne, github: fakeGithub().github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    ruleDb.close();
+    expect(result.findings).toEqual([]);
+    expect(result.warnings.some((warning) => warning.includes('Suppressed repository rule finding'))).toBe(true);
+  });
+
+  it('deduplicates an entire root-cause group on a rerun', async () => {
+    const findings = [
+      { ...base, line: 4, title: 'Shared issue A' },
+      { ...base, line: 3, title: 'Shared issue B', evidence: { ...base.evidence, line: 3 } },
+    ];
+    const makeLlm = () => fakeLlm({ file: JSON.stringify({ findings }) });
+    const ruleDb = openDb(':memory:');
+    ruleDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    ruleDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const firstGithub = fakeGithub();
+    await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: firstGithub.github }, { repoId: REPO_ID, prNumber: 42 });
+    const firstComment = firstGithub.reviews[0]!.input.comments[0]!;
+    const secondGithub = fakeGithub(DIFF, PR, { existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
+    const second = await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: secondGithub.github }, { repoId: REPO_ID, prNumber: 42, force: true });
+    expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
+    expect(second.warnings).toContain('Skipped 2 findings already commented');
+    ruleDb.close();
+  });
+});
 
 const REPO_ID = 'github:o/r';
 
@@ -203,6 +273,41 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
 }
 
 const retrieveOne: RetrieveFn = async () => [CHUNK];
+
+// Existing fixtures predate mandatory evidence. Keep them focused on their original
+// behavior while production parsing remains strict; new contract tests use explicit fields.
+function enrichLegacyFindingResponse(raw: string, request: CompleteRequest): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return raw; }
+  const findings = Array.isArray(parsed) ? parsed : parsed && typeof parsed === 'object' && Array.isArray((parsed as { findings?: unknown }).findings)
+    ? (parsed as { findings: unknown[] }).findings : null;
+  if (!findings) return raw;
+  const fileMatch = request.messages[0]?.content.match(/File under review: ([^ (]+)/);
+  const files = fileMatch ? [fileMatch[1]!] : [];
+  const enriched = findings.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    const finding = item as Record<string, unknown>;
+    const path = typeof finding.path === 'string' ? finding.path : files[0] ?? 'unknown.ts';
+    const line = typeof finding.line === 'number' ? finding.line : Number(finding.line);
+    return {
+      ...finding,
+      category: finding.category ?? 'correctness',
+      confidence: finding.confidence ?? 'high',
+      rootCause: finding.rootCause ?? `${path}:${line}:${String(finding.title ?? '')}`,
+      evidence: finding.evidence ?? { path, line, trigger: 'fixture input', consequence: 'fixture behavior changes' },
+    };
+  });
+  return JSON.stringify(Array.isArray(parsed) ? enriched : { ...(parsed as object), findings: enriched });
+}
+
+function reviewPullRequest(deps: ReviewDeps, opts: Parameters<typeof runReviewPullRequest>[1]) {
+  const wrap = (llm: LLMProvider): LLMProvider => ({
+    ...llm,
+    async complete(req) { return enrichLegacyFindingResponse(await llm.complete(req), req); },
+    reviewFallbacks: llm.reviewFallbacks?.map(wrap),
+  });
+  return runReviewPullRequest({ ...deps, llm: wrap(deps.llm) }, opts);
+}
 
 function makeDeps(db: Db, overrides: Partial<ReviewDeps> = {}): ReviewDeps {
   const llm = fakeLlm();
@@ -799,9 +904,9 @@ describe('reviewPullRequest', () => {
     expect({ owner, repo, number }).toEqual({ owner: 'o', repo: 'r', number: 42 });
     expect(input.commitId).toBe('head-sha-1');
     expect(input.event).toBe('COMMENT');
-    expect(input.comments).toEqual([
-      { path: 'src/app.ts', line: 4, body: '**[critical] Assignment**\n\nUse `===`.' },
-    ]);
+    expect(input.comments).toHaveLength(1);
+    expect(input.comments[0]).toMatchObject({ path: 'src/app.ts', line: 4, body: expect.stringContaining('**[critical] Assignment**\n\nUse `===`.') });
+    expect(input.comments[0]!.body).toMatch(/repolens-root-cause:[a-f0-9]{16}/);
     expect(input.body).toContain('## RepoLens review');
     expect(input.body).toContain('| critical | src/app.ts:4 | Assignment |');
     expect(res.posted).toBe(true);
@@ -1073,9 +1178,8 @@ describe('reviewPullRequest', () => {
 
     expect(gh.listCalls).toEqual([{ owner: 'o', repo: 'r', number: 42 }]);
     expect(res.findings).toHaveLength(2);
-    expect(gh.reviews[0]!.input.comments).toEqual([
-      { path: 'src/app.ts', line: 3, body: '**[nit] Fresh one**\n\nnew' },
-    ]);
+    expect(gh.reviews[0]!.input.comments).toHaveLength(1);
+    expect(gh.reviews[0]!.input.comments[0]).toMatchObject({ path: 'src/app.ts', line: 3, body: expect.stringContaining('**[nit] Fresh one**\n\nnew') });
     expect(res.warnings).toContain('Skipped 1 findings already commented');
   });
 
