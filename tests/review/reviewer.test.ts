@@ -10,6 +10,7 @@ import type {
 } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
+import { UsageTracker } from '../../src/usage/tracker.js';
 import { JobQueue } from '../../src/jobs.js';
 import {
   reviewPullRequest,
@@ -201,9 +202,51 @@ describe('reviewPullRequest', () => {
   });
   afterEach(() => db.close());
 
+  it.each([
+    { costs: [0.012, 0.003, 0.004], expected: 0.019 },
+    { costs: [0, 0, 0], expected: 0 },
+    { costs: [0.012, null, 0.004], expected: null },
+    { costs: [0.012, undefined, 0.004], expected: null },
+    { costs: [[0.01, 0.002], 0.003, 0.004], expected: 0.019 },
+    { costs: [[0.01, 0.002], undefined, 0.004], expected: null },
+  ])('stores the review cost for $costs and preserves it on cache hits', async ({ costs, expected }) => {
+    const tracker = new UsageTracker({ db, pricing: null });
+    const fake = fakeLlm();
+    const record = { provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 };
+    const llm = { ...fake.provider, async complete(req: CompleteRequest) {
+      const costUsd = costs[fake.calls.length];
+      tracker.sinkFor('chat')({ ...record, costUsd: 1 });
+      for (const value of Array.isArray(costUsd) ? costUsd : [costUsd]) {
+        if (value !== undefined) tracker.sinkFor('review')({ ...record, costUsd: value });
+      }
+      return fake.provider.complete(req);
+    } };
+    const deps = makeDeps(db, { llm });
+    const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(fake.calls).toHaveLength(3); // modified file, deleted file, summary
+    expect(db.getReview(result.reviewId)?.cost_usd).toEqual(expected);
+    await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(fake.calls).toHaveLength(3);
+    expect(db.listReviews(REPO_ID)[0]?.cost_usd).toEqual(expected);
+  });
+
+  it('keeps concurrent review costs separate', async () => {
+    const tracker = new UsageTracker({ db, pricing: null });
+    const results = await Promise.all([0.01, 0.02].map(async (costUsd, i) => {
+      const fake = fakeLlm();
+      const llm = { ...fake.provider, async complete(req: CompleteRequest) {
+        await new Promise((resolve) => setTimeout(resolve, i ? 1 : 5));
+        tracker.sinkFor('review')({ provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd });
+        return fake.provider.complete(req);
+      } };
+      return reviewPullRequest(makeDeps(db, { llm }), { repoId: REPO_ID, prNumber: 42 + i, post: false });
+    }));
+    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.03, 0.06]);
+  });
+
   it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
     const paths = Array.from({ length: 40 }, (_, i) => `src/file${i}.ts`);
-    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+new\n`).join('');
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+${'n'.repeat(2000)}\n`).join('');
     const gh = fakeGithub(diff);
     const calls: CompleteRequest[] = [];
     const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 4, async complete(req) {
@@ -216,11 +259,12 @@ describe('reviewPullRequest', () => {
     const retrieve: RetrieveFn = async (req) => {
       expect(req.lexicalOnly).toBe(true);
       expect(req.excludePaths).toEqual(paths);
-      return [CHUNK, { ...CHUNK, chunkId: 2, content: '💸'.repeat(50000) }];
+      return [CHUNK, { ...CHUNK, chunkId: 2, content: '💸'.repeat(200000) }];
     };
     const result = await reviewPullRequest({ db, llm, retrieve, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.reviewBudget).toBe(true);
+    expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(0.045);
     expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
     expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(2);
     expect(result.findings).toHaveLength(2);
@@ -231,10 +275,10 @@ describe('reviewPullRequest', () => {
 
   it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => { throw new Error('must not call'); } };
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(20000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(150000)));
     let retrievals = 0;
     const retrieve: RetrieveFn = async () => { retrievals++; return [CHUNK]; };
-    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.05');
+    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.25');
     expect(retrievals).toBe(0);
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
@@ -832,6 +876,8 @@ describe('reviewPullRequest lineage', () => {
     const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content as string;
     expect(summary).toContain('First pass.');
     expect(summary).toContain('1 commit since that review');
+    expect(summary).toContain('Changes since the previous review');
+    expect(summary).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
     expect(result.warnings).toEqual([]);
   });

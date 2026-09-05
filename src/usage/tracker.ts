@@ -1,3 +1,4 @@
+import { reviewCallCost } from './review-cost.js';
 import type { Db, UsageDayRow } from '../db.js';
 import { OpenRouterPricing } from './pricing.js';
 import type { PriceList } from './pricing.js';
@@ -64,6 +65,11 @@ export class UsageTracker {
   /** The callback handed to a provider for one role. */
   sinkFor(role: UsageRole): UsageSink {
     return (record) => {
+      const cost = role === 'review' ? reviewCallCost.getStore() : undefined;
+      if (cost) {
+        cost.reported = true;
+        cost.costUsd = cost.costUsd === null || record.costUsd === null ? null : cost.costUsd + record.costUsd;
+      }
       try {
         this.db.insertUsage({
           role,

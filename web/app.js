@@ -979,6 +979,7 @@ function renderReviewList() {
       }),
       rv.verdict ? h('span', { class: 'badge badge-' + String(rv.verdict).toLowerCase().replace(/[^a-z]+/g, '-'), text: String(rv.verdict).replace(/_/g, ' ') }) : null,
       h('span', { class: 'pill pill-' + rv.status, text: rv.status }),
+      h('span', { class: 'review-cost', title: 'Reported inference cost for this review', text: typeof rv.cost_usd === 'number' ? 'Cost ' + fmtUsd(rv.cost_usd) : 'Cost unavailable' }),
       h('a', { class: 'review-time', href: '#' + anchor, title: 'Link to this review', text: fmtTime(rv.created_at) }),
       h('span', { class: 'review-posted ' + (rv.posted ? 'is-posted' : ''), text: rv.posted ? 'posted to GitHub' : 'not posted' }),
       rv.head_sha ? h('code', { text: String(rv.head_sha).slice(0, 8) }) : null,

@@ -16,6 +16,27 @@ function dashboard(withSanitizer = true) {
 }
 
 describe('dashboard Markdown security', () => {
+  it('preserves semantic Markdown without application data or ARIA attributes', () => {
+    const dom = dashboard();
+    try {
+      const node = dom.window.markdown([
+        '# Review',
+        '- **Important** change',
+        '```ts\ncheckAuth();\n```',
+        '| File | Status |\n| --- | --- |\n| auth.ts | reviewed |',
+        '<p data-action="delete" aria-hidden="true">Visible finding</p>',
+      ].join('\n\n'));
+      expect(node.querySelector('h1')?.textContent).toBe('Review');
+      expect(node.querySelector('li strong')?.textContent).toBe('Important');
+      expect(node.querySelector('pre code')?.textContent).toBe('checkAuth();\n');
+      expect(node.querySelector('td')?.textContent).toBe('auth.ts');
+      expect(node.textContent).toContain('Visible finding');
+      expect(node.querySelector('[data-action], [aria-hidden]')).toBeNull();
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it('keeps Markdown formatting but strips active HTML, obfuscated URLs and remote images', () => {
     const dom = dashboard();
     try {

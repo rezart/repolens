@@ -117,7 +117,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (req.reviewBudget) {
       if (this.model !== 'qwen/qwen3-coder' || streaming || !Number.isInteger(req.maxTokens) ||
           req.maxTokens! <= 0 || req.maxTokens! > REVIEW_MAX_OUTPUT || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
-        throw new ProviderError('openrouter', 'Review exceeds the $0.05 budget; split this pull request into smaller reviews.');
+        throw new ProviderError('openrouter', 'Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
       body.provider = {
         sort: 'price', require_parameters: true, allow_fallbacks: false,

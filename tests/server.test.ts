@@ -343,16 +343,30 @@ describe('API', () => {
   });
 
   describe('reviews', () => {
+    it('returns 429 without adding a job when the review queue is full', async () => {
+      deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
+      for (let i = 0; i < 100; i++) deps.jobs.enqueue('review', 'github:o/n', async () => new Promise(() => {}), { prNumber: i + 1 });
+      const before = deps.db.listJobs().length;
+      const res = await app.request('/api/reviews', {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ repository: 'github:o/n', prNumber: 101 }),
+      });
+      expect(res.status).toBe(429);
+      expect(deps.db.listJobs()).toHaveLength(before);
+    });
+
     it('pages past reviews newest first with a total', async () => {
       deps.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
       for (const n of [1, 2, 3]) {
         deps.db.insertReview({
           repo_id: 'github:o/n', pr_number: n, head_sha: 'h' + n, status: 'done', summary: null, verdict: null,
-          comments_json: '[]', posted: 0, error: null,
+          comments_json: '[]', posted: 0, error: null, cost_usd: n === 1 ? 0.00608 : null,
         });
       }
       const page = await (await app.request('/api/reviews?repository=github:o/n&limit=2&offset=2', { headers: auth })).json();
       expect(page.total).toBe(3);
+      expect(page.reviews[0].cost_usd).toBe(0.00608);
       expect(page.reviews.map((r: { pr_number: number }) => r.pr_number)).toEqual([1]);
       expect((await app.request('/api/reviews?limit=0', { headers: auth })).status).toBe(400);
     });
