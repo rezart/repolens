@@ -3,6 +3,7 @@ name: repolens
 services:
   repolens:
     image: ghcr.io/rezart/repolens:main
+    pull_policy: always
     container_name: repolens
     restart: unless-stopped
     ports:
