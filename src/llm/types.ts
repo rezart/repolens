@@ -14,6 +14,8 @@ export interface CompleteRequest {
   temperature?: number;
   /** Single-attempt review budget; disables retries and caps routing prices. */
   reviewBudget?: boolean;
+  /** Price route used by staged review calls. */
+  reviewStage?: 'initial' | 'escalation' | 'verification';
 }
 
 /** Receives incremental text as the model produces it. */

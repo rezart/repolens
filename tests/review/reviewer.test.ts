@@ -10,7 +10,7 @@ import type {
   PathCommit,
   HistoricalPullRequest,
 } from '../../src/review/github.js';
-import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
@@ -354,7 +354,12 @@ function reviewPullRequest(deps: ReviewDeps, opts: Parameters<typeof runReviewPu
     async complete(req) { return enrichLegacyFindingResponse(await llm.complete(req), req); },
     reviewFallbacks: llm.reviewFallbacks?.map(wrap),
   });
-  return runReviewPullRequest({ ...deps, llm: wrap(deps.llm) }, opts);
+  return runReviewPullRequest({
+    ...deps,
+    llm: wrap(deps.llm),
+    escalationLlm: deps.escalationLlm ? wrap(deps.escalationLlm) : undefined,
+    verifierLlm: deps.verifierLlm ? wrap(deps.verifierLlm) : undefined,
+  }, opts);
 }
 
 function makeDeps(db: Db, overrides: Partial<ReviewDeps> = {}): ReviewDeps {
@@ -1825,6 +1830,132 @@ describe('reviewPullRequest commit statuses', () => {
     const gh = fakeGithub(DIFF, { ...PR, htmlUrl: '' }, { createReviewError: () => new Error('nope') });
     await reviewPullRequest(deps(gh, llm, { publicUrl: 'https://repolens.example/' }), { repoId: REPO_ID, prNumber: 42 });
     expect(gh.statuses[0]!.input.targetUrl).toBe(`https://repolens.example/#/reviews/${REPO_ID}`);
+  });
+});
+
+describe('staged review', () => {
+  const diff = `diff --git a/src/mixed.ts b/src/mixed.ts
+--- a/src/mixed.ts
++++ b/src/mixed.ts
+@@ -1,2 +1,2 @@
+-const token = oldToken;
++const token = request.token;
+ context
+@@ -20 +20 @@
+-oldCall();
++newCall();
+`;
+  const paths = ['src/mixed.ts'];
+  const finding = (line: number, title: string, confidence = 'high') => ({
+    path: 'src/mixed.ts', line, severity: 'warning', title, body: `${title} body`, category: 'correctness', confidence,
+    rootCause: title, evidence: { path: 'src/mixed.ts', line, trigger: `${title} trigger`, consequence: `${title} consequence` },
+  });
+
+  it('rechecks only risky hunks, replaces their findings, and verifies every provisional finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      expect(req.reviewStage).toBe('initial');
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial allegation.', verdict: 'request_changes', findings: [
+        finding(1, 'Weak risky finding', 'medium'), finding(20, 'Keep low-risk finding'),
+      ] });
+    } };
+    const escalationCalls: CompleteRequest[] = [];
+    const escalationLlm: LLMProvider = { name: 'openrouter', model: 'moonshotai/kimi-k2.7-code', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      escalationCalls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, findings: [finding(1, 'Strong risky finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      expect(req.reviewStage).toBe('verification');
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string } }> };
+      expect(payload.findings.map((item) => item.finding.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
+      return JSON.stringify({ decisions: payload.findings.map(({ id }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.' })), summary: 'Two supported issues remain.', verdict: 'approve' });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+      expect(escalationCalls).toHaveLength(1);
+      expect(escalationCalls[0]!.reviewStage).toBe('escalation');
+      expect(escalationCalls[0]!.messages[0]!.content).toContain('request.token');
+      expect(escalationCalls[0]!.messages[0]!.content).not.toContain('+newCall();');
+      expect(result.findings.map((item) => item.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
+      expect(result.summary).toBe('Two supported issues remain.');
+      expect(result.verdict).toBe('comment');
+    } finally { testDb.close(); }
+  });
+
+  it('does not call staged models for low-risk changes with no findings', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const lowDiff = diff.replace('const token = request.token;', 'newValue();').replace('const token = oldToken;', 'oldValue();').split('@@ -20')[0]!;
+    let staged = 0;
+    const llm: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'No issues.', verdict: 'approve', findings: [] });
+    } };
+    const unused: LLMProvider = { ...llm, async complete() { staged++; return '{}'; } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm, escalationLlm: unused, verifierLlm: unused, retrieve: retrieveOne, github: fakeGithub(lowDiff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+      expect(staged).toBe(0);
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('fails closed when verification omits a finding decision', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const llm: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      if (req.system === VERIFIER_SYSTEM_PROMPT) return JSON.stringify({ decisions: [], summary: 'Missing.', verdict: 'approve' });
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'comment', findings: [finding(20, 'Finding')] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm, verifierLlm: llm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false })).rejects.toThrow('verification');
+      expect(testDb.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+    } finally { testDb.close(); }
+  });
+
+  it('suppresses contradicted and marginal findings and uses the verifier summary', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Stale allegations.', verdict: 'request_changes', findings: [
+        finding(1, 'Contradicted'), finding(20, 'Marginal', 'medium'),
+      ] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [finding(1, 'Contradicted')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      return JSON.stringify({
+        decisions: [
+          { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.' },
+          { id: 1, decision: 'supported', explanation: 'The code supports it, but confidence remains marginal.' },
+        ],
+        summary: 'Two issues remain.', verdict: 'approve',
+      });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+      expect(result.findings).toEqual([]);
+      expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
+      expect(result.verdict).toBe('approve');
+    } finally { testDb.close(); }
+  });
+
+  it('shares the total budget with escalation and fails before an over-budget strong call', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const tracker = new UsageTracker({ db: testDb, pricing: null });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.24 });
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    let strongCalls = 0;
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete() { strongCalls++; return '{}'; } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false })).rejects.toThrow('budget');
+      expect(strongCalls).toBe(0);
+      expect(testDb.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+    } finally { testDb.close(); }
   });
 });
 

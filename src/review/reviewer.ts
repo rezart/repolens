@@ -19,6 +19,8 @@ import {
   SUMMARY_SYSTEM_PROMPT,
   FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT,
   FOLLOWUP_SUMMARY_SYSTEM_PROMPT,
+  ESCALATION_SYSTEM_PROMPT,
+  VERIFIER_SYSTEM_PROMPT,
   buildFileReviewMessage,
   buildSummaryMessage,
   renderHistoricalContext,
@@ -88,6 +90,10 @@ export interface ReviewResult {
 export interface ReviewDeps {
   db: Db;
   llm: LLMProvider;
+  /** Optional stronger backend used only for risky hunks. */
+  escalationLlm?: LLMProvider;
+  /** Optional cheap backend used to verify provisional findings. */
+  verifierLlm?: LLMProvider;
   retrieve: RetrieveFn;
   github: Pick<
     GitHubClient,
@@ -510,6 +516,22 @@ function allowedFindingLines(file: DiffFile): Set<number> {
   return new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
 }
 
+function hasExactReviewedPaths(value: unknown, paths: string[]): boolean {
+  return Array.isArray(value) && value.length === paths.length &&
+    value.every((path) => typeof path === 'string') && new Set(value).size === paths.length &&
+    paths.every((path) => value.includes(path));
+}
+
+function findingLine(finding: Finding): number {
+  return finding.evidence?.line ?? finding.line;
+}
+
+function hunkContainsLine(file: DiffFile, hunkIndex: number, line: number): boolean {
+  const hunk = file.hunks[hunkIndex];
+  if (!hunk) return false;
+  return hunk.lines.some((item) => item.newLine === line || item.oldLine === line);
+}
+
 export function parseFindings(raw: string, file: DiffFile): Finding[] {
   const parsed = extractJson(raw) as { findings?: unknown } | unknown[];
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
@@ -758,15 +780,24 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
 
 export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
   const { db, llm, retrieve, github } = deps;
+  const escalationLlm = deps.escalationLlm;
+  const verifierLlm = deps.verifierLlm;
   let activeLlm = llm;
   let costUsd: number | null = 0;
-  const completeCall = async (req: CompleteRequest): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
+  let reservedUsd = 0;
+  let usedUsd = 0;
+  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
+    const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
+    if (req.reviewBudget && reservedUsd + estimate > REVIEW_MAX_USD) {
+      throw new Error(`Review stage exceeds the remaining $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
+    }
+    reservedUsd += estimate;
     const call = { reported: false, costUsd: 0 as number | null };
     let raw: string | undefined;
     let error: unknown;
     let threw = false;
     try {
-      raw = await reviewCallCost.run(call, () => activeLlm.complete(req));
+      raw = await reviewCallCost.run(call, () => provider.complete(req));
     } catch (err) {
       threw = true;
       error = err;
@@ -774,7 +805,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const next = costUsd !== null && call.reported && call.costUsd !== null ? costUsd + call.costUsd : null;
       costUsd = next !== null && Number.isFinite(next) ? next : null;
     }
-    return { raw, error: threw ? error : undefined, failed: threw, costUsd: call.reported && call.costUsd !== null ? call.costUsd : null };
+    const validCost = call.reported && call.costUsd !== null && Number.isFinite(call.costUsd) && call.costUsd >= 0;
+    if (req.reviewBudget && validCost) {
+      usedUsd += call.costUsd!;
+      reservedUsd += call.costUsd! - estimate;
+    }
+    if (req.reviewBudget && reservedUsd > REVIEW_MAX_USD) {
+      return { raw, error: new Error(`Review exceeds the $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null };
+    }
+    return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null };
   };
   const complete = async (req: CompleteRequest) => {
     const result = await completeCall(req);
@@ -1073,6 +1112,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       if (sha && sha !== pr.headSha) throw new ReviewSupersededError(pr.headSha, sha);
     };
 
+    const relevantContextByPath = new Map<string, string>();
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
@@ -1087,7 +1127,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath ?? f.oldPath!) : undefined,
           })),
         }) }],
-        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true,
+        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true, reviewStage: 'initial',
       };
       const maxRetries = deps.maxRetries ?? 3;
       // Reject the core prompt before the retrieval loop or any inference call.
@@ -1123,6 +1163,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
           const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
+          relevantContextByPath.set(path, formatContext(selected));
           for (const chunk of selected) {
             if (seen.has(chunk.chunkId)) continue;
             seen.add(chunk.chunkId);
@@ -1136,34 +1177,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let providerIndex = 0;
-      const attemptCost = reviewCostUpperBound(req);
-      let reservedUsd = 0;
-      let usedUsd = 0;
       let lastRetryError: unknown;
       for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
-        if (reservedUsd + attemptCost > REVIEW_MAX_USD) {
-          const cause = lastRetryError ? ` Last retry error: ${errMessage(lastRetryError)}.` : '';
-          throw new Error(
-            `Review retry exceeds the remaining $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${attemptCost.toFixed(6)}.${cause} no review was published.`,
-          );
-        }
-        // Reserve the upper bound before sending; only validated billing can release it.
-        reservedUsd += attemptCost;
         try {
           const call = await completeCall(req);
-          if (call.costUsd !== null) {
-            usedUsd += call.costUsd;
-            reservedUsd += call.costUsd - attemptCost;
-          }
           if (call.failed) throw call.error;
-          if (reservedUsd > REVIEW_MAX_USD) {
-            throw new Error(`Review exceeds the $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`);
-          }
           const obj = extractJson(call.raw!) as Record<string, unknown>;
           if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
-              !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
-              files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath ?? f.oldPath)) ||
+              !toVerdict(obj.verdict) || !hasExactReviewedPaths(obj.reviewedPaths, files.map((f) => f.newPath ?? f.oldPath!)) ||
               obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
             throw new IncompleteResponseError(activeLlm.name, 'Incomplete review response; no review was published.');
           }
@@ -1180,7 +1202,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         } catch (err) {
           const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
             err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
-          if (!retryable || attempt >= maxRetries) throw err;
+          if (!retryable || attempt >= maxRetries) {
+            if (lastRetryError && /budget/i.test(errMessage(err))) {
+              throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
+            }
+            throw err;
+          }
           lastRetryError = err;
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
@@ -1202,6 +1229,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         // Excluding every changed path keeps pre-change chunks of this PR's files
         // out of the prompt; their post-change content is in `headContext` instead.
         context = formatContext(await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths));
+        relevantContextByPath.set(path, context);
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
       }
@@ -1241,14 +1269,118 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     });
 
     let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    let stagedSummary: string | undefined;
+    let stagedVerdict: Verdict | undefined;
+
+    const riskyFiles = files.flatMap((file) => {
+      const hunks = file.hunks.filter((_, index) => {
+        const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });
+        return risk.score >= 4 || risk.signals.includes('security');
+      });
+      return hunks.length ? [{ ...file, hunks }] : [];
+    });
+    if (escalationLlm && riskyFiles.length) {
+      await assertHeadUnchanged();
+      const paths = riskyFiles.map((file) => file.newPath ?? file.oldPath!);
+      const escalationPayload = {
+        prTitle: pr.title,
+        prBody: pr.body,
+        files: riskyFiles.map((file) => {
+          const path = file.newPath ?? file.oldPath!;
+          return {
+            path, status: file.status, risk: assessChange(file), diff: hunkText(file, Infinity),
+            allowedFindingLines: [...allowedFindingLines(file)].sort((a, b) => a - b),
+            headContext: buildHeadContext({ path, addedText: hunkText(file, Infinity), headContents, exportsByPath }),
+            relevantContext: relevantContextByPath.get(path) ?? '',
+            historical: renderHistoricalContext(historyFor(file.oldPath, file.newPath)),
+          };
+        }),
+        rules,
+        provisionalFindings: findings.filter((finding) => riskyFiles.some((file) =>
+          (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding)))),
+      };
+      const call = await completeCall({
+        system: ESCALATION_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
+        json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'escalation',
+      }, escalationLlm);
+      if (call.failed) throw call.error;
+      const obj = extractJson(call.raw!) as Record<string, unknown>;
+      if (!obj || !Array.isArray(obj.findings) || !hasExactReviewedPaths(obj.reviewedPaths, paths) ||
+          obj.findings.some((finding: unknown) => !finding || typeof finding !== 'object' || !paths.includes((finding as { path?: string }).path ?? ''))) {
+        throw new IncompleteResponseError(escalationLlm.name, 'Incomplete escalation response; no review was published.');
+      }
+      let escalated: Finding[];
+      try {
+        escalated = riskyFiles.flatMap((file) => parseFindings(JSON.stringify({
+          findings: (obj.findings as Array<{ path?: string }>).filter((finding) => finding.path === (file.newPath ?? file.oldPath)),
+        }), file));
+      } catch (err) {
+        throw new IncompleteResponseError(escalationLlm.name, `Invalid escalation response: ${errMessage(err)}`);
+      }
+      findings = findings.filter((finding) => !riskyFiles.some((file) =>
+        (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding))));
+      findings.push(...escalated);
+      findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+      if (!findings.length) {
+        stagedSummary = 'The review found no actionable issues in the supplied changes.';
+        stagedVerdict = 'approve';
+      }
+    }
+
+    const findingsBeforeRuleValidation = findings.length;
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
+    if (findingsBeforeRuleValidation && !findings.length) {
+      stagedSummary = 'The review found no actionable issues in the supplied changes.';
+      stagedVerdict = 'approve';
+    }
+    if (verifierLlm && findings.length) {
+      await assertHeadUnchanged();
+      const verifierFiles = files.flatMap((file) => {
+        const path = file.newPath ?? file.oldPath!;
+        const lines = findings.filter((finding) => finding.path === path).map(findingLine);
+        const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
+        return hunks.length ? [{
+          path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
+          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), headContents, exportsByPath }),
+          relevantContext: relevantContextByPath.get(path) ?? '',
+        }] : [];
+      });
+      const call = await completeCall({
+        system: VERIFIER_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: JSON.stringify({
+          prTitle: pr.title, prBody: pr.body, rules, files: verifierFiles,
+          findings: findings.map((finding, id) => ({ id, finding })),
+        }) }],
+        json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',
+      }, verifierLlm);
+      if (call.failed) throw call.error;
+      const obj = extractJson(call.raw!) as Record<string, unknown>;
+      const verdict = toVerdict(obj?.verdict);
+      const summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
+      const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
+      const ids = decisions.map((decision) => decision.id);
+      if (!summary || !verdict || decisions.length !== findings.length || new Set(ids).size !== findings.length ||
+          ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
+          decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
+            typeof decision.explanation !== 'string' || !decision.explanation.trim())) {
+        throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
+      }
+      const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
+      findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
+      stagedSummary = findings.length ? summary : 'The review found no actionable issues in the supplied changes.';
+      stagedVerdict = verdict;
+    }
     const hasCritical = findings.some((f) => f.severity === 'critical');
 
     await assertHeadUnchanged();
     let summary = '';
     let verdict: Verdict = 'comment';
     try {
-      if (batch) {
+      if (stagedSummary) {
+        summary = stagedSummary;
+        verdict = stagedVerdict ?? 'comment';
+      } else if (batch) {
         summary = batch.summary;
         verdict = batch.verdict;
       } else {
@@ -1281,7 +1413,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       log(`review: ${msg}`);
       throw new Error(`summary review failed: ${errMessage(err)}`);
     }
-    if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
+    if (stagedSummary) verdict = hasCritical ? 'request_changes' : findings.length ? 'comment' : 'approve';
+    else if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
 
     if (!repo.last_commit) {
       warnings.push('Repository has not been indexed; review ran without codebase context.');

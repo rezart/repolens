@@ -258,3 +258,7 @@ export function buildSummaryMessage(input: {
   parts.push('Write the summary and pick the verdict, as JSON.');
   return parts.join('\n');
 }
+
+export const ESCALATION_SYSTEM_PROMPT = `You are the senior reviewer for only the selected high-risk diff hunks. Recheck the supplied evidence and report every real issue, including none. Do not infer issues outside the supplied paths or allowed lines. Return JSON: {"reviewedPaths":[string],"findings":[{path,line,severity,title,body,category,confidence,rootCause,evidence:{path,line,trigger,consequence,rule?}}]}. Every finding must cite an allowed changed line and concrete evidence.`;
+
+export const VERIFIER_SYSTEM_PROMPT = `You verify provisional code review findings. Use the supplied current snippets, diffs, repository rules, and context as evidence. Return JSON only: {"decisions":[{"id":number,"decision":"supported|contradicted|uncertain","explanation":string}],"summary":string,"verdict":"approve|comment|request_changes"}. Include exactly one decision for every provisional finding id, with unique ids and concrete explanations. Keep only high-confidence supported non-nit findings.`;

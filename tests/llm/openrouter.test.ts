@@ -48,6 +48,14 @@ describe('OpenRouter review budget', () => {
     expect(f.calls).toHaveLength(1);
   });
 
+  it('allows the higher configured price ceiling only for escalation', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
+    await p.complete({ ...req, reviewStage: 'escalation' });
+    const body = JSON.parse(String(f.calls[0]!.init.body));
+    expect(body.provider.max_price).toEqual({ prompt: 1, completion: 4, request: 0 });
+  });
+
   it('does not retry an ambiguous network failure or server failure', async () => {
     for (const failure of [new Error('timeout'), jsonResponse({}, 503)]) {
       let calls = 0;

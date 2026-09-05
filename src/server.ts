@@ -25,6 +25,9 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const usage = new UsageTracker({ db, pricing, log });
   // Reviews get the configured reasoning budget.
   const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
+  const escalationLlm = config.llm.provider === 'openrouter' && config.review.escalationModel && config.review.escalationModel !== llm.model
+    ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
+    : undefined;
   // Chat always gets its own provider so it pins effort to 'low' rather than
   // inheriting the review budget, even when it runs on the same provider/model.
   // Measured on the Claude CLI with haiku, the default budget spends ~17s thinking
@@ -41,7 +44,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
+  return { config, db, llm, escalationLlm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {
