@@ -84,6 +84,9 @@ const SKIP_DIRS = new Set([
   'coverage',
   '.idea',
   '.vscode',
+  'generated',
+  'gen',
+  '__generated__',
 ]);
 
 const SKIP_BASENAMES = new Set([
@@ -167,6 +170,7 @@ export function shouldIndex(path: string, size: number): boolean {
   if (SKIP_BASENAMES.has(base)) return false;
   const lower = base.toLowerCase();
   if (lower.endsWith('.min.js') || lower.endsWith('.min.css') || lower.endsWith('.map')) return false;
+  if (/(?:\.generated|\.gen|_generated|\.pb)\.[^.]+$/.test(lower)) return false;
   if (BINARY_EXTS.has(extension(path))) return false;
   return detectLanguage(path) !== null;
 }

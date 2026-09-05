@@ -1,4 +1,5 @@
 import type { Db, RepoRow } from '../db.js';
+import { matchesGlob } from 'node:path';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
@@ -10,6 +11,7 @@ import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import { buildLineage, deltaForFile, type Lineage } from './lineage.js';
 import { buildHistoricalContext, type HistoricalPr } from './history.js';
+import { assessChange, selectReviewCandidates, type ChangeRisk } from './selection.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
@@ -60,6 +62,8 @@ export interface ReviewResult {
   reviewUrl?: string;
   skippedFiles: string[];
   warnings: string[];
+  /** Deterministic risk metadata for the reviewed candidate files. */
+  riskMetadata: Array<{ path: string; risk: ChangeRisk }>;
   /** The commit status reported on the PR head, when statuses are enabled. */
   status?: ReviewStatus;
 }
@@ -94,6 +98,8 @@ export interface ReviewDeps {
   failOn?: FailOn;
   /** Base URL of this RepoLens install, used as a status target when the PR has no URL. */
   publicUrl?: string;
+  /** Repository-relative globs excluded from review. */
+  ignorePatterns?: string[];
   log?: (msg: string) => void;
 }
 
@@ -114,6 +120,7 @@ const LOCKFILES = new Set([
   'yarn.lock',
   'pnpm-lock.yaml',
   'bun.lockb',
+  'bun.lock',
   'composer.lock',
   'gemfile.lock',
   'poetry.lock',
@@ -126,7 +133,7 @@ const LOCKFILES = new Set([
   'flake.lock',
 ]);
 
-const SKIP_DIRS = ['node_modules/', 'vendor/', 'dist/', 'build/', '.next/', 'out/', 'target/', 'coverage/', '.venv/'];
+const SKIP_DIRS = ['node_modules/', 'vendor/', 'dist/', 'build/', '.next/', 'out/', 'target/', 'coverage/', '.venv/', 'generated/', 'gen/', '__generated__/'];
 
 const BINARY_EXT = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'webp', 'avif', 'tiff', 'svgz',
@@ -138,16 +145,31 @@ const BINARY_EXT = new Set([
 ]);
 
 /** Files RepoLens will not spend an LLM call on. */
-export function isReviewablePath(path: string): boolean {
+function matchesIgnorePattern(path: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => {
+    try { return matchesGlob(path, pattern); } catch { return false; }
+  });
+}
+
+/** Detect standard generated-file notices in the first five diff lines. */
+export function hasGeneratedHeader(file: DiffFile): boolean {
+  return file.hunks.flatMap((hunk) => hunk.lines)
+    .filter((line) => line.newLine !== undefined && line.newLine <= 5)
+    .some((line) => /^\s*(?:(?:\/\/|#|;|--)\s*)?(?:code\s+generated\b.*(?:do not edit|automatically generated).*|@generated\b.*)$/i.test(line.content));
+}
+
+export function isReviewablePath(path: string, ignorePatterns: string[] = []): boolean {
   if (!path) return false;
   const lower = path.toLowerCase();
   const base = lower.slice(lower.lastIndexOf('/') + 1);
+  if (matchesIgnorePattern(path, ignorePatterns)) return false;
   if (LOCKFILES.has(base)) return false;
   if (SKIP_DIRS.some((d) => lower === d.slice(0, -1) || lower.startsWith(d) || lower.includes(`/${d}`))) return false;
   if (base.endsWith('.snap')) return false;
   if (/\.min\.(js|css|mjs|cjs)$/.test(base)) return false;
   if (/[.-]bundle\.js$/.test(base)) return false;
   if (base.endsWith('.map')) return false;
+  if (/(?:\.generated|\.gen|_generated|\.pb)\.[^.]+$/.test(base)) return false;
   const dot = base.lastIndexOf('.');
   if (dot > 0 && BINARY_EXT.has(base.slice(dot + 1))) return false;
   return true;
@@ -616,6 +638,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         posted: cached.posted === 1,
         skippedFiles: [],
         warnings: statusWarnings,
+        riskMetadata: [],
       };
       postCtx.llm = { name: cached.provider ?? 'unknown', model: cached.model ?? 'unknown' };
       if (post && cached.posted === 0) {
@@ -679,7 +702,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const reviewable: DiffFile[] = [];
     for (const f of parsed) {
       const path = f.newPath ?? f.oldPath;
-      if (f.binary || !path || !isReviewablePath(path)) {
+      if (f.binary || !path || hasGeneratedHeader(f) || !isReviewablePath(path, deps.ignorePatterns)) {
         const label = path ?? f.oldPath ?? '(unknown)';
         skippedFiles.push(label);
         continue;
@@ -688,7 +711,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         skippedFiles.push(path);
         continue;
       }
-      reviewable.push(f);
+      const candidate = selectReviewCandidates(f);
+      if (!candidate.file.hunks.length) {
+        skippedFiles.push(path);
+        continue;
+      }
+      reviewable.push(candidate.file);
     }
 
     const budgeted = llm.supportsBatchReview === true;
@@ -742,7 +770,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     // base branch, so without this the model judges new code against old exports.
     const headContents = new Map<string, string>();
     const fetchable = parsed
-      .filter((f) => f.status !== 'deleted' && !f.binary && f.newPath && isReviewablePath(f.newPath))
+      .filter((f) => f.status !== 'deleted' && !f.binary && !hasGeneratedHeader(f) && f.newPath && isReviewablePath(f.newPath, deps.ignorePatterns))
       .map((f) => f.newPath!);
     const toFetch = fetchable.slice(0, HEAD_FILES_MAX);
     if (fetchable.length > toFetch.length) {
@@ -1019,6 +1047,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       posted: false,
       skippedFiles,
       warnings,
+      riskMetadata: files.map((file) => ({ path: file.newPath ?? file.oldPath!, risk: assessChange(file) })),
     };
 
     postCtx.llm = activeLlm;

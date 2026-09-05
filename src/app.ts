@@ -171,6 +171,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           statusContext: deps.config.review.statusContext,
           failOn: deps.config.review.failOn,
           maxRetries: deps.config.review.maxRetries,
+          ignorePatterns: deps.config.review.ignorePatterns ?? [],
           publicUrl: deps.config.publicUrl,
           log: (m) => ctx.progress(m),
         },
