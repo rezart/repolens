@@ -203,23 +203,56 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 8).map((item) => item.chunk);
 }
 
-function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { query: string; symbols: string[] } {
+function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
   const pathTerms = stem.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
-  const testTerms = /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(path) ? ['test'] : [];
-  const symbols = [...new Set([...identifiers(changedText).slice(0, 8), ...pathTerms, ...testTerms])]
+  const symbols = [...new Set([...identifiers(changedText).slice(0, 3), ...pathTerms])]
     .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
-  return { query: [path, ...symbols].join(' '), symbols };
+  return { stem, symbols };
+}
+
+async function retrieveTargetedChunks(
+  retrieve: RetrieveFn,
+  repoId: string,
+  path: string,
+  changedText: string,
+  identifiers: (text: string) => string[],
+  excludePaths: string[],
+): Promise<RetrievedChunk[]> {
+  const targeted = contextQuery(path, changedText, identifiers);
+  const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 3);
+  const queries = [...changedSymbols];
+  const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
+  if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
+  if (!queries.length) queries.push(targeted.stem || path);
+  const chunks: RetrievedChunk[] = [];
+  for (const query of queries) {
+    chunks.push(...await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true }));
+  }
+  const symbols = [...changedSymbols, targeted.stem, 'test'];
+  const selected = selectRelevantChunks(chunks, symbols, path);
+  const testChunk = chunks.find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
+  if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
+    selected.pop();
+    selected.push(testChunk);
+  }
+  return [...new Map(selected.map((chunk) => [chunk.chunkId, chunk])).values()].slice(0, 8);
 }
 
 /** Root and ancestor rule files that can apply to the changed paths. */
 export function repositoryRulePaths(changedPaths: string[]): string[] {
-  const dirs = new Set<string>(['']);
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const add = (path: string) => { if (!seen.has(path)) { seen.add(path); paths.push(path); } };
   for (const path of changedPaths) {
     const parts = path.split('/');
-    for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const dir = parts.slice(0, i).join('/');
+      add(`${dir}/AGENTS.md`); add(`${dir}/CLAUDE.md`);
+    }
   }
-  return [...dirs].flatMap((dir) => ['AGENTS.md', 'CLAUDE.md'].map((name) => dir ? `${dir}/${name}` : name));
+  add('AGENTS.md'); add('CLAUDE.md');
+  return paths;
 }
 
 export function renderRepositoryRules(rules: Map<string, string>, baseSha: string): string {
@@ -248,6 +281,7 @@ const HEAD_CONTEXT_CHARS_MAX = 24_000;
 /** The reviewed file's own content is included in full only up to this size. */
 const OWN_HEAD_CHARS_MAX = 12_000;
 const RULE_FILES_MAX = 16;
+const RULE_REQUESTS_MAX = 128;
 const RULE_CHARS_MAX = 12_000;
 
 /** Module specifiers of `import`, `import()`, `export ... from` and `require()`. */
@@ -894,8 +928,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     // rules used to judge it. Keep the paths in the prompt as citations.
     const repositoryRules = new Map<string, string>();
     let rulesUsed = 0;
-    for (const rulePath of repositoryRulePaths(changedPaths).slice(0, RULE_FILES_MAX)) {
-      if (rulesUsed >= RULE_CHARS_MAX) break;
+    const rulePaths = repositoryRulePaths(changedPaths);
+    let ruleRequests = 0;
+    for (const rulePath of rulePaths) {
+      if (rulesUsed >= RULE_CHARS_MAX || ruleRequests >= RULE_REQUESTS_MAX || [...repositoryRules].length >= RULE_FILES_MAX) break;
+      ruleRequests++;
       try {
         const content = await github.getFileContent(repo.owner, repo.name, rulePath, pr.baseSha);
         if (!content?.trim()) continue;
@@ -907,6 +944,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         warnings.push(`rules: reading ${rulePath} at base failed: ${errMessage(err)}`);
       }
     }
+    if (ruleRequests < rulePaths.length && ruleRequests >= RULE_REQUESTS_MAX) warnings.push(`rules: skipped ${rulePaths.length - ruleRequests} candidate paths after ${RULE_REQUESTS_MAX} requests.`);
     const rules = renderRepositoryRules(repositoryRules, pr.baseSha);
 
     const historyFor = (...paths: Array<string | null>): HistoricalPr[] => {
@@ -1024,10 +1062,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const path = file.newPath ?? file.oldPath!;
         const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
-          const targeted = contextQuery(path, changedText, identifiers);
-          const chunks = await retrieve({ repoIds: [opts.repoId], query: targeted.query, limit: 8, excludePaths: changedPaths, lexicalOnly: true });
-          const symbols = targeted.symbols;
-          const selected = selectRelevantChunks(chunks, symbols, path);
+          const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
           for (const chunk of selected) {
             if (seen.has(chunk.chunkId)) continue;
             seen.add(chunk.chunkId);
@@ -1101,16 +1136,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const changedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content))
         .join('\n');
-      const targeted = contextQuery(path, changedText, identifiers);
-      const symbols = targeted.symbols;
-      const query = targeted.query;
       const headContext = buildHeadContext({ path, addedText: changedText, headContents, exportsByPath });
       let context = '';
       try {
         // Excluding every changed path keeps pre-change chunks of this PR's files
         // out of the prompt; their post-change content is in `headContext` instead.
-        const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePaths: changedPaths, lexicalOnly: true });
-        context = formatContext(selectRelevantChunks(chunks, symbols, path));
+        context = formatContext(await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths));
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
       }
