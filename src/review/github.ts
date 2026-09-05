@@ -101,11 +101,11 @@ export class GitHubClient {
   private async request(path: string, opts: RequestOptions = {}): Promise<RawResponse> {
     const method = opts.method ?? 'GET';
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.token}`,
       Accept: opts.accept ?? 'application/vnd.github+json',
       'X-GitHub-Api-Version': API_VERSION,
       'User-Agent': USER_AGENT,
     };
+    if (this.token) headers.Authorization = `Bearer ${this.token}`;
     const init: RequestInit = { method, headers };
     if (opts.body !== undefined) {
       headers['Content-Type'] = 'application/json';
