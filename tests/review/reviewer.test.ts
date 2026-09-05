@@ -10,7 +10,7 @@ import type {
   PathCommit,
   HistoricalPullRequest,
 } from '../../src/review/github.js';
-import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
@@ -106,7 +106,7 @@ function fakeLlm(opts: FakeLlmOptions = {}) {
         const f = opts.file ?? '{"findings":[]}';
         return typeof f === 'function' ? f() : f;
       }
-      if (req.system === SUMMARY_SYSTEM_PROMPT) {
+      if (req.system === SUMMARY_SYSTEM_PROMPT || req.system === FOLLOWUP_SUMMARY_SYSTEM_PROMPT) {
         return opts.summary ?? '{"summary":"Adds a guard to run().","verdict":"comment"}';
       }
       throw new Error('unexpected system prompt');
@@ -1296,13 +1296,35 @@ describe('reviewPullRequest lineage', () => {
     expect(file).toContain('- [critical] src/app.ts:5 — Assignment in condition');
     expect(file).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(file).toContain('- head-sh fix: compare');
-    const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content as string;
-    expect(summary).toContain('First pass.');
+    const summaryRequest = llm.calls.find((c) => c.system === FOLLOWUP_SUMMARY_SYSTEM_PROMPT)!;
+    expect(summaryRequest.system).not.toContain('what the pull request changes');
+    const summary = summaryRequest.messages[0]!.content;
+    expect(summary).not.toContain('First pass.');
+    expect(summary).not.toContain(PR.body);
+    expect(summary).not.toContain('feat: run');
     expect(summary).toContain('1 commit since that review');
     expect(summary).toContain('Changes since the previous review');
     expect(summary).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
     expect(result.warnings).toEqual([]);
+  });
+
+  it('uses delta-only summary instructions for batch follow-ups', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done',
+      summary: 'Original PR overview.', verdict: 'comment', comments_json: '[]', posted: 1, error: null });
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, complete: async (req) => {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], findings: [],
+        summary: 'Since the previous review, the condition now checks equality.', verdict: 'approve' });
+    } };
+    const gh = fakeGithub(DIFF, PR, { compare: DELTA });
+    await reviewPullRequest(makeDeps(db, { llm, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
+    expect(calls[0]!.system).toBe(FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT);
+    expect(calls[0]!.system).not.toContain('what the pull request changes');
+    expect(calls[0]!.messages[0]!.content).not.toContain('Original PR overview.');
+    expect(calls[0]!.messages[0]!.content).toContain('if (n === 0) return;');
+    expect(gh.reviews[0]!.input.body).toContain('Since the previous review, the condition now checks equality.');
   });
 
   it('reads overview docs at the base sha and puts them in the file prompt', async () => {
