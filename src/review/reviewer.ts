@@ -722,19 +722,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
 
     const budgeted = llm.supportsBatchReview === true;
-    // Never silently approve files that did not fit the configured review budget.
-    if (reviewable.length > maxFiles) {
-      throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
-    }
-
     // Read head files before final filtering so an unchanged generated header
     // outside the diff still suppresses the review.
     const headContents = new Map<string, string>();
     const headFetched = new Set<string>();
     const headerPaths = reviewable
       .filter((f) => f.status !== 'deleted' && !f.binary && f.newPath)
-      .map((f) => f.newPath!)
-      .slice(0, HEAD_FILES_MAX);
+      .map((f) => f.newPath!);
     await mapPool(headerPaths, HEAD_FETCH_CONCURRENCY, async (path) => {
       headFetched.add(path);
       try {
@@ -756,6 +750,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         skippedFiles.push(path);
         reviewable.splice(i, 1);
       }
+    }
+    // Never silently approve files that did not fit the configured review budget.
+    if (reviewable.length > maxFiles) {
+      throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
     }
     const files = reviewable;
 
