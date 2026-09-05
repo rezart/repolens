@@ -787,6 +787,8 @@ describe('reviewPullRequest lineage', () => {
     const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content as string;
     expect(summary).toContain('First pass.');
     expect(summary).toContain('1 commit since that review');
+    expect(summary).toContain('Changes since the previous review');
+    expect(summary).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
     expect(result.warnings).toEqual([]);
   });
