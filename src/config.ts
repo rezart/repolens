@@ -37,6 +37,8 @@ const envSchema = z.object({
   REVIEW_STATUS_CONTEXT: z.string().default('repolens/review'),
   /** Which finding severity makes the status fail: critical | warning | never. */
   REVIEW_FAIL_ON: z.enum(['critical', 'warning', 'never']).default('critical'),
+  /** Extra attempts for invalid batch review responses, within the total review budget. */
+  REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
   /** Seconds a PR must go without a new push before an automatic review starts. 0 reviews immediately. */
   REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(300),
 });
@@ -65,7 +67,7 @@ export interface Config {
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
   chatModel: string;
-  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number };
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number };
 }
 
 export class ConfigError extends Error {}
@@ -119,7 +121,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     chatProvider: e.CHAT_PROVIDER,
     chatModel: e.CHAT_MODEL,
-    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS },
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES },
     github: {
       token: e.GITHUB_TOKEN,
       app: e.GITHUB_APP_ID ? { appId: e.GITHUB_APP_ID, installationId: e.GITHUB_APP_INSTALLATION_ID, privateKeyPath: e.GITHUB_APP_PRIVATE_KEY_PATH } : undefined,

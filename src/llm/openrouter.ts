@@ -1,4 +1,4 @@
-import { ProviderError } from './types.js';
+import { IncompleteResponseError, ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
@@ -132,7 +132,7 @@ export class OpenRouterProvider implements LLMProvider {
     const { content, usage, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS));
     this.reportUsage(usage);
     if (req.reviewBudget && finishReason !== 'stop') {
-      throw new ProviderError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
+      throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
     }
     return content;
   }
