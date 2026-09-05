@@ -23,6 +23,9 @@ import {
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
+  selectRelevantChunks,
+  repositoryRulePaths,
+  renderRepositoryRules,
   statusForFindings,
   selectPostedFindings,
   parseFindings,
@@ -95,6 +98,30 @@ describe('fresh finding evidence validation', () => {
     expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
     expect(second.warnings).toContain('Skipped 2 findings already commented');
     ruleDb.close();
+  });
+});
+
+describe('review context selection', () => {
+  it('keeps matching definitions and callers while dropping unrelated chunks', () => {
+    const chunks: RetrievedChunk[] = [
+      { ...CHUNK, chunkId: 1, path: 'src/helper.ts', content: 'export function helper() {}' },
+      { ...CHUNK, chunkId: 2, path: 'tests/helper.test.ts', content: 'expect(helper()).toBe(1)' },
+      { ...CHUNK, chunkId: 3, path: 'src/unrelated.ts', content: 'export function other() {}' },
+    ];
+    expect(selectRelevantChunks(chunks, ['helper'], 'src/app.ts').map((c) => c.chunkId)).toEqual([1, 2]);
+  });
+
+  it('finds only root and applicable nested repository rule files', () => {
+    expect(repositoryRulePaths(['src/review/app.ts', 'tests/review/app.test.ts'])).toEqual([
+      'AGENTS.md', 'CLAUDE.md', 'src/AGENTS.md', 'src/CLAUDE.md',
+      'src/review/AGENTS.md', 'src/review/CLAUDE.md', 'tests/AGENTS.md', 'tests/CLAUDE.md',
+      'tests/review/AGENTS.md', 'tests/review/CLAUDE.md',
+    ]);
+  });
+
+  it('renders rule sources with their base revision citation', () => {
+    expect(renderRepositoryRules(new Map([['src/AGENTS.md', 'Run focused tests.']]), 'base123'))
+      .toContain('### src/AGENTS.md (base base123)\n1 | Run focused tests.');
   });
 });
 
@@ -388,11 +415,10 @@ describe('reviewPullRequest', () => {
     expect(calls[0]!.reviewBudget).toBe(true);
     expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(0.045);
     expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
-    expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(2);
+    expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(1);
     expect(result.findings).toHaveLength(2);
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
-    expect(result.warnings.some((w) => w.includes('optional context'))).toBe(true);
   });
 
   it('lists exactly the validator-allowed finding lines for normal, deleted and deletion-only files', async () => {
@@ -1289,14 +1315,14 @@ describe('reviewPullRequest PR-head context', () => {
     expect(msg).toContain('### src/b.ts (content after this pull request)');
     expect(msg).toContain('export function helper(n: number) { return n + base; }');
     expect(msg.indexOf(AUTHORITATIVE)).toBeLessThan(msg.indexOf('### src/b.ts (content after this pull request)'));
-    expect(msg.indexOf('### src/b.ts (content after this pull request)')).toBeLessThan(msg.indexOf(INDEXED));
+    expect(msg).not.toContain(INDEXED);
     // The reviewed file's own new content is there too, so the model sees past the hunk.
     expect(msg).toContain('### src/a.ts (content after this pull request)');
 
     // Every changed path is excluded from retrieval, so no stale chunk survives.
     for (const paths of excludes) expect(paths).toEqual(['src/a.ts', 'src/b.ts']);
     expect(msg).not.toContain('STALE b.ts');
-    expect(msg).toContain('export const other = 2;');
+    expect(msg).not.toContain('export const other = 2;');
   });
 
   it('matches an added identifier to the changed file that exports it', async () => {
