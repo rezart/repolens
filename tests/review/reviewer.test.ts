@@ -364,6 +364,26 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews[0]!.input.comments).toEqual([]);
   });
 
+  it('retries a Qwen batch whose finding points outside the diff', async () => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => {
+      calls++;
+      return JSON.stringify({
+        reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Reviewed all changes.', verdict: 'approve',
+        findings: calls === 1
+          ? [{ path: 'src/app.ts', line: 999, severity: 'warning', title: 'Outside diff', body: 'Invalid line.' }]
+          : [],
+      });
+    } };
+
+    const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+
+    expect(calls).toBe(2);
+    expect(result.posted).toBe(true);
+    expect(gh.reviews).toHaveLength(1);
+  });
+
   it.each([undefined, 0, 1])('stops invalid response retries at the configured limit %s', async (maxRetries) => {
     const gh = fakeGithub();
     let calls = 0;
