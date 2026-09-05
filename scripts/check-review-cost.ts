@@ -23,6 +23,7 @@ const github: ReviewDeps['github'] = {
   getPull: async () => pr, getPullDiff: async () => diff,
   getFileContent: async (_owner, _repo, path) => contents[paths.indexOf(path)] ?? null,
   listPullCommits: async () => [], compareDiff: async () => null,
+  listPathCommits: async () => [], listCommitPulls: async () => [],
   createReview: noPost, listReviewComments: noPost, createCommitStatus: noPost,
 };
 const usage: UsageRecord[] = [];

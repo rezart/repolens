@@ -47,6 +47,19 @@ export interface PullCommit {
   message: string;
 }
 
+export interface PathCommit extends PullCommit {
+  htmlUrl?: string;
+}
+
+export interface HistoricalPullRequest {
+  number: number;
+  title: string;
+  body: string;
+  htmlUrl: string;
+  mergedAt: string | null;
+  repository: string;
+}
+
 export type CommitStatusState = 'pending' | 'success' | 'failure' | 'error';
 
 export interface CommitStatusInput {
@@ -192,6 +205,34 @@ export class GitHubClient {
       `/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`,
     );
     return (raw ?? []).map((c) => ({ sha: c.sha ?? '', message: (c.commit?.message ?? '').split('\n')[0] }));
+  }
+
+  /** A few commits touching a path, walking back from a ref. */
+  async listPathCommits(owner: string, repo: string, path: string, ref: string): Promise<PathCommit[]> {
+    const raw = await this.json<Array<{ sha?: string; html_url?: string; commit?: { message?: string } }>>(
+      `/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(ref)}&path=${encodeURIComponent(path)}&per_page=3`,
+    );
+    return (raw ?? []).map((c) => ({ sha: c.sha ?? '', message: (c.commit?.message ?? '').split('\n')[0], ...(c.html_url ? { htmlUrl: c.html_url } : {}) }));
+  }
+
+  /** Pull requests associated with a commit, including merge state and base repository. */
+  async listCommitPulls(owner: string, repo: string, sha: string): Promise<HistoricalPullRequest[]> {
+    const raw = await this.json<Array<{
+      number?: number;
+      title?: string | null;
+      body?: string | null;
+      html_url?: string;
+      merged_at?: string | null;
+      base?: { repo?: { full_name?: string | null } | null } | null;
+    }>>(`/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}/pulls`);
+    return (raw ?? []).map((p) => ({
+      number: p.number ?? 0,
+      title: p.title ?? '',
+      body: p.body ?? '',
+      htmlUrl: p.html_url ?? '',
+      mergedAt: p.merged_at ?? null,
+      repository: p.base?.repo?.full_name ?? '',
+    }));
   }
 
   /**

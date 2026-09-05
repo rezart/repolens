@@ -373,6 +373,35 @@ describe('GitHubClient.listPullCommits', () => {
   });
 });
 
+describe('GitHubClient historical pull request lookups', () => {
+  it('lists commits touching a path at a ref and pull requests for a commit', async () => {
+    const { f, gh } = client([
+      jsonResponse([{ sha: 'abc1234', commit: { message: 'old change\nbody' } }]),
+      jsonResponse([{
+        number: 7,
+        title: 'Old fix',
+        body: 'Description',
+        html_url: 'https://github.com/o/r/pull/7',
+        merged_at: '2025-01-01T00:00:00Z',
+        base: { repo: { full_name: 'o/r' } },
+      }]),
+    ]);
+    await expect(gh.listPathCommits('o', 'r', 'src/my file.ts', 'basesha')).resolves.toEqual([
+      { sha: 'abc1234', message: 'old change' },
+    ]);
+    await expect(gh.listCommitPulls('o', 'r', 'abc1234')).resolves.toEqual([{
+      number: 7,
+      title: 'Old fix',
+      body: 'Description',
+      htmlUrl: 'https://github.com/o/r/pull/7',
+      mergedAt: '2025-01-01T00:00:00Z',
+      repository: 'o/r',
+    }]);
+    expect(f.calls[0]!.url).toBe('https://api.github.com/repos/o/r/commits?sha=basesha&path=src%2Fmy%20file.ts&per_page=3');
+    expect(f.calls[1]!.url).toBe('https://api.github.com/repos/o/r/commits/abc1234/pulls');
+  });
+});
+
 describe('GitHubClient.compareDiff', () => {
   it('requests the diff media type for base...head', async () => {
     const { f, gh } = client([textResponse('diff --git a/x b/x\n')]);

@@ -9,12 +9,14 @@ import { truncateDescription } from './github.js';
 import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import { buildLineage, deltaForFile, type Lineage } from './lineage.js';
+import { buildHistoricalContext, type HistoricalPr } from './history.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
   SUMMARY_SYSTEM_PROMPT,
   buildFileReviewMessage,
   buildSummaryMessage,
+  renderHistoricalContext,
 } from './prompts.js';
 
 export type Severity = 'critical' | 'warning' | 'nit';
@@ -74,6 +76,8 @@ export interface ReviewDeps {
     | 'createCommitStatus'
     | 'listPullCommits'
     | 'compareDiff'
+    | 'listPathCommits'
+    | 'listCommitPulls'
   >;
   /** Injected from search/tokenize.ts in production. */
   identifiers?: (text: string) => string[];
@@ -670,6 +674,45 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
     const files = reviewable;
 
+    const historyPaths: string[] = [];
+    for (const file of files) {
+      for (const path of [file.oldPath, file.newPath]) if (path && !historyPaths.includes(path)) historyPaths.push(path);
+    }
+    const historical = await buildHistoricalContext(
+      {
+        listPathCommits: (path, ref) => github.listPathCommits(repo.owner, repo.name, path, ref),
+        listCommitPulls: (sha) => github.listCommitPulls(repo.owner, repo.name, sha),
+        findLatestReview: (number) => db.findLatestReview(opts.repoId, number),
+      },
+      {
+        paths: historyPaths,
+        baseSha: pr.baseSha,
+        currentPrNumber: opts.prNumber,
+        repository: `${repo.owner}/${repo.name}`,
+      },
+    );
+    warnings.push(...historical.warnings);
+
+    const historyFor = (...paths: Array<string | null>): HistoricalPr[] => {
+      const merged = new Map<number, HistoricalPr>();
+      for (const path of paths) {
+        if (!path) continue;
+        for (const entry of historical.byPath.get(path) ?? []) {
+          const current = merged.get(entry.number);
+          if (!current) {
+            merged.set(entry.number, entry);
+            continue;
+          }
+          const findings = [...current.findings];
+          for (const finding of entry.findings) {
+            if (!findings.some((f) => f.path === finding.path && f.line === finding.line && f.title === finding.title)) findings.push(finding);
+          }
+          merged.set(entry.number, { ...current, findings });
+        }
+      }
+      return [...merged.values()];
+    };
+
     // Fetch the PR head once for the whole review: the search index only knows the
     // base branch, so without this the model judges new code against old exports.
     const headContents = new Map<string, string>();
@@ -749,6 +792,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       for (const [path, content] of headContents) {
         addContext(`Files changed in this pull request (post-change content, authoritative):\n${JSON.stringify({ path, content })}`);
       }
+      const batchHistory = historyFor(...historyPaths);
+      if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
       const seen = new Set<number>();
       for (const file of files) {
         const path = file.newPath ?? file.oldPath!;
@@ -833,6 +878,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
                 instructions: repo.instructions,
                 lineage,
                 delta: lineage.previous ? deltaForFile(lineage.previous, path) : undefined,
+                historical: historyFor(file.oldPath, file.newPath),
               }),
             },
           ],
@@ -870,6 +916,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
                 files: files.map((f) => ({ path: f.newPath ?? f.oldPath!, status: f.status })),
                 findings,
                 lineage,
+                historical: historyFor(...historyPaths),
               }),
             },
           ],

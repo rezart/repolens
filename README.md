@@ -18,6 +18,7 @@ Everything runs in one Node process with a SQLite database (FTS5 for lexical sea
 - **Repository indexing**: clone, chunk by language-aware boundaries, index incrementally by git blob hash.
 - **Codebase Q&A**: hybrid retrieval (BM25 + optional embeddings, fused with reciprocal rank fusion), answers in Markdown with `path:start-end` citations.
 - **PR review**: triggered by a GitHub webhook or the API. Reviews each changed file with related code pulled from the index, then posts a GitHub review with a summary and inline comments on the changed lines.
+- **Historical PR context**: traces recent commits for changed files on the PR's base to related merged PRs. Reviews can use their descriptions and available stored RepoLens findings, with PR and commit links, to check for regressions. Looks back at three commits per path for up to eight paths, with at most twelve commit-to-PR lookups and three historical PRs. History is treated as potentially outdated context and fetched on demand without a separate embedding index; lookup failures do not block a review.
 - **PR chat**: owners, members, and collaborators can mention the bot handle in a PR comment (`@repolens why does this change X?`) to get an answer posted back.
 - **REST API** modeled on Greptile's (`/api/repositories`, `/api/query`, `/api/search`, `/api/reviews`).
 - **Dashboard** at `/` for adding repos, chatting, running reviews, and setting per-repo review instructions.
