@@ -471,7 +471,10 @@ describe('reviewPullRequest', () => {
   });
 
   it.each(['qwen/qwen3-coder-next', 'other/coder'])('batches reviews for %s without a model-name special case', async (model) => {
-    const gh = fakeGithub();
+    const gh = fakeGithub(DIFF, PR, {
+      historyCommits: [{ sha: 'history-commit', message: 'history', htmlUrl: 'https://github.com/o/r/commit/history-commit' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
     const calls: CompleteRequest[] = [];
     const llm = new OpenRouterProvider({ apiKey: 'fake', model, fetch: async (_url, init) => {
       const body = JSON.parse(String(init?.body));
@@ -485,10 +488,14 @@ describe('reviewPullRequest', () => {
     const result = await reviewPullRequest({ db, llm: wrapped, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
     expect(result.posted).toBe(true);
     expect(calls).toHaveLength(1);
+    expect(calls[0]!.messages[0]!.content).toContain('Historical description');
   });
 
   it.each(['408', '429', '503', 'timeout', 'invalid', 'truncated', 'missing content', 'invalid finding'])('falls back on %s with the same prompt and attributes the actual model', async (failure) => {
-    const gh = fakeGithub();
+    const gh = fakeGithub(DIFF, PR, {
+      historyCommits: [{ sha: 'history-commit', message: 'history', htmlUrl: 'https://github.com/o/r/commit/history-commit' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
     const tracker = new UsageTracker({ db, pricing: null });
     const sent: Array<{ model: string; messages: unknown; provider: unknown }> = [];
     const response = (content: string, finish_reason = 'stop') => new Response(JSON.stringify({
@@ -512,6 +519,7 @@ describe('reviewPullRequest', () => {
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(sent.map((r) => r.model)).toEqual(['qwen/qwen3-coder', 'qwen/qwen3-coder-next']);
     expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+    expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
     expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
     expect(db.getReview(result.reviewId)?.model).toBe('qwen/qwen3-coder-next');
@@ -1191,7 +1199,7 @@ describe('reviewPullRequest lineage', () => {
 
   it('adds deduplicated historical context as optional Qwen batch input', async () => {
     const calls: CompleteRequest[] = [];
-    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, async complete(req) {
+    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
       calls.push(req);
       return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], findings: [], summary: 'Reviewed.', verdict: 'approve' });
     } };
@@ -1247,7 +1255,7 @@ describe('reviewPullRequest lineage', () => {
         { path: 'src/b.ts', line: 1, severity: 'warning', title: 'B finding', body: 'B detail.' },
       ]), posted: 1, error: null });
     const calls: CompleteRequest[] = [];
-    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, async complete(req) {
+    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
       calls.push(req);
       return JSON.stringify({ reviewedPaths: ['src/a.ts', 'src/b.ts'], findings: [], summary: 'Reviewed.', verdict: 'approve' });
     } };
