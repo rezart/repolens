@@ -88,7 +88,7 @@ export function tokenizeQuery(q: string): string[] {
 /** Build an FTS5 MATCH expression: every token quoted, OR-ed together. */
 export function buildFtsQuery(tokens: string[]): string {
   const quoted = tokens.filter((t) => t.length > 0).map((t) => `"${t.replace(/"/g, '""')}"`);
-  return quoted.join(' OR ');
+  return '';
 }
 
 /**
