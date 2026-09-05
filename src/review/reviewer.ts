@@ -2,7 +2,8 @@ import type { Db, RepoRow } from '../db.js';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
-import { extractJson } from '../llm/json.js';
+import { IncompleteResponseError } from '../llm/types.js';
+import { extractJson, JsonExtractError } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
 import { truncateDescription } from './github.js';
 import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
@@ -79,6 +80,8 @@ export interface ReviewDeps {
   /** Injected from search/retrieve.ts in production. */
   formatContext?: (chunks: RetrievedChunk[]) => string;
   maxFiles?: number;
+  /** Extra attempts for invalid batch responses; default 3, within the total budget. */
+  maxRetries?: number;
   /** Commit status context reported on the PR head; blank/undefined disables statuses. */
   statusContext?: string;
   /** Which findings turn the commit status red (default `critical`). */
@@ -745,22 +748,37 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
-      await assertHeadUnchanged();
-      // Parsing failures reach reviewPullRequest's outer catch (error status),
-      // then JobQueue records a failed job. Never turn invalid JSON into approval.
-      const obj = extractJson(await complete(req)) as Record<string, unknown>;
-      if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
-          !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
-          files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath)) ||
-          obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => file.newPath === (f as { path?: unknown }).path))) {
-        throw new Error('Incomplete review response; no review was published.');
+      const maxRetries = deps.maxRetries ?? 3;
+      const attemptCost = reviewCostUpperBound(req);
+      let reservedUsd = 0;
+      for (let attempt = 0; ; attempt++) {
+        await assertHeadUnchanged();
+        if (reservedUsd + attemptCost > REVIEW_MAX_USD) {
+          throw new Error('Review retry exceeds the remaining $0.25 budget; no review was published.');
+        }
+        // ponytail: reserve each call's upper bound even when usage is missing;
+        // reclaim unused reservations only if trustworthy billing supports it.
+        reservedUsd += attemptCost;
+        try {
+          const obj = extractJson(await complete(req)) as Record<string, unknown>;
+          if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
+              !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
+              files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath)) ||
+              obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => file.newPath === (f as { path?: unknown }).path))) {
+            throw new IncompleteResponseError(llm.name, 'Incomplete review response; no review was published.');
+          }
+          batch = {
+            findings: files.flatMap((file) => parseFindings(JSON.stringify({
+              findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === file.newPath),
+            }), file, changedNewLines(file))),
+            summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
+          };
+          break;
+        } catch (err) {
+          if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError) || attempt >= maxRetries) throw err;
+          log(`review: invalid response; retry ${attempt + 1}/${maxRetries}`);
+        }
       }
-      batch = {
-        findings: files.flatMap((file) => parseFindings(JSON.stringify({
-          findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === file.newPath),
-        }), file, changedNewLines(file))),
-        summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
-      };
     }
 
     const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {

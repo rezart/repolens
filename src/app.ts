@@ -167,6 +167,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           formatContext: (chunks) => formatContext(chunks, 16000),
           statusContext: deps.config.review.statusContext,
           failOn: deps.config.review.failOn,
+          maxRetries: deps.config.review.maxRetries,
           publicUrl: deps.config.publicUrl,
           log: (m) => ctx.progress(m),
         },

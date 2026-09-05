@@ -59,3 +59,6 @@ export class ProviderError extends Error {
     this.name = 'ProviderError';
   }
 }
+
+/** A completed model call whose output is incomplete and can be retried. */
+export class IncompleteResponseError extends ProviderError {}
