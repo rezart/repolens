@@ -46,8 +46,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: publish
     runs-on: ubuntu-latest
+    env:
+      PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
     steps:
       - name: Deploy with Portainer
-        env:
-          PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+        if: env.PORTAINER_WEBHOOK_URL != ''
         run: curl --fail --show-error --silent --retry 3 --retry-all-errors --request POST "$PORTAINER_WEBHOOK_URL"
