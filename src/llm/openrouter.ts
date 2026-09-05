@@ -119,6 +119,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (req.json) body.response_format = { type: 'json_object' };
     if (this.effort) body.reasoning = { effort: this.effort };
     if (streaming) body.stream = true;
+    // Every model uses the same token bounds and routing price caps below.
     if (req.reviewBudget) {
       if (streaming || !Number.isInteger(req.maxTokens) ||
           req.maxTokens! <= 0 || req.maxTokens! > REVIEW_MAX_OUTPUT || reviewCostUpperBound(req) > REVIEW_MAX_USD) {

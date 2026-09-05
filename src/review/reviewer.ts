@@ -373,26 +373,26 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return results;
 }
 
-function parseFindings(raw: string, file: DiffFile, allowed: Set<number>, provider: string): Finding[] {
+function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Finding[] {
   const parsed = extractJson(raw) as { findings?: unknown } | unknown[];
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
-  if (!list) throw new IncompleteResponseError(provider, 'model output has no "findings" array');
+  if (!list) throw new Error('model output has no "findings" array');
   const path = file.newPath ?? file.oldPath ?? '';
   const bodyAllowed = new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
   const out: Finding[] = [];
   for (const entry of list) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new IncompleteResponseError(provider, 'model output contains a malformed finding');
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('model output contains a malformed finding');
     const e = entry as Record<string, unknown>;
     const line = typeof e.line === 'number' ? e.line : typeof e.line === 'string' ? Number(e.line) : NaN;
     const bodyOnly = file.status === 'deleted' || allowed.size === 0;
     if (!Number.isInteger(line) || (!bodyOnly && !allowed.has(line)) || (bodyOnly && !bodyAllowed.has(line))) {
-      throw new IncompleteResponseError(provider, `model output contains an invalid finding line for ${path}`);
+      throw new Error(`model output contains an invalid finding line for ${path}`);
     }
     const title = typeof e.title === 'string' ? e.title.trim() : '';
     const body = typeof e.body === 'string' ? e.body.trim() : '';
-    if (!title && !body) throw new IncompleteResponseError(provider, `model output contains an empty finding for ${path}`);
+    if (!title && !body) throw new Error(`model output contains an empty finding for ${path}`);
     const sevRaw = typeof e.severity === 'string' ? e.severity.toLowerCase().trim() : '';
-    if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new IncompleteResponseError(provider, `model output contains an invalid finding severity for ${path}`);
+    if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new Error(`model output contains an invalid finding severity for ${path}`);
     const severity = sevRaw as Severity;
     out.push({ path, line: bodyOnly ? 0 : line, severity, title: title || body.slice(0, 60), body: body || title });
   }
@@ -789,12 +789,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
             throw new IncompleteResponseError(activeLlm.name, 'Incomplete review response; no review was published.');
           }
-          batch = {
-            findings: files.flatMap((file) => parseFindings(JSON.stringify({
+          let findings: Finding[];
+          try {
+            findings = files.flatMap((file) => parseFindings(JSON.stringify({
               findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-            }), file, changedNewLines(file), activeLlm.name)),
-            summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
-          };
+            }), file, changedNewLines(file)));
+          } catch (err) {
+            throw new IncompleteResponseError(activeLlm.name, errMessage(err));
+          }
+          batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
           break;
         } catch (err) {
           const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
@@ -850,7 +853,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           json: true,
           maxTokens: 2000,
         });
-        return parseFindings(raw, file, allowed, activeLlm.name);
+        return parseFindings(raw, file, allowed);
       } catch (err) {
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);

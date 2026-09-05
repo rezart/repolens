@@ -32,9 +32,9 @@ const ok = () => jsonResponse({ choices: [{ message: { role: 'assistant', conten
 describe('OpenRouter review budget', () => {
   const req = { messages: [{ role: 'user' as const, content: 'review this' }], reviewBudget: true, maxTokens: REVIEW_MAX_OUTPUT };
 
-  it('enforces routing prices and counts UTF-8 bytes before making a request', async () => {
+  it.each(['qwen/qwen3-coder', 'qwen/qwen3-coder-next', 'other/coder'])('enforces routing prices and UTF-8 budget bounds for %s', async (model) => {
     const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
-    const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, reasoningEffort: 'high' });
+    const p = new OpenRouterProvider({ apiKey: 'k', model, fetch: f.fetch, reasoningEffort: 'high' });
     const larger = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(20000) }] };
     expect(REVIEW_MAX_USD).toBe(0.245);
     expect(reviewCostUpperBound(larger)).toBeGreaterThan(0.045);
