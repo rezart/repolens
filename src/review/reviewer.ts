@@ -146,16 +146,18 @@ const BINARY_EXT = new Set([
 
 /** Files RepoLens will not spend an LLM call on. */
 function matchesIgnorePattern(path: string, patterns: string[]): boolean {
-  return patterns.some((pattern) => {
-    try { return matchesGlob(path, pattern); } catch { return false; }
-  });
+  return patterns.some((pattern) => matchesGlob(path, pattern));
 }
 
 /** Detect standard generated-file notices in the first five diff lines. */
 export function hasGeneratedHeader(file: DiffFile): boolean {
   return file.hunks.flatMap((hunk) => hunk.lines)
     .filter((line) => line.newLine !== undefined && line.newLine <= 5)
-    .some((line) => /^\s*(?:(?:\/\/|#|;|--)\s*)?(?:code\s+generated\b.*(?:do not edit|automatically generated).*|@generated\b.*)$/i.test(line.content));
+    .some((line) => /^\s*(?:(?:\/\/|#|;|--)\s*)?(?:code\s+generated\b.*\bdo not edit\b.*|@generated\b.*)$/i.test(line.content));
+}
+
+function hasGeneratedContent(content: string): boolean {
+  return content.split('\n').slice(0, 5).some((line) => /^\s*(?:(?:\/\/|#|;|--)\s*)?(?:code\s+generated\b.*\bdo not edit\b.*|@generated\b.*)$/i.test(line));
 }
 
 export function isReviewablePath(path: string, ignorePatterns: string[] = []): boolean {
@@ -724,6 +726,37 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (reviewable.length > maxFiles) {
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
     }
+
+    // Read head files before final filtering so an unchanged generated header
+    // outside the diff still suppresses the review.
+    const headContents = new Map<string, string>();
+    const headFetched = new Set<string>();
+    const headerPaths = reviewable
+      .filter((f) => f.status !== 'deleted' && !f.binary && f.newPath)
+      .map((f) => f.newPath!)
+      .slice(0, HEAD_FILES_MAX);
+    await mapPool(headerPaths, HEAD_FETCH_CONCURRENCY, async (path) => {
+      headFetched.add(path);
+      try {
+        const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
+        if (content === null) {
+          log(`review: ${path}: no post-change content at ${shortSha(pr.headSha)}`);
+        } else if (content.length > HEAD_FILE_CHARS_MAX) {
+          warnings.push(`${path}: post-change content skipped (${content.length} chars over the ${HEAD_FILE_CHARS_MAX} limit)`);
+        } else {
+          headContents.set(path, content);
+        }
+      } catch (err) {
+        warnings.push(`${path}: fetching post-change content failed: ${errMessage(err)}`);
+      }
+    });
+    for (let i = reviewable.length - 1; i >= 0; i--) {
+      const path = reviewable[i]!.newPath ?? reviewable[i]!.oldPath!;
+      if (hasGeneratedContent(headContents.get(path) ?? '')) {
+        skippedFiles.push(path);
+        reviewable.splice(i, 1);
+      }
+    }
     const files = reviewable;
 
     const historyPathSet = new Set<string>();
@@ -768,9 +801,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     // Fetch the PR head once for the whole review: the search index only knows the
     // base branch, so without this the model judges new code against old exports.
-    const headContents = new Map<string, string>();
     const fetchable = parsed
-      .filter((f) => f.status !== 'deleted' && !f.binary && !hasGeneratedHeader(f) && f.newPath && isReviewablePath(f.newPath, deps.ignorePatterns))
+      .filter((f) => f.status !== 'deleted' && !f.binary && !hasGeneratedHeader(f) && f.newPath && isReviewablePath(f.newPath, deps.ignorePatterns) && !headFetched.has(f.newPath))
       .map((f) => f.newPath!);
     const toFetch = fetchable.slice(0, HEAD_FILES_MAX);
     if (fetchable.length > toFetch.length) {
