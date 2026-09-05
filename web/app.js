@@ -440,6 +440,8 @@ function renderHealth() {
     text: 'embeddings ' + (hp.embeddings ? 'on (' + hp.embeddings + ')' : 'off'),
   }));
   dom.version.textContent = hp.version ? 'v' + hp.version : '';
+  if (hp.revision) dom.version.title = hp.revision;
+  else dom.version.removeAttribute('title');
 }
 
 function renderRepoList() {

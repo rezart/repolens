@@ -80,6 +80,11 @@ describe('API', () => {
     expect(body.embeddings).toBeNull();
   });
 
+  it('reports the running image revision', async () => {
+    const res = await createApp(makeDeps({}, { REPOLENS_REVISION: 'abc123' })).request('/api/health');
+    expect((await res.json()).revision).toBe('abc123');
+  });
+
   it('rejects unauthenticated api calls', async () => {
     const res = await app.request('/api/repositories');
     expect(res.status).toBe(401);
