@@ -18,6 +18,7 @@ Everything runs in one Node process with a SQLite database (FTS5 for lexical sea
 - **Repository indexing**: clone, chunk by language-aware boundaries, index incrementally by git blob hash.
 - **Codebase Q&A**: hybrid retrieval (BM25 + optional embeddings, fused with reciprocal rank fusion), answers in Markdown with `path:start-end` citations.
 - **PR review**: triggered by a GitHub webhook or the API. Reviews each changed file with related code pulled from the index, then posts a GitHub review with a summary and inline comments on the changed lines.
+- **Historical PR context**: traces recent commits for changed files on the PR's base to related merged PRs. Reviews can use their descriptions and available stored RepoLens findings, with PR and commit links, to check for regressions. Looks back at three commits per path for up to eight paths, with at most twelve commit-to-PR lookups and three historical PRs. History is treated as potentially outdated context and fetched on demand without a separate embedding index; lookup failures do not block a review.
 - **PR chat**: owners, members, and collaborators can mention the bot handle in a PR comment (`@repolens why does this change X?`) to get an answer posted back.
 - **REST API** modeled on Greptile's (`/api/repositories`, `/api/query`, `/api/search`, `/api/reviews`).
 - **Dashboard** at `/` for adding repos, chatting, running reviews, and setting per-repo review instructions.
@@ -97,6 +98,8 @@ Prefer the authoritative `message` over concatenating deltas. The dashboard stre
 ## Using it
 
 With `LLM_PROVIDER=openrouter`, a review uses one request for all files and the summary, regardless of model ID. Shared context is sent once, and retrieval uses the local lexical index without paid query embeddings. CLI providers keep the per-file pipeline.
+
+When retries are enabled, optional context is admitted only while the request reserves at most half the review budget, leaving room for one retry. All file diffs remain complete. A core prompt that already exceeds half the budget can still receive one review attempt, but optional context is omitted and a retry may not fit.
 
 Set `LLM_MODEL=qwen/qwen3-coder` and `REVIEW_FALLBACK_MODELS=qwen/qwen3-coder-next` to try the current model first, then Coder Next when it fails. The fallback setting accepts a comma-separated list of OpenRouter model IDs in priority order; blank disables model fallback. Chat keeps its separate configuration.
 

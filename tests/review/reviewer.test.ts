@@ -7,12 +7,15 @@ import type {
   CreateReviewInput,
   ExistingReviewComment,
   CommitStatusInput,
+  PathCommit,
+  HistoricalPullRequest,
 } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
+import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
 import {
   reviewPullRequest,
   ReviewSupersededError,
@@ -131,6 +134,11 @@ interface FakeGithubOptions {
   commits?: Array<{ sha: string; message: string }>;
   /** Diff returned by compareDiff (null = GitHub cannot compare). */
   compare?: string | null;
+  /** Historical path commits and associated PRs. */
+  historyCommits?: PathCommit[];
+  historyCommitsByPath?: Record<string, PathCommit[]>;
+  historyPulls?: HistoricalPullRequest[];
+  historyPullsByCommit?: Record<string, HistoricalPullRequest[]>;
 }
 
 interface StatusCall {
@@ -146,9 +154,17 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
   const statuses: StatusCall[] = [];
   const contentCalls: Array<{ path: string; ref: string }> = [];
   const compareCalls: Array<{ base: string; head: string }> = [];
+  const historyCalls: string[] = [];
   const github: ReviewDeps['github'] = {
     async listPullCommits() {
       return opts.commits ?? [];
+    },
+    async listCommitPulls(_owner: string, _repo: string, sha: string) {
+      return opts.historyPullsByCommit?.[sha] ?? opts.historyPulls ?? [];
+    },
+    async listPathCommits(_owner: string, _repo: string, path: string, ref: string) {
+      historyCalls.push(`${path}@${ref}`);
+      return opts.historyCommitsByPath?.[path] ?? opts.historyCommits ?? [];
     },
     async compareDiff(_owner: string, _repo: string, base: string, head: string) {
       compareCalls.push({ base, head });
@@ -183,7 +199,7 @@ function fakeGithub(diff = DIFF, pr: PullRequest = PR, opts: FakeGithubOptions =
       return { id: 7, htmlUrl: 'https://github.com/o/r/pull/42#pullrequestreview-7' };
     },
   };
-  return { reviews, listCalls, statuses, contentCalls, compareCalls, github };
+  return { reviews, listCalls, statuses, contentCalls, compareCalls, historyCalls, github };
 }
 
 const retrieveOne: RetrieveFn = async () => [CHUNK];
@@ -272,6 +288,36 @@ describe('reviewPullRequest', () => {
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
     expect(result.warnings.some((w) => w.includes('optional context'))).toBe(true);
+  });
+
+  it('lists exactly the validator-allowed finding lines for normal, deleted and deletion-only files', async () => {
+    const diff = [
+      'diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', '@@ -1,2 +1,2 @@',
+      ' context', '-old', '+new',
+      'diff --git a/src/gone.ts b/src/gone.ts', 'deleted file mode 100644', '--- a/src/gone.ts', '+++ /dev/null', '@@ -10,2 +0,0 @@',
+      '-gone', '-also gone',
+      'diff --git a/src/auth.ts b/src/auth.ts', '--- a/src/auth.ts', '+++ b/src/auth.ts', '@@ -4,3 +4,1 @@',
+      ' context', '-const auth = true;', '-const allowed = true;', '',
+    ].join('\n');
+    const requests: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'fake', model: 'batch', supportsBatchReview: true, concurrency: 1, async complete(req) {
+      requests.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts', 'src/auth.ts'], summary: 'Reviewed.', verdict: 'request_changes', findings: [
+        { path: 'src/app.ts', line: 2, severity: 'warning', title: 'Normal', body: 'Check.' },
+        { path: 'src/gone.ts', line: 10, severity: 'critical', title: 'Deleted', body: 'Restore.' },
+        { path: 'src/auth.ts', line: 4, severity: 'warning', title: 'Deletion only', body: 'Check.' },
+      ] });
+    } };
+    const result = await reviewPullRequest({ db, llm, retrieve: async () => [], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    const payload = JSON.parse(requests[0]!.messages[0]!.content) as { files: Array<{ path: string; allowedFindingLines: number[] }> };
+    expect(payload.files.map((file) => [file.path, file.allowedFindingLines])).toEqual([
+      ['src/app.ts', [2]],
+      ['src/gone.ts', [10, 11]],
+      ['src/auth.ts', [4, 5, 6]],
+    ]);
+    expect(result.findings.map((finding) => [finding.path, finding.line])).toEqual([
+      ['src/gone.ts', 0], ['src/app.ts', 2], ['src/auth.ts', 0],
+    ]);
   });
 
   it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
@@ -409,6 +455,38 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(0);
   });
 
+  it('leaves retry budget after admitting optional context while preserving the full diff and history', async () => {
+    const calls: CompleteRequest[] = [];
+    const invalid = JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Incomplete.', verdict: 'approve',
+      findings: [{ path: 'src/app.ts', line: 999, severity: 'critical', title: 'Bad', body: 'Fix.' }] });
+    const valid = JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Complete.', verdict: 'approve', findings: [] });
+    const fallback: LLMProvider = { name: 'fake', model: 'fallback', concurrency: 1, supportsBatchReview: true, complete: async (req) => {
+      calls.push(req);
+      return valid;
+    } };
+    const primary: LLMProvider = { name: 'fake', model: 'primary', concurrency: 1, supportsBatchReview: true, reviewFallbacks: [fallback], complete: async (req) => {
+      calls.push(req);
+      return invalid;
+    } };
+    const gh = fakeGithub(DIFF, PR, {
+      headFiles: { 'src/app.ts': 'x'.repeat(50_000) },
+      historyCommits: [{ sha: 'history-commit', message: 'history', htmlUrl: 'https://github.com/o/r/commit/history-commit' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
+    const result = await reviewPullRequest({ db, llm: primary, retrieve: async () => [{ ...CHUNK, content: 'x'.repeat(300_000) }], github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(result.summary).toBe('Complete.');
+    expect(calls).toHaveLength(2);
+    const primaryContent = calls[0]!.messages[0]!.content;
+    expect(calls[1]!.messages[0]!.content).toBe(primaryContent);
+    expect(primaryContent).toContain('Historical description');
+    const payload = JSON.parse(primaryContent.split('\n\n', 1)[0]!) as { files: Array<{ path: string; status: string; diff: string }> };
+    const expected = parseUnifiedDiff(DIFF)
+      .filter((file) => file.newPath === 'src/app.ts' || file.oldPath === 'src/gone.ts')
+      .map((file) => ({ path: file.newPath ?? file.oldPath!, status: file.status, diff: hunkText(file, Infinity) }));
+    expect(payload.files.map(({ path, status, diff }) => ({ path, status, diff }))).toEqual(expected);
+    expect(reviewCostUpperBound(calls[0]!) * 2).toBeLessThanOrEqual(REVIEW_MAX_USD);
+  });
+
   it('retries truncated provider output and counts the cost of both attempts', async () => {
     const gh = fakeGithub();
     const tracker = new UsageTracker({ db, pricing: null });
@@ -456,7 +534,10 @@ describe('reviewPullRequest', () => {
   });
 
   it.each(['qwen/qwen3-coder-next', 'other/coder'])('batches reviews for %s without a model-name special case', async (model) => {
-    const gh = fakeGithub();
+    const gh = fakeGithub(DIFF, PR, {
+      historyCommits: [{ sha: 'history-commit', message: 'history', htmlUrl: 'https://github.com/o/r/commit/history-commit' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
     const calls: CompleteRequest[] = [];
     const llm = new OpenRouterProvider({ apiKey: 'fake', model, fetch: async (_url, init) => {
       const body = JSON.parse(String(init?.body));
@@ -470,10 +551,14 @@ describe('reviewPullRequest', () => {
     const result = await reviewPullRequest({ db, llm: wrapped, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
     expect(result.posted).toBe(true);
     expect(calls).toHaveLength(1);
+    expect(calls[0]!.messages[0]!.content).toContain('Historical description');
   });
 
   it.each(['408', '429', '503', 'timeout', 'invalid', 'truncated', 'missing content', 'invalid finding'])('falls back on %s with the same prompt and attributes the actual model', async (failure) => {
-    const gh = fakeGithub();
+    const gh = fakeGithub(DIFF, PR, {
+      historyCommits: [{ sha: 'history-commit', message: 'history', htmlUrl: 'https://github.com/o/r/commit/history-commit' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
     const tracker = new UsageTracker({ db, pricing: null });
     const sent: Array<{ model: string; messages: unknown; provider: unknown }> = [];
     const response = (content: string, finish_reason = 'stop') => new Response(JSON.stringify({
@@ -497,6 +582,7 @@ describe('reviewPullRequest', () => {
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(sent.map((r) => r.model)).toEqual(['qwen/qwen3-coder', 'qwen/qwen3-coder-next']);
     expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+    expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
     expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
     expect(db.getReview(result.reviewId)?.model).toBe('qwen/qwen3-coder-next');
@@ -1158,6 +1244,97 @@ describe('reviewPullRequest lineage', () => {
     const result = await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
     expect(result.warnings.join('\n')).toContain('commits down');
     expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('Delta unavailable');
+  });
+
+  it('includes relevant historical PR context in per-file review prompts', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 7, head_sha: 'old', status: 'done', summary: 'Old summary', verdict: 'comment',
+      comments_json: JSON.stringify([{ path: 'src/app.ts', line: 3, severity: 'warning', title: 'Old issue', body: 'Check this.' }]), posted: 1, error: null });
+    const llm = fakeLlm();
+    const gh = fakeGithub(DIFF, PR, {
+      historyCommits: [{ sha: 'abc1234', message: 'old change', htmlUrl: 'https://github.com/o/r/commit/abc1234' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
+    await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('[#7 Old fix](https://github.com/o/r/pull/7)');
+    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('[abc1234](https://github.com/o/r/commit/abc1234)');
+    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('Old issue');
+  });
+
+  it('adds deduplicated historical context as optional Qwen batch input', async () => {
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], findings: [], summary: 'Reviewed.', verdict: 'approve' });
+    } };
+    const gh = fakeGithub(DIFF, PR, {
+      historyCommits: [{ sha: 'abc1234', message: 'old change', htmlUrl: 'https://github.com/o/r/commit/abc1234' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
+    await reviewPullRequest({ db, llm, retrieve: async () => [], github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(calls).toHaveLength(1);
+    const content = calls[0]!.messages[0]!.content;
+    expect(content).toContain('Relevant merged pull requests');
+    expect(content.match(/Relevant merged pull requests/g)).toHaveLength(1);
+  });
+
+  it('merges rename history into the new-file prompt and ordinary summary', async () => {
+    const renameDiff = [
+      'diff --git a/src/old.ts b/src/new.ts', 'similarity index 80%', 'rename from src/old.ts', 'rename to src/new.ts',
+      '--- a/src/old.ts', '+++ b/src/new.ts', '@@ -1,1 +1,2 @@', ' export const value = 1;', '+export const next = 2;', '',
+    ].join('\n');
+    db.insertReview({ repo_id: REPO_ID, pr_number: 7, head_sha: 'old', status: 'done', summary: 'Old summary', verdict: 'comment',
+      comments_json: JSON.stringify([
+        { path: 'src/old.ts', line: 1, severity: 'warning', title: 'Old path finding', body: 'Old detail.' },
+        { path: 'src/new.ts', line: 2, severity: 'critical', title: 'New path finding', body: 'New detail.' },
+      ]), posted: 1, error: null });
+    const llm = fakeLlm();
+    const gh = fakeGithub(renameDiff, PR, {
+      historyCommitsByPath: {
+        'src/old.ts': [{ sha: 'old-commit', message: 'old', htmlUrl: 'https://github.com/o/r/commit/old-commit' }],
+        'src/new.ts': [{ sha: 'new-commit', message: 'new', htmlUrl: 'https://github.com/o/r/commit/new-commit' }],
+      },
+      historyPullsByCommit: {
+        'old-commit': [{ number: 7, title: 'Old fix', body: 'Description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+        'new-commit': [{ number: 7, title: 'Old fix', body: 'Description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+      },
+    });
+    await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42, post: false });
+    const file = llm.fileCalls()[0]!.messages[0]!.content;
+    const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content;
+    expect(file).toContain('Old path finding');
+    expect(file).toContain('New path finding');
+    expect(summary).toContain('Old path finding');
+    expect(summary).toContain('New path finding');
+  });
+
+  it('keeps both paths\' historical findings in the Qwen batch context', async () => {
+    const diff = [
+      'diff --git a/src/a.ts b/src/a.ts', '--- a/src/a.ts', '+++ b/src/a.ts', '@@ -1 +1 @@', '-a', '+b',
+      'diff --git a/src/b.ts b/src/b.ts', '--- a/src/b.ts', '+++ b/src/b.ts', '@@ -1 +1 @@', '-a', '+b', '',
+    ].join('\n');
+    db.insertReview({ repo_id: REPO_ID, pr_number: 7, head_sha: 'old', status: 'done', summary: 'Old summary', verdict: 'comment',
+      comments_json: JSON.stringify([
+        { path: 'src/a.ts', line: 1, severity: 'warning', title: 'A finding', body: 'A detail.' },
+        { path: 'src/b.ts', line: 1, severity: 'warning', title: 'B finding', body: 'B detail.' },
+      ]), posted: 1, error: null });
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/a.ts', 'src/b.ts'], findings: [], summary: 'Reviewed.', verdict: 'approve' });
+    } };
+    const gh = fakeGithub(diff, PR, {
+      historyCommitsByPath: {
+        'src/a.ts': [{ sha: 'a-commit', message: 'a' }],
+        'src/b.ts': [{ sha: 'b-commit', message: 'b' }],
+      },
+      historyPullsByCommit: {
+        'a-commit': [{ number: 7, title: 'Old fix', body: '', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+        'b-commit': [{ number: 7, title: 'Old fix', body: '', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+      },
+    });
+    await reviewPullRequest({ db, llm, retrieve: async () => [], github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(calls[0]!.messages[0]!.content).toContain('A finding');
+    expect(calls[0]!.messages[0]!.content).toContain('B finding');
   });
 });
 

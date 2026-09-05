@@ -9,12 +9,14 @@ import { truncateDescription } from './github.js';
 import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
 import { buildLineage, deltaForFile, type Lineage } from './lineage.js';
+import { buildHistoricalContext, type HistoricalPr } from './history.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
   SUMMARY_SYSTEM_PROMPT,
   buildFileReviewMessage,
   buildSummaryMessage,
+  renderHistoricalContext,
 } from './prompts.js';
 
 export type Severity = 'critical' | 'warning' | 'nit';
@@ -74,6 +76,8 @@ export interface ReviewDeps {
     | 'createCommitStatus'
     | 'listPullCommits'
     | 'compareDiff'
+    | 'listPathCommits'
+    | 'listCommitPulls'
   >;
   /** Injected from search/tokenize.ts in production. */
   identifiers?: (text: string) => string[];
@@ -373,19 +377,26 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return results;
 }
 
-function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Finding[] {
+function allowedFindingLines(file: DiffFile): Set<number> {
+  const added = changedNewLines(file);
+  if (file.status !== 'deleted' && added.size > 0) return added;
+  return new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
+}
+
+function parseFindings(raw: string, file: DiffFile): Finding[] {
   const parsed = extractJson(raw) as { findings?: unknown } | unknown[];
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
   if (!list) throw new Error('model output has no "findings" array');
   const path = file.newPath ?? file.oldPath ?? '';
-  const bodyAllowed = new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
+  const allowed = allowedFindingLines(file);
+  const bodyOnly = file.status === 'deleted' || changedNewLines(file).size === 0;
   const out: Finding[] = [];
   for (const entry of list) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('model output contains a malformed finding');
     const e = entry as Record<string, unknown>;
     const line = typeof e.line === 'number' ? e.line : typeof e.line === 'string' ? Number(e.line) : NaN;
-    const bodyOnly = file.status === 'deleted' || allowed.size === 0;
-    if (!Number.isInteger(line) || (!bodyOnly && !allowed.has(line)) || (bodyOnly && !bodyAllowed.has(line))) {
+    // allowed already contains old diff lines for deleted/deletion-only files.
+    if (!Number.isInteger(line) || !allowed.has(line)) {
       throw new Error(`model output contains an invalid finding line for ${path}`);
     }
     const title = typeof e.title === 'string' ? e.title.trim() : '';
@@ -672,6 +683,46 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
     const files = reviewable;
 
+    const historyPathSet = new Set<string>();
+    for (const file of files) {
+      for (const path of [file.oldPath, file.newPath]) if (path) historyPathSet.add(path);
+    }
+    const historyPaths = [...historyPathSet];
+    const historical = await buildHistoricalContext(
+      {
+        listPathCommits: (path, ref) => github.listPathCommits(repo.owner, repo.name, path, ref),
+        listCommitPulls: (sha) => github.listCommitPulls(repo.owner, repo.name, sha),
+        findLatestReview: (number) => db.findLatestReview(opts.repoId, number),
+      },
+      {
+        paths: historyPaths,
+        baseSha: pr.baseSha,
+        currentPrNumber: opts.prNumber,
+        repository: `${repo.owner}/${repo.name}`,
+      },
+    );
+    warnings.push(...historical.warnings);
+
+    const historyFor = (...paths: Array<string | null>): HistoricalPr[] => {
+      const merged = new Map<number, HistoricalPr>();
+      for (const path of paths) {
+        if (!path) continue;
+        for (const entry of historical.byPath.get(path) ?? []) {
+          const current = merged.get(entry.number);
+          if (!current) {
+            merged.set(entry.number, entry);
+            continue;
+          }
+          const findings = [...current.findings];
+          for (const finding of entry.findings) {
+            if (!findings.some((f) => f.path === finding.path && f.line === finding.line && f.title === finding.title)) findings.push(finding);
+          }
+          merged.set(entry.number, { ...current, findings });
+        }
+      }
+      return [...merged.values()];
+    };
+
     // Fetch the PR head once for the whole review: the search index only knows the
     // base branch, so without this the model judges new code against old exports.
     const headContents = new Map<string, string>();
@@ -728,22 +779,27 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           previous: lineage.previous ? { ...lineage.previous, delta: undefined } : undefined,
           files: files.map((f) => ({
             path: f.newPath ?? f.oldPath!, status: f.status, diff: hunkText(f, Infinity),
+            allowedFindingLines: [...allowedFindingLines(f)].sort((a, b) => a - b),
             delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath ?? f.oldPath!) : undefined,
           })),
         }) }],
         json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true,
       };
+      const maxRetries = deps.maxRetries ?? 3;
       // Reject the core prompt before the retrieval loop or any inference call.
-      if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+      const coreCost = reviewCostUpperBound(req);
+      if (coreCost > REVIEW_MAX_USD) {
         throw new Error('Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
+      // Reserve half the ceiling for one retry while keeping the full core diff.
+      const optionalContextBudget = maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
       let omitted = 0;
       const addContext = (block: string) => {
         const previous = req.messages[0]!.content;
         req.messages[0]!.content += `\n\n${block}`;
-        if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+        if (reviewCostUpperBound(req) > optionalContextBudget) {
           req.messages[0]!.content = previous;
           omitted++;
         }
@@ -751,6 +807,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       for (const [path, content] of headContents) {
         addContext(`Files changed in this pull request (post-change content, authoritative):\n${JSON.stringify({ path, content })}`);
       }
+      const batchHistory = historyFor(...historyPaths);
+      if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
       const seen = new Set<number>();
       for (const file of files) {
         const path = file.newPath ?? file.oldPath!;
@@ -770,7 +828,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let providerIndex = 0;
-      const maxRetries = deps.maxRetries ?? 3;
       const attemptCost = reviewCostUpperBound(req);
       let reservedUsd = 0;
       for (let attempt = 0; ; attempt++) {
@@ -793,7 +850,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           try {
             findings = files.flatMap((file) => parseFindings(JSON.stringify({
               findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-            }), file, changedNewLines(file)));
+            }), file));
           } catch (err) {
             throw new IncompleteResponseError(activeLlm.name, errMessage(err));
           }
@@ -814,7 +871,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath ?? file.oldPath!;
-      const allowed = changedNewLines(file);
       const addedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
         .join('\n');
@@ -847,13 +903,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
                 instructions: repo.instructions,
                 lineage,
                 delta: lineage.previous ? deltaForFile(lineage.previous, path) : undefined,
+                historical: historyFor(file.oldPath, file.newPath),
               }),
             },
           ],
           json: true,
           maxTokens: 2000,
         });
-        return parseFindings(raw, file, allowed);
+        return parseFindings(raw, file);
       } catch (err) {
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);
@@ -884,6 +941,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
                 files: files.map((f) => ({ path: f.newPath ?? f.oldPath!, status: f.status })),
                 findings,
                 lineage,
+                historical: historyFor(...historyPaths),
               }),
             },
           ],
