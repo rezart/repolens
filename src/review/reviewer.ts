@@ -2,7 +2,7 @@ import type { Db, RepoRow } from '../db.js';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
-import { IncompleteResponseError } from '../llm/types.js';
+import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
 import { truncateDescription } from './github.js';
@@ -80,7 +80,7 @@ export interface ReviewDeps {
   /** Injected from search/retrieve.ts in production. */
   formatContext?: (chunks: RetrievedChunk[]) => string;
   maxFiles?: number;
-  /** Extra attempts for invalid batch responses; default 3, within the total budget. */
+  /** Extra attempts for failed batch reviews; default 3, within the total budget. */
   maxRetries?: number;
   /** Commit status context reported on the PR head; blank/undefined disables statuses. */
   statusContext?: string;
@@ -439,7 +439,7 @@ function shortSha(sha: string): string {
 interface PostContext {
   db: Db;
   github: ReviewDeps['github'];
-  llm: LLMProvider;
+  llm: Pick<LLMProvider, 'name' | 'model'>;
   repo: RepoRow;
   pr: PullRequest;
   log: (msg: string) => void;
@@ -514,11 +514,12 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
 
 export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
   const { db, llm, retrieve, github } = deps;
+  let activeLlm = llm;
   let costUsd: number | null = 0;
   const complete = async (req: CompleteRequest) => {
     const call = { reported: false, costUsd: 0 as number | null };
     try {
-      return await reviewCallCost.run(call, () => llm.complete(req));
+      return await reviewCallCost.run(call, () => activeLlm.complete(req));
     } finally {
       costUsd = costUsd === null || !call.reported || call.costUsd === null ? null : costUsd + call.costUsd;
     }
@@ -590,6 +591,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         skippedFiles: [],
         warnings: statusWarnings,
       };
+      postCtx.llm = { name: cached.provider ?? 'unknown', model: cached.model ?? 'unknown' };
       if (post && cached.posted === 0) {
         // A previous run stored the review but failed (or was asked not) to post it.
         log(`review: cached review #${cached.id} was never posted; posting it now`);
@@ -663,7 +665,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       reviewable.push(f);
     }
 
-    const budgeted = llm.name === 'openrouter' && llm.model === 'qwen/qwen3-coder';
+    const budgeted = llm.supportsBatchReview === true;
     // Never silently approve files that did not fit the configured review budget.
     if (reviewable.length > maxFiles) {
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
@@ -765,6 +767,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
+      const providers = [llm, ...(llm.reviewFallbacks ?? [])];
+      if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
+      let providerIndex = 0;
       const maxRetries = deps.maxRetries ?? 3;
       const attemptCost = reviewCostUpperBound(req);
       let reservedUsd = 0;
@@ -782,7 +787,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
               files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath ?? f.oldPath)) ||
               obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
-            throw new IncompleteResponseError(llm.name, 'Incomplete review response; no review was published.');
+            throw new IncompleteResponseError(activeLlm.name, 'Incomplete review response; no review was published.');
           }
           let findings: Finding[];
           try {
@@ -790,13 +795,19 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
             }), file, changedNewLines(file)));
           } catch (err) {
-            throw new IncompleteResponseError(llm.name, errMessage(err));
+            throw new IncompleteResponseError(activeLlm.name, errMessage(err));
           }
           batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
           break;
         } catch (err) {
-          if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError) || attempt >= maxRetries) throw err;
-          log(`review: invalid response; retry ${attempt + 1}/${maxRetries}`);
+          const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
+            err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
+          if (!retryable || attempt >= maxRetries) throw err;
+          const previous = activeLlm.model;
+          activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
+          const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
+          warnings.push(message);
+          log(`review: ${message}`);
         }
       }
     }
@@ -902,6 +913,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       head_sha: pr.headSha,
       status: 'done',
       cost_usd: costUsd,
+      provider: activeLlm.name,
+      model: activeLlm.model,
       summary,
       verdict,
       comments_json: JSON.stringify(findings),
@@ -921,6 +934,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       warnings,
     };
 
+    postCtx.llm = activeLlm;
     if (post) await postReview(postCtx, result);
 
     return result;

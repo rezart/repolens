@@ -49,3 +49,17 @@ it('requires a complete GitHub App configuration and preserves PAT-only setups',
   expect(loadConfig({ ...base, GITHUB_APP_ID: '123', GITHUB_APP_INSTALLATION_ID: '456', GITHUB_APP_PRIVATE_KEY_PATH: '/key.pem' }).github.app)
     .toEqual({ appId: '123', installationId: '456', privateKeyPath: '/key.pem' });
 });
+
+it('parses ordered review fallback models and rejects malformed lists or CLI fallbacks', () => {
+  const base = { LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'k' };
+  expect(loadConfig(base).review.fallbackModels).toEqual([]);
+  expect(loadConfig({ ...base, REVIEW_FALLBACK_MODELS: ' qwen/qwen3-coder-next,other/coder ' }).review.fallbackModels).toEqual(['qwen/qwen3-coder-next', 'other/coder']);
+  for (const value of ['qwen/qwen3-coder-next,', 'a,,b', 'a b']) {
+    expect(() => loadConfig({ ...base, REVIEW_FALLBACK_MODELS: value })).toThrow(ConfigError);
+  }
+  expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_FALLBACK_MODELS: 'qwen/qwen3-coder-next' })).toThrow(/OpenRouter/);
+});
+
+it.each(['not-a-url', 'ftp://example.com'])('rejects invalid OpenRouter base URL %s at configuration time', (url) => {
+  expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'm', OPENROUTER_API_KEY: 'k', OPENROUTER_BASE_URL: url })).toThrow(ConfigError);
+});

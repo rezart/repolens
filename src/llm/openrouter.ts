@@ -1,4 +1,4 @@
-import { IncompleteResponseError, ProviderError } from './types.js';
+import { IncompleteResponseError, NetworkProviderError, ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
@@ -16,7 +16,7 @@ export interface OpenRouterOptions {
   sleep?: Sleep;
   /** Sent as `reasoning: { effort }`. Blank/undefined omits it. */
   reasoningEffort?: ReasoningEffort | '';
-  /** Called once per successful completion with the tokens it consumed. */
+  /** Called once when a response reports usage, even if its content is invalid. */
   onUsage?: UsageSink;
 }
 
@@ -50,6 +50,7 @@ export class OpenRouterProvider implements LLMProvider {
   readonly name = 'openrouter';
   readonly model: string;
   readonly concurrency = 4;
+  readonly supportsBatchReview = true;
 
   private readonly apiKey: string;
   private readonly baseUrl: string;
@@ -63,6 +64,10 @@ export class OpenRouterProvider implements LLMProvider {
     this.apiKey = opts.apiKey;
     this.model = opts.model;
     this.baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+    const url = new URL(this.baseUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      throw new Error('OpenRouter base URL must use HTTP(S) without credentials');
+    }
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 300_000;
     this.sleep = opts.sleep ?? defaultSleep;
@@ -114,8 +119,9 @@ export class OpenRouterProvider implements LLMProvider {
     if (req.json) body.response_format = { type: 'json_object' };
     if (this.effort) body.reasoning = { effort: this.effort };
     if (streaming) body.stream = true;
+    // Every model uses the same token bounds and routing price caps below.
     if (req.reviewBudget) {
-      if (this.model !== 'qwen/qwen3-coder' || streaming || !Number.isInteger(req.maxTokens) ||
+      if (streaming || !Number.isInteger(req.maxTokens) ||
           req.maxTokens! <= 0 || req.maxTokens! > REVIEW_MAX_OUTPUT || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
         throw new ProviderError('openrouter', 'Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
@@ -129,8 +135,7 @@ export class OpenRouterProvider implements LLMProvider {
   }
 
   async complete(req: CompleteRequest): Promise<string> {
-    const { content, usage, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS));
-    this.reportUsage(usage);
+    const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS));
     if (req.reviewBudget && finishReason !== 'stop') {
       throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
     }
@@ -232,7 +237,7 @@ export class OpenRouterProvider implements LLMProvider {
         });
       } catch (err) {
         // DNS failures, resets and timeouts arrive as a thrown error, not a response.
-        const netErr = new ProviderError('openrouter', `request failed: ${err instanceof Error ? err.message : String(err)}`);
+        const netErr = new NetworkProviderError('openrouter', `request failed: ${err instanceof Error ? err.message : String(err)}`);
         if (attempt === maxAttempts) throw netErr;
         lastError = netErr;
         await this.sleep(backoffMs(attempt));
@@ -251,25 +256,30 @@ export class OpenRouterProvider implements LLMProvider {
     throw lastError ?? new ProviderError('openrouter', 'request failed');
   }
 
-  /** The message text plus the usage block, if the response carried one. */
-  private async readContent(res: Response): Promise<{ content: string; usage: RawUsage | null | undefined; finishReason?: string }> {
+  /** Record any billed usage before validating the completion. */
+  private async readContent(res: Response): Promise<{ content: string; finishReason?: string }> {
     let parsed: ChatCompletionResponse;
     const text = await safeText(res);
     try {
       parsed = JSON.parse(text) as ChatCompletionResponse;
     } catch {
-      throw new ProviderError('openrouter', 'response was not JSON', res.status, text.slice(0, 500));
+      throw new IncompleteResponseError('openrouter', 'response was not JSON', res.status, text.slice(0, 500));
     }
-    const content = parsed.choices?.[0]?.message?.content;
+    this.reportUsage(parsed?.usage);
+    if (parsed?.error) {
+      const code = typeof parsed.error === 'object' && 'code' in parsed.error ? parsed.error.code : undefined;
+      throw new ProviderError('openrouter', 'response returned an error', typeof code === 'number' ? code : res.status, text.slice(0, 500));
+    }
+    const content = parsed?.choices?.[0]?.message?.content;
     if (typeof content !== 'string') {
-      throw new ProviderError('openrouter', 'response had no message content', res.status, text.slice(0, 500));
+      throw new IncompleteResponseError('openrouter', 'response had no message content', res.status, text.slice(0, 500));
     }
-    return { content, usage: parsed.usage, finishReason: parsed.choices?.[0]?.finish_reason };
+    return { content, finishReason: parsed.choices?.[0]?.finish_reason };
   }
 }
 
 function isRetryable(status: number): boolean {
-  return status === 429 || status >= 500;
+  return status === 408 || status === 429 || status >= 500;
 }
 
 function backoffMs(attempt: number): number {

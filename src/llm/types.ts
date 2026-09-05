@@ -12,7 +12,7 @@ export interface CompleteRequest {
   json?: boolean;
   maxTokens?: number;
   temperature?: number;
-  /** Single-request Qwen review budget; disables retries and caps routing prices. */
+  /** Single-attempt review budget; disables retries and caps routing prices. */
   reviewBudget?: boolean;
 }
 
@@ -24,6 +24,10 @@ export interface LLMProvider {
   readonly model: string;
   /** How many completions may run at once. CLI providers use 1. */
   readonly concurrency: number;
+  /** Supports a whole-PR JSON review with enforced routing prices and no hidden retries. */
+  readonly supportsBatchReview?: boolean;
+  /** Ordered alternatives for batch reviews; selection is local to each review. */
+  readonly reviewFallbacks?: readonly LLMProvider[];
   complete(req: CompleteRequest): Promise<string>;
   /**
    * Optional incremental variant of `complete`. Resolves with the full text;
@@ -62,3 +66,6 @@ export class ProviderError extends Error {
 
 /** A completed model call whose output is incomplete and can be retried. */
 export class IncompleteResponseError extends ProviderError {}
+
+/** A transport failure that may already have consumed inference; reserve its full budget. */
+export class NetworkProviderError extends ProviderError {}

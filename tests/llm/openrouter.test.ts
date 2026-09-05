@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
-import { ProviderError } from '../../src/llm/types.js';
+import { IncompleteResponseError, ProviderError } from '../../src/llm/types.js';
 import type { UsageRecord } from '../../src/usage/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from '../../src/review/budget.js';
 
@@ -29,12 +29,12 @@ function fakeFetch(responses: Response[]) {
 
 const ok = () => jsonResponse({ choices: [{ message: { role: 'assistant', content: 'hello there' } }] });
 
-describe('Qwen review budget', () => {
+describe('OpenRouter review budget', () => {
   const req = { messages: [{ role: 'user' as const, content: 'review this' }], reviewBudget: true, maxTokens: REVIEW_MAX_OUTPUT };
 
-  it('enforces routing prices and counts UTF-8 bytes before making a request', async () => {
+  it.each(['qwen/qwen3-coder', 'qwen/qwen3-coder-next', 'other/coder'])('enforces routing prices and UTF-8 budget bounds for %s', async (model) => {
     const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
-    const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, reasoningEffort: 'high' });
+    const p = new OpenRouterProvider({ apiKey: 'k', model, fetch: f.fetch, reasoningEffort: 'high' });
     const larger = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(20000) }] };
     expect(REVIEW_MAX_USD).toBe(0.245);
     expect(reviewCostUpperBound(larger)).toBeGreaterThan(0.045);
@@ -59,6 +59,15 @@ describe('Qwen review budget', () => {
       await expect(p.complete(req)).rejects.toThrow();
       expect(calls).toBe(1);
     }
+  });
+
+  it.each([401, 429, 503])('preserves an in-band error code %s even with HTTP 200', async (code) => {
+    const f = fakeFetch([jsonResponse({ error: { code, message: 'backend error' } })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'other/coder', fetch: f.fetch });
+    const error = await p.complete(req).catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(ProviderError);
+    expect(error).toMatchObject({ status: code });
+    expect(error).not.toBeInstanceOf(IncompleteResponseError);
   });
 
   it('records billed usage but rejects a truncated response', async () => {
@@ -473,4 +482,8 @@ describe('OpenRouterProvider reasoning effort', () => {
     await p.complete({ messages: [{ role: 'user', content: 'hi' }] });
     expect(JSON.parse(String(f.calls[0]!.init.body)).reasoning).toBeUndefined();
   });
+});
+
+it.each(['not-a-url', 'ftp://example.com', 'https://user:pass@example.com'])('rejects invalid direct provider base URL %s before any retry', (baseUrl) => {
+  expect(() => new OpenRouterProvider({ apiKey: 'k', model: 'm', baseUrl })).toThrow();
 });
