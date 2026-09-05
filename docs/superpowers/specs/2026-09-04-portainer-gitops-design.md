@@ -12,7 +12,7 @@ Deploy every commit merged to `main` to the existing RepoLens production service
 4. Cloudflare routes only that exact webhook path to Portainer on `external-docker:9443`.
 5. Portainer pulls the new image and recreates the RepoLens container.
 
-The first workflow run skips deployment when the webhook secret is absent. This bootstraps the image before the current standalone container is migrated into Portainer.
+The first workflow run skips deployment while `PORTAINER_WEBHOOK_ENABLED` is unset. This bootstraps the image before the current standalone container is migrated into Portainer.
 
 ## Production State
 
@@ -26,6 +26,7 @@ The first workflow run skips deployment when the webhook secret is absent. This 
 
 - The Portainer dashboard remains private. Cloudflare publishes only the generated `/api/stacks/webhooks/<id>` path.
 - The webhook URL is stored as the encrypted GitHub Actions secret `PORTAINER_WEBHOOK_URL`.
+- The repository variable `PORTAINER_WEBHOOK_ENABLED=true` enables deployment after the stack and route exist.
 - GitHub's job token receives only `contents: read` and `packages: write`.
 - A failed image build never calls Portainer, leaving the current container running.
 - The deployment request retries transient failures and fails the workflow if Portainer rejects it.

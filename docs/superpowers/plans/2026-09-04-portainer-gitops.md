@@ -43,7 +43,7 @@ Expected: exit 0 with one `repolens` service and `repolens-data` marked external
 - Create: `.github/workflows/deploy.yml`
 
 **Interfaces:**
-- Consumes: the merge commit, `GITHUB_TOKEN`, and optional `PORTAINER_WEBHOOK_URL`
+- Consumes: the merge commit, `GITHUB_TOKEN`, `PORTAINER_WEBHOOK_URL`, and `PORTAINER_WEBHOOK_ENABLED`
 - Produces: `ghcr.io/rezart/repolens:main`, then one webhook POST
 
 - [ ] **Step 1: Add the image workflow**
@@ -52,7 +52,7 @@ Trigger on pushes to `main`, refuse manual runs for any other ref, grant `conten
 
 - [ ] **Step 2: Add the guarded deployment request**
 
-Expose `secrets.PORTAINER_WEBHOOK_URL` only to the deployment step. Skip the step while the secret is empty; otherwise POST with `curl --fail --retry 3` after the image push.
+Expose `secrets.PORTAINER_WEBHOOK_URL` only to the deployment step. Skip the step until `vars.PORTAINER_WEBHOOK_ENABLED` is `true`; otherwise POST with `curl --fail --retry 3` after the image push.
 
 - [ ] **Step 3: Validate repository behavior**
 
@@ -92,7 +92,7 @@ Enable the stack webhook, re-pull images, and force redeployment when the webhoo
 
 **Interfaces:**
 - Consumes: Portainer webhook path
-- Produces: Cloudflare route and GitHub Actions secret `PORTAINER_WEBHOOK_URL`
+- Produces: Cloudflare route, GitHub Actions secret `PORTAINER_WEBHOOK_URL`, and repository variable `PORTAINER_WEBHOOK_ENABLED`
 
 - [ ] **Step 1: Add the Cloudflare route**
 
@@ -101,6 +101,7 @@ Publish `portainer-webhook.betalabs.org` only for the generated webhook path and
 - [ ] **Step 2: Store the webhook URL**
 
 Set repository secret `PORTAINER_WEBHOOK_URL` to the public path-restricted HTTPS URL.
+Set repository variable `PORTAINER_WEBHOOK_ENABLED` to `true`.
 
 - [ ] **Step 3: Exercise the deployment**
 
