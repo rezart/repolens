@@ -64,6 +64,38 @@ describe('fresh finding evidence validation', () => {
     expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'repository_rule' }] }), file)).toThrow('evidence');
     expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'repository_rule', evidence: { ...base.evidence, rule: { path: 'CLAUDE.md', line: 0, quote: '' } } }] }), file)).toThrow('evidence');
   });
+
+  it('suppresses repository-rule findings whose base rule citation is fabricated', async () => {
+    const llm = fakeLlm({ file: JSON.stringify({ findings: [{ ...base, category: 'repository_rule', evidence: {
+      ...base.evidence, rule: { path: 'CLAUDE.md', line: 999, quote: 'made up rule' },
+    } }] }) });
+    const ruleDb = openDb(':memory:');
+    ruleDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    ruleDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const result = await reviewPullRequest({ db: ruleDb, llm: llm.provider, retrieve: retrieveOne, github: fakeGithub().github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    ruleDb.close();
+    expect(result.findings).toEqual([]);
+    expect(result.warnings.some((warning) => warning.includes('Suppressed repository rule finding'))).toBe(true);
+  });
+
+  it('deduplicates an entire root-cause group on a rerun', async () => {
+    const findings = [
+      { ...base, line: 4, title: 'Shared issue A' },
+      { ...base, line: 3, title: 'Shared issue B', evidence: { ...base.evidence, line: 3 } },
+    ];
+    const makeLlm = () => fakeLlm({ file: JSON.stringify({ findings }) });
+    const ruleDb = openDb(':memory:');
+    ruleDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    ruleDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const firstGithub = fakeGithub();
+    await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: firstGithub.github }, { repoId: REPO_ID, prNumber: 42 });
+    const firstComment = firstGithub.reviews[0]!.input.comments[0]!;
+    const secondGithub = fakeGithub(DIFF, PR, { existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
+    const second = await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: secondGithub.github }, { repoId: REPO_ID, prNumber: 42, force: true });
+    expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
+    expect(second.warnings).toContain('Skipped 2 findings already commented');
+    ruleDb.close();
+  });
 });
 
 const REPO_ID = 'github:o/r';
@@ -872,9 +904,9 @@ describe('reviewPullRequest', () => {
     expect({ owner, repo, number }).toEqual({ owner: 'o', repo: 'r', number: 42 });
     expect(input.commitId).toBe('head-sha-1');
     expect(input.event).toBe('COMMENT');
-    expect(input.comments).toEqual([
-      { path: 'src/app.ts', line: 4, body: '**[critical] Assignment**\n\nUse `===`.' },
-    ]);
+    expect(input.comments).toHaveLength(1);
+    expect(input.comments[0]).toMatchObject({ path: 'src/app.ts', line: 4, body: expect.stringContaining('**[critical] Assignment**\n\nUse `===`.') });
+    expect(input.comments[0]!.body).toMatch(/repolens-root-cause:[a-f0-9]{16}/);
     expect(input.body).toContain('## RepoLens review');
     expect(input.body).toContain('| critical | src/app.ts:4 | Assignment |');
     expect(res.posted).toBe(true);
@@ -1146,9 +1178,8 @@ describe('reviewPullRequest', () => {
 
     expect(gh.listCalls).toEqual([{ owner: 'o', repo: 'r', number: 42 }]);
     expect(res.findings).toHaveLength(2);
-    expect(gh.reviews[0]!.input.comments).toEqual([
-      { path: 'src/app.ts', line: 3, body: '**[nit] Fresh one**\n\nnew' },
-    ]);
+    expect(gh.reviews[0]!.input.comments).toHaveLength(1);
+    expect(gh.reviews[0]!.input.comments[0]).toMatchObject({ path: 'src/app.ts', line: 3, body: expect.stringContaining('**[nit] Fresh one**\n\nnew') });
     expect(res.warnings).toContain('Skipped 1 findings already commented');
   });
 

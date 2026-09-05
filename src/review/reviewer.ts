@@ -1,4 +1,5 @@
 import type { Db, RepoRow } from '../db.js';
+import { createHash } from 'node:crypto';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
@@ -480,6 +481,52 @@ export function selectPostedFindings(findings: Finding[], limit = 3): Finding[] 
     });
 }
 
+function rootCauseMarker(finding: Finding): string {
+  const cause = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title.trim()}`;
+  return createHash('sha256').update(cause.replace(/\s+/g, ' ').toLowerCase()).digest('hex').slice(0, 16);
+}
+
+function postedFindingBody(finding: Finding): string {
+  return `<!-- repolens-root-cause:${rootCauseMarker(finding)} -->\n**[${finding.severity}] ${finding.title}**\n\n${finding.body}`;
+}
+
+async function validateRepositoryRuleFindings(
+  findings: Finding[],
+  github: ReviewDeps['github'],
+  repo: RepoRow,
+  baseSha: string,
+  warnings: string[],
+): Promise<Finding[]> {
+  const contents = new Map<string, string | null>();
+  const valid: Finding[] = [];
+  for (const finding of findings) {
+    const rule = finding.category === 'repository_rule' ? finding.evidence?.rule : undefined;
+    if (!rule) { valid.push(finding); continue; }
+    const fileDir = finding.path.includes('/') ? finding.path.slice(0, finding.path.lastIndexOf('/')) : '';
+    const normalized = rule.path.replace(/^\/+|\/{2,}/g, '/').replace(/\/$/, '');
+    const applicable = (normalized === 'CLAUDE.md' || normalized === 'AGENTS.md') ||
+      (normalized.endsWith('/CLAUDE.md') || normalized.endsWith('/AGENTS.md')) &&
+      (fileDir === normalized.slice(0, normalized.lastIndexOf('/')) || fileDir.startsWith(`${normalized.slice(0, normalized.lastIndexOf('/'))}/`));
+    if (!applicable || rule.line < 1 || !rule.quote.trim()) {
+      warnings.push(`Suppressed repository rule finding at ${finding.path}:${finding.line}: unsupported rule citation.`);
+      continue;
+    }
+    let content = contents.get(normalized);
+    if (content === undefined) {
+      try { content = await github.getFileContent(repo.owner, repo.name, normalized, baseSha); }
+      catch { content = null; }
+      contents.set(normalized, content);
+    }
+    const line = content?.split(/\r?\n/)[rule.line - 1]?.trim();
+    if (!line || line !== rule.quote.trim()) {
+      warnings.push(`Suppressed repository rule finding at ${finding.path}:${finding.line}: rule citation does not match ${normalized}:${rule.line}.`);
+      continue;
+    }
+    valid.push(finding);
+  }
+  return valid;
+}
+
 function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
@@ -554,9 +601,17 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
   let comments = result.findings;
   try {
     const existing = await github.listReviewComments(repo.owner, repo.name, result.prNumber);
-    const kept = comments.filter(
-      (f) => !existing.some((c) => c.path === f.path && c.line === f.line && c.body.includes(f.title)),
-    );
+    const existingMarkers = new Set(existing.flatMap((comment) => [...comment.body.matchAll(/repolens-root-cause:([a-f0-9]{16})/g)].map((match) => match[1]!)));
+    const groups = new Map<string, Finding[]>();
+    for (const finding of comments) {
+      const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+      const group = groups.get(key);
+      if (group) group.push(finding); else groups.set(key, [finding]);
+    }
+    const kept = [...groups.values()].filter((group) => {
+      const marker = rootCauseMarker(group[0]!);
+      return !existingMarkers.has(marker) && !group.some((f) => existing.some((c) => c.path === f.path && c.line === f.line && c.body.includes(f.title)));
+    }).flat();
     const dropped = comments.length - kept.length;
     if (dropped > 0) {
       const msg = `Skipped ${dropped} findings already commented`;
@@ -579,7 +634,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
       comments: selectPostedFindings(comments.filter((f) => f.line > 0)).map((f) => ({
         path: f.path,
         line: f.line,
-        body: `**[${f.severity}] ${f.title}**\n\n${f.body}`,
+        body: postedFindingBody(f),
       })),
     });
     db.markReviewPosted(result.reviewId);
@@ -674,6 +729,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       } catch {
         findings = [];
       }
+      findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings);
       const cachedResult: ReviewResult = {
         reviewId: cached.id,
         prNumber: cached.pr_number,
@@ -1016,7 +1072,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }
     });
 
-    const findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
     const hasCritical = findings.some((f) => f.severity === 'critical');
 
     await assertHeadUnchanged();
