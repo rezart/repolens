@@ -125,6 +125,14 @@ describe('Db', () => {
     expect(db.listReviewJobsForRepo('github:o/n').map((j) => j.id)).toEqual([second.id, first.id]);
   });
 
+  it('adds nullable review costs to an existing database without losing history', () => {
+    const row = db.insertReview({ repo_id: 'github:o/n', pr_number: 7, head_sha: 'old', status: 'done', summary: 'Existing review', verdict: null, comments_json: '[]', posted: 1, error: null });
+    db.raw.exec('alter table reviews drop column cost_usd');
+    migrate(db.raw);
+    migrate(db.raw);
+    expect(db.getReview(row.id)).toMatchObject({ summary: 'Existing review', posted: 1, cost_usd: null });
+  });
+
   it('adds pr_number to a jobs table created before the column existed', () => {
     const hasPrNumber = () => (db.raw.pragma('table_info(jobs)') as Array<{ name: string }>).some((c) => c.name === 'pr_number');
     expect(hasPrNumber()).toBe(true);

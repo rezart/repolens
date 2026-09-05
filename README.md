@@ -105,6 +105,8 @@ With `LLM_PROVIDER=openrouter` and `LLM_MODEL=qwen/qwen3-coder`, a review uses o
 
 Qwen review requests reserve at most **$0.245**, below the $0.25 per-run limit: UTF-8 bytes conservatively bound input tokens (plus message overhead), output is limited to 8,000 tokens, and OpenRouter routing is capped at $0.40/M input and $2/M output with no per-request fee. Retries and provider fallbacks are disabled to avoid duplicate charges after an ambiguous failure. If no provider meets those prices, the run fails rather than exceeding the budget. This covers review inference, not separate repository indexing jobs.
 
+The dashboard’s past-review list shows the reported inference cost for each new review, summed across its calls. Historical reviews and reviews with missing cost reports show “Cost unavailable”; cached reviews retain their original cost. This excludes chat and repository indexing costs.
+
 All selected file diffs are included in full; optional post-change and indexed context is added only while it fits. Reviews exceeding the budget or the 40-file limit fail with an explicit error asking for a smaller PR. Truncated responses or responses missing a reviewed path also fail without posting or caching a clean review.
 
 Run the opt-in paid check with `node --env-file=.env --import tsx scripts/check-review-cost.ts`. It sends only generated synthetic code, reviews 40 files, checks for a planted authorization bug in the last file, asserts the reported cost is at most $0.25, and never posts to GitHub. A run on 2026-09-04 cost **$0.00608** (23,749 input tokens, 509 output tokens), with a conservative reservation of $0.04278.

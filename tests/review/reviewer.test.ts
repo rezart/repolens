@@ -10,6 +10,7 @@ import type {
 } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
+import { UsageTracker } from '../../src/usage/tracker.js';
 import { JobQueue } from '../../src/jobs.js';
 import {
   reviewPullRequest,
@@ -197,6 +198,48 @@ describe('reviewPullRequest', () => {
     db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
   });
   afterEach(() => db.close());
+
+  it.each([
+    { costs: [0.012, 0.003], expected: 0.015 },
+    { costs: [0, 0], expected: 0 },
+    { costs: [0.012, null], expected: null },
+    { costs: [0.012, undefined], expected: null },
+    { costs: [[0.01, 0.002], 0.003], expected: 0.015 },
+    { costs: [[0.01, 0.002], undefined], expected: null },
+  ])('stores the review cost for $costs and preserves it on cache hits', async ({ costs, expected }) => {
+    const tracker = new UsageTracker({ db, pricing: null });
+    const fake = fakeLlm();
+    const record = { provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 };
+    const llm = { ...fake.provider, async complete(req: CompleteRequest) {
+      const costUsd = costs[fake.calls.length];
+      tracker.sinkFor('chat')({ ...record, costUsd: 1 });
+      for (const value of Array.isArray(costUsd) ? costUsd : [costUsd]) {
+        if (value !== undefined) tracker.sinkFor('review')({ ...record, costUsd: value });
+      }
+      return fake.provider.complete(req);
+    } };
+    const deps = makeDeps(db, { llm });
+    const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(fake.calls).toHaveLength(2);
+    expect(db.getReview(result.reviewId)?.cost_usd).toEqual(expected);
+    await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(fake.calls).toHaveLength(2);
+    expect(db.listReviews(REPO_ID)[0]?.cost_usd).toEqual(expected);
+  });
+
+  it('keeps concurrent review costs separate', async () => {
+    const tracker = new UsageTracker({ db, pricing: null });
+    const results = await Promise.all([0.01, 0.02].map(async (costUsd, i) => {
+      const fake = fakeLlm();
+      const llm = { ...fake.provider, async complete(req: CompleteRequest) {
+        await new Promise((resolve) => setTimeout(resolve, i ? 1 : 5));
+        tracker.sinkFor('review')({ provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd });
+        return fake.provider.complete(req);
+      } };
+      return reviewPullRequest(makeDeps(db, { llm }), { repoId: REPO_ID, prNumber: 42 + i, post: false });
+    }));
+    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.02, 0.04]);
+  });
 
   it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
     const paths = Array.from({ length: 40 }, (_, i) => `src/file${i}.ts`);
