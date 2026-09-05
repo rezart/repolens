@@ -46,9 +46,10 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: publish
     runs-on: ubuntu-latest
+    # GitHub does not allow secrets.* in an if expression, so expose it at job scope.
     env:
       PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
     steps:
       - name: Deploy with Portainer
-        if: env.PORTAINER_WEBHOOK_URL != ''
+        if: ${{ env.PORTAINER_WEBHOOK_URL != '' }}
         run: curl --fail --show-error --silent --retry 3 --retry-all-errors --request POST "$PORTAINER_WEBHOOK_URL"
