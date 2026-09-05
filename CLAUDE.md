@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-RepoLens is a self-hosted Greptile clone: it indexes git repositories into SQLite, answers codebase questions with `path:start-end` citations, and reviews GitHub pull requests, posting a review with inline comments and a `repolens/review` commit status that can gate merges. One Node process, no external services. LLM backends are swappable: OpenRouter (HTTP), the `claude` CLI (Claude subscription), and the `codex` CLI (ChatGPT subscription).
+RepoLens is a self-hosted Greptile clone: it indexes git repositories into SQLite, answers codebase questions with `path:start-end` citations, and reviews GitHub pull requests, posting a review with inline comments and a `repolens/review` commit status that can gate merges. One Node process, no external services. LLM backends are swappable: OpenRouter (HTTP) and the `claude` CLI (Claude subscription). The `codex-cli` backend is temporarily disabled until it has a reliable host-isolation boundary; configuration, factory overrides, and direct adapter use must reject it.
 
 ## Commands
 

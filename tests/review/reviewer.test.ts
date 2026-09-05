@@ -8,7 +8,7 @@ import type {
   ExistingReviewComment,
   CommitStatusInput,
 } from '../../src/review/github.js';
-import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
@@ -86,6 +86,7 @@ const CHUNK: RetrievedChunk = {
 interface FakeLlmOptions {
   file?: string | (() => string);
   summary?: string;
+  allowDeleted?: boolean;
 }
 
 function fakeLlm(opts: FakeLlmOptions = {}) {
@@ -97,6 +98,8 @@ function fakeLlm(opts: FakeLlmOptions = {}) {
     async complete(req) {
       calls.push(req);
       if (req.system === FILE_REVIEW_SYSTEM_PROMPT) {
+        if (!opts.allowDeleted && req.messages[0]!.content.includes('File under review: src/gone.ts')) return '{"findings":[]}';
+        if (opts.allowDeleted && !req.messages[0]!.content.includes('File under review: src/gone.ts')) return '{"findings":[]}';
         const f = opts.file ?? '{"findings":[]}';
         return typeof f === 'function' ? f() : f;
       }
@@ -201,12 +204,12 @@ describe('reviewPullRequest', () => {
   afterEach(() => db.close());
 
   it.each([
-    { costs: [0.012, 0.003], expected: 0.015 },
-    { costs: [0, 0], expected: 0 },
-    { costs: [0.012, null], expected: null },
-    { costs: [0.012, undefined], expected: null },
-    { costs: [[0.01, 0.002], 0.003], expected: 0.015 },
-    { costs: [[0.01, 0.002], undefined], expected: null },
+    { costs: [0.012, 0.003, 0.004], expected: 0.019 },
+    { costs: [0, 0, 0], expected: 0 },
+    { costs: [0.012, null, 0.004], expected: null },
+    { costs: [0.012, undefined, 0.004], expected: null },
+    { costs: [[0.01, 0.002], 0.003, 0.004], expected: 0.019 },
+    { costs: [[0.01, 0.002], undefined, 0.004], expected: null },
   ])('stores the review cost for $costs and preserves it on cache hits', async ({ costs, expected }) => {
     const tracker = new UsageTracker({ db, pricing: null });
     const fake = fakeLlm();
@@ -221,10 +224,10 @@ describe('reviewPullRequest', () => {
     } };
     const deps = makeDeps(db, { llm });
     const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls).toHaveLength(3); // modified file, deleted file, summary
     expect(db.getReview(result.reviewId)?.cost_usd).toEqual(expected);
     await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls).toHaveLength(3);
     expect(db.listReviews(REPO_ID)[0]?.cost_usd).toEqual(expected);
   });
 
@@ -239,7 +242,7 @@ describe('reviewPullRequest', () => {
       } };
       return reviewPullRequest(makeDeps(db, { llm }), { repoId: REPO_ID, prNumber: 42 + i, post: false });
     }));
-    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.02, 0.04]);
+    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.03, 0.06]);
   });
 
   it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
@@ -251,7 +254,7 @@ describe('reviewPullRequest', () => {
       calls.push(req);
       return JSON.stringify({ reviewedPaths: paths, summary: 'Updates the files.', verdict: 'request_changes', findings: [
         { path: paths[39], line: 1, severity: 'critical', title: 'Bug', body: 'Fix it.' },
-        { path: paths[0], line: 999, severity: 'warning', title: 'Invalid line', body: 'Ignored.' },
+        { path: paths[0], line: 1, severity: 'warning', title: 'Valid line', body: 'Not ignored.' },
       ] });
     } };
     const retrieve: RetrieveFn = async (req) => {
@@ -265,7 +268,7 @@ describe('reviewPullRequest', () => {
     expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(0.045);
     expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
     expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(2);
-    expect(result.findings).toHaveLength(1);
+    expect(result.findings).toHaveLength(2);
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
     expect(result.warnings.some((w) => w.includes('optional context'))).toBe(true);
@@ -320,13 +323,45 @@ describe('reviewPullRequest', () => {
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => {
       calls++;
-      return calls < 4 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts'] });
+      return calls < 4 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
     } };
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
     expect(calls).toBe(4);
     expect(result.posted).toBe(true);
     expect(result.summary).toBe('Reviewed all changes.');
     expect(gh.reviews).toHaveLength(1);
+  });
+
+  it('retries an incomplete Qwen batch with the deleted file and publishes its body-only finding', async () => {
+    const gh = fakeGithub();
+    const deletedDiff = [
+      '@@ -1,1 +0,0 @@',
+      '    1 - const gone = true;',
+    ].join('\n');
+    const requests: CompleteRequest[] = [];
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async (req: CompleteRequest) => {
+      calls++;
+      requests.push(req);
+      if (calls === 1) return JSON.stringify({ findings: [], summary: 'Incomplete.', verdict: 'approve', reviewedPaths: ['src/app.ts'] });
+      return JSON.stringify({
+        reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Auth was removed.', verdict: 'request_changes',
+        findings: [{ path: 'src/gone.ts', line: 1, severity: 'critical', title: 'Auth removed', body: 'Restore the check.' }],
+      });
+    } };
+
+    const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 });
+
+    expect(calls).toBe(2);
+    expect(requests).toHaveLength(2);
+    for (const req of requests) {
+      const payload = JSON.parse(req.messages[0]!.content.split('\n\n', 1)[0]!) as { files: Array<{ path: string; status: string; diff: string }> };
+      expect(payload.files.find((file) => file.path === 'src/gone.ts')).toMatchObject({ status: 'deleted', diff: deletedDiff });
+    }
+    expect(result.status?.state).toBe('failure');
+    expect(result.findings).toMatchObject([{ path: 'src/gone.ts', line: 0, severity: 'critical' }]);
+    expect(gh.reviews[0]!.input.body).toContain('Auth removed');
+    expect(gh.reviews[0]!.input.comments).toEqual([]);
   });
 
   it.each([undefined, 0, 1])('stops invalid response retries at the configured limit %s', async (maxRetries) => {
@@ -363,7 +398,7 @@ describe('reviewPullRequest', () => {
       fetch: async () => {
         calls++;
         return new Response(JSON.stringify({
-          choices: [{ message: { content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts'] }) }, finish_reason: calls === 1 ? 'length' : 'stop' }],
+          choices: [{ message: { content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }, finish_reason: calls === 1 ? 'length' : 'stop' }],
           usage: { prompt_tokens: 100, completion_tokens: 100, cost: 0.01 },
         }), { status: 200 });
       },
@@ -414,8 +449,8 @@ describe('reviewPullRequest', () => {
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
 
-  it('keeps findings on changed lines and drops the rest', async () => {
-    const llm = fakeLlm({
+  it('fails closed when a finding points outside the reviewable diff', async () => {
+    const llm = fakeLlm({ allowDeleted: true,
       file: JSON.stringify({
         findings: [
           { line: 4, severity: 'critical', title: 'Assignment in condition', body: 'Use `===`.' },
@@ -426,21 +461,10 @@ describe('reviewPullRequest', () => {
       summary: '{"summary":"Adds a guard.","verdict":"request_changes"}',
     });
     const gh = fakeGithub();
-    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+    await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
       repoId: REPO_ID,
       prNumber: 42,
-    });
-
-    expect(res.findings).toHaveLength(1);
-    expect(res.findings[0]).toEqual({
-      path: 'src/app.ts',
-      line: 4,
-      severity: 'critical',
-      title: 'Assignment in condition',
-      body: 'Use `===`.',
-    });
-    expect(res.verdict).toBe('request_changes');
-    expect(res.warnings).toEqual([]);
+    })).rejects.toThrow('invalid finding line');
   });
 
   it('reviews only reviewable files and reports the rest as skipped', async () => {
@@ -450,9 +474,9 @@ describe('reviewPullRequest', () => {
       repoId: REPO_ID,
       prNumber: 42,
     });
-    expect(llm.fileCalls()).toHaveLength(1);
+    expect(llm.fileCalls()).toHaveLength(2);
     expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('src/app.ts');
-    expect(res.skippedFiles.sort()).toEqual(['assets/logo.png', 'package-lock.json', 'src/gone.ts']);
+    expect(res.skippedFiles.sort()).toEqual(['assets/logo.png', 'package-lock.json']);
   });
 
   it('posts a review with the head sha and severity-tagged inline comments', async () => {
@@ -556,33 +580,26 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(2);
   });
 
-  it('records a warning and no findings when a file review returns garbage', async () => {
+  it('fails closed when a file review returns garbage', async () => {
     const llm = fakeLlm({ file: 'I am not JSON at all.' });
     const gh = fakeGithub();
-    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+    await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
       repoId: REPO_ID,
       prNumber: 42,
-    });
-    expect(res.findings).toEqual([]);
-    expect(res.warnings).toHaveLength(1);
-    expect(res.warnings[0]).toContain('src/app.ts');
-    expect(res.summary).toBeTruthy();
-    expect(gh.reviews).toHaveLength(1);
+    })).rejects.toThrow('file review failed');
+    expect(gh.reviews).toHaveLength(0);
   });
 
-  it('falls back to a generated summary when the summary call fails', async () => {
+  it('fails closed when the summary call fails', async () => {
     const llm = fakeLlm({
       file: JSON.stringify({ findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }] }),
       summary: 'not json',
     });
     const gh = fakeGithub();
-    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+    await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
       repoId: REPO_ID,
       prNumber: 42,
-    });
-    expect(res.summary).toBe('Reviewed 1 files, 1 findings.');
-    expect(res.verdict).toBe('comment');
-    expect(res.warnings.some((w) => w.startsWith('summary:'))).toBe(true);
+    })).rejects.toThrow('summary review failed');
   });
 
   it('passes repo instructions and retrieved context to the file prompt', async () => {
@@ -611,21 +628,81 @@ describe('reviewPullRequest', () => {
     };
     const llm = fakeLlm();
     await reviewPullRequest({ db, llm: llm.provider, retrieve, github: fakeGithub().github }, { repoId: REPO_ID, prNumber: 42 });
-    expect(seen).toHaveLength(1);
+    expect(seen).toHaveLength(2);
     expect(seen[0]).toContain('src/app.ts');
     expect(seen[0]).toContain('run');
     expect(seen[0]).toContain('number');
   });
 
-  it('honours maxFiles by skipping the overflow', async () => {
+  it('fails closed on maxFiles overflow for every provider', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub();
-    const res = await reviewPullRequest(
+    await expect(reviewPullRequest(
       { db, llm: llm.provider, retrieve: retrieveOne, github: gh.github, maxFiles: 0 },
       { repoId: REPO_ID, prNumber: 42 },
-    );
+    )).rejects.toThrow('file limit');
     expect(llm.fileCalls()).toHaveLength(0);
-    expect(res.skippedFiles).toContain('src/app.ts');
+  });
+
+  it('reviews deleted source files and keeps findings in the body', async () => {
+    const llm = fakeLlm({ allowDeleted: true,
+      file: JSON.stringify({ findings: [{ line: 1, severity: 'critical', title: 'Auth bypass', body: 'Do not remove this check.' }] }),
+    });
+    const gh = fakeGithub(DIFF);
+    const res = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+      repoId: REPO_ID, prNumber: 42,
+    });
+    const finding = res.findings.find((f) => f.path === 'src/gone.ts');
+    expect(finding).toMatchObject({ line: 0, severity: 'critical' });
+    expect(gh.reviews[0]!.input.comments.some((c) => c.path === 'src/gone.ts')).toBe(false);
+    expect(gh.reviews[0]!.input.body).toContain('Auth bypass');
+  });
+
+  it('reviews deletion-only auth removal and blocks without inline comments', async () => {
+    const diff = 'diff --git a/src/auth.ts b/src/auth.ts\n--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1,2 +1 @@\n-checkAuth();\n serve();\n';
+    const llm = fakeLlm({ file: JSON.stringify({ findings: [{ line: 1, severity: 'critical', title: 'Auth removed', body: 'Restore the check.' }] }) });
+    const gh = fakeGithub(diff);
+    const result = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 });
+    expect(llm.fileCalls()).toHaveLength(1);
+    expect(result.status?.state).toBe('failure');
+    expect(result.findings[0]).toMatchObject({ path: 'src/auth.ts', line: 0 });
+    expect(gh.reviews[0]!.input.comments).toEqual([]);
+    expect(gh.reviews[0]!.input.body).toContain('Restore the check.');
+  });
+
+  it.each(['provider failure', 'invalid severity'])('reports error and does not cache success on %s', async (failure) => {
+    const llm = fakeLlm({ file: () => {
+      if (failure === 'provider failure') throw new Error('unavailable');
+      return JSON.stringify({ findings: [{ line: 4, severity: 'severe', title: 'Auth removed', body: 'Restore the check.' }] });
+    } });
+    const gh = fakeGithub();
+    await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('file review failed');
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+    expect(gh.reviews).toEqual([]);
+  });
+
+  it('reviews deleted source files in Qwen batch mode and blocks on body findings', async () => {
+    const deleted = [
+      'diff --git a/src/auth.ts b/src/auth.ts', 'deleted file mode 100644',
+      '--- a/src/auth.ts', '+++ /dev/null', '@@ -1,2 +0,0 @@',
+      '-checkAuth(user);', '-return secret;', '',
+    ].join('\n');
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async (req: CompleteRequest) => {
+      if (req.system === BATCH_REVIEW_SYSTEM_PROMPT) return JSON.stringify({
+        reviewedPaths: ['src/auth.ts'], summary: 'Removed auth.', verdict: 'request_changes',
+        findings: [{ path: 'src/auth.ts', line: 1, severity: 'critical', title: 'Auth removed', body: 'Restore the check.' }],
+      });
+      throw new Error('unexpected call');
+    } };
+    const gh = fakeGithub(deleted);
+    const res = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, {
+      repoId: REPO_ID, prNumber: 42,
+    });
+    expect(res.findings).toMatchObject([{ path: 'src/auth.ts', line: 0, severity: 'critical' }]);
+    expect(res.status).toEqual({ state: 'failure', description: '1 critical' });
+    expect(gh.reviews[0]!.input.comments).toEqual([]);
+    expect(gh.reviews[0]!.input.body).toContain('Auth removed');
   });
 
   it('keeps the stored review and warns when posting throws', async () => {

@@ -80,4 +80,9 @@ describe('system prompts', () => {
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/previous RepoLens review/i);
     expect(SUMMARY_SYSTEM_PROMPT).toMatch(/previous review/i);
   });
+
+  it('allows deletion findings to be retained without invalid inline comments', () => {
+    expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/deleted file|deletion-only/i);
+    expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/review body/i);
+  });
 });

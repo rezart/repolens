@@ -28,8 +28,8 @@ When a "Previous RepoLens review of this pull request" section is present, this 
 Rules:
 - Do NOT comment on style, formatting, naming preferences or import order.
 - Do NOT praise the change, summarise it, or restate what the code does.
-- Only comment on changed lines: the lines marked with a leading "+" in the diff.
-- The "line" you report MUST be the new-file line number printed at the start of that diff line.
+- Only comment inline on changed lines: the lines marked with a leading "+" in the diff. For a deleted file or deletion-only change with no right-side line, report the finding against any old diff line; RepoLens will retain it in the review body instead of posting an invalid inline comment.
+- For normal changes, the "line" you report MUST be the new-file line number printed at the start of a diff line. For deleted files or deletion-only changes, report the old-file line number printed on a deleted diff line; RepoLens retains those findings in the review body.
 - One finding per issue. Be specific and include a concrete suggested fix.
 - Keep "body" to at most three sentences plus a suggested snippet. State the problem, do not hedge.
 - "body" is GitHub-flavored Markdown: wrap identifiers, paths and expressions in backticks and put suggested code in a fenced block with a language tag (escape newlines as \\n inside the JSON string).
@@ -57,7 +57,7 @@ When a previous review is present, lead with what changed in the commits since t
 
 export const BATCH_REVIEW_SYSTEM_PROMPT = `${REVIEW_SYSTEM_PROMPT}
 
-Review ALL files in the input. Shared post-change context is authoritative for every file. Reconcile previous findings against the current code and per-file delta.
+Review ALL files in the input, including deleted and deletion-only source files. Shared post-change context is authoritative for every file. Reconcile previous findings against the current code and per-file delta.
 ${SUMMARY_GUIDANCE}
 Severity: critical for bugs/security issues that should block merging, warning for likely problems, nit for minor correctness concerns.
 Verdict: request_changes when there are critical findings, comment for other findings, approve when no findings remain.

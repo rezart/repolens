@@ -2,13 +2,14 @@ services:
   repolens:
     build: .
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     env_file: .env
     environment:
       REPOLENS_DATA_DIR: /data
+      REPOLENS_HOST: 0.0.0.0
     volumes:
       - repolens-data:/data
-      # For LLM_PROVIDER=claude-cli / codex-cli inside Docker you would also need the
+      # For LLM_PROVIDER=claude-cli inside Docker you would also need the
       # CLI binaries and their login state; running `npm start` on the host is simpler.
 volumes:
   repolens-data:

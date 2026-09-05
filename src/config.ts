@@ -4,6 +4,7 @@ const envSchema = z.object({
   REPOLENS_DATA_DIR: z.string().default('./data'),
   REPOLENS_API_TOKEN: z.string().default(''),
   REPOLENS_PORT: z.coerce.number().int().positive().default(3000),
+  REPOLENS_HOST: z.string().min(1).default('127.0.0.1'),
   REPOLENS_PUBLIC_URL: z.string().default(''),
 
   LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli']).default('openrouter'),
@@ -48,6 +49,7 @@ export interface Config {
   dataDir: string;
   apiToken: string;
   port: number;
+  hostname?: string;
   publicUrl: string;
   llm: {
     provider: LLMProviderName;
@@ -76,6 +78,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new ConfigError(`Invalid configuration: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   }
   const e = parsed.data;
+  if (e.LLM_PROVIDER === 'codex-cli' || e.CHAT_PROVIDER === 'codex-cli') {
+    throw new ConfigError('codex-cli is temporarily disabled for security; use claude-cli or openrouter');
+  }
   const appFields = [e.GITHUB_APP_ID, e.GITHUB_APP_INSTALLATION_ID, e.GITHUB_APP_PRIVATE_KEY_PATH];
   if (appFields.some(Boolean) && !appFields.every(Boolean)) {
     throw new ConfigError('GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and GITHUB_APP_PRIVATE_KEY_PATH must all be set');
@@ -98,6 +103,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     dataDir: e.REPOLENS_DATA_DIR,
     apiToken: e.REPOLENS_API_TOKEN,
     port: e.REPOLENS_PORT,
+    hostname: e.REPOLENS_HOST,
     publicUrl: e.REPOLENS_PUBLIC_URL,
     llm: {
       provider: e.LLM_PROVIDER,

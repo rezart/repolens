@@ -302,10 +302,10 @@ describe('createProvider', () => {
 
   it('treats an empty model as unset for the cli providers', () => {
     const cfg = baseConfig();
-    cfg.llm.provider = 'codex-cli';
+    cfg.llm.provider = 'claude-cli';
     cfg.llm.model = '';
     const p = createProvider(cfg);
-    expect(p.name).toBe('codex-cli');
+    expect(p.name).toBe('claude-cli');
     expect(p.model).toBe('default');
   });
 });

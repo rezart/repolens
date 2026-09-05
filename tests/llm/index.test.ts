@@ -19,13 +19,9 @@ describe('createProvider', () => {
     expect(p.model).toBe('haiku');
   });
 
-  it('overrides the provider, so chat can run on a different backend than reviews', () => {
-    const config = loadConfig({ ...base, CHAT_PROVIDER: 'codex-cli', CHAT_MODEL: 'gpt-5-mini' });
-    const chat = createProvider(config, { provider: config.chatProvider || undefined, model: config.chatModel });
-    expect(chat.name).toBe('codex-cli');
-    expect(chat.model).toBe('gpt-5-mini');
-    // The review backend is unaffected.
-    expect(createProvider(config).name).toBe('claude-cli');
+  it('rejects a direct Codex provider override', () => {
+    const config = loadConfig(base);
+    expect(() => createProvider(config, { provider: 'codex-cli' })).toThrow(/codex-cli is temporarily disabled/);
   });
 
   it('rejects an openrouter override without an API key', () => {
@@ -57,7 +53,7 @@ describe('createProvider', () => {
     const onUsage = () => {};
     const sinkOf = (p: LLMProvider): unknown => (p as unknown as { onUsage?: unknown }).onUsage;
     const config = loadConfig({ ...base, OPENROUTER_API_KEY: 'k' });
-    for (const provider of ['claude-cli', 'codex-cli', 'openrouter'] as const) {
+    for (const provider of ['claude-cli', 'openrouter'] as const) {
       const p = createProvider(config, { provider, model: 'anthropic/claude-sonnet-4.5', onUsage });
       expect(sinkOf(p), provider).toBe(onUsage);
     }
