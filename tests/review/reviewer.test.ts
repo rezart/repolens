@@ -24,9 +24,27 @@ import {
   defaultIdentifiers,
   defaultFormatContext,
   statusForFindings,
+  selectPostedFindings,
   type ReviewDeps,
   type Finding,
 } from '../../src/review/reviewer.js';
+
+describe('review finding posting', () => {
+  it('keeps at most three root causes and folds related locations into the strongest comment', () => {
+    const finding = (path: string, line: number, severity: Finding['severity'], rootCause: string): Finding => ({
+      path, line, severity, title: `${rootCause} at ${path}`, body: 'Fix it.', rootCause,
+      category: 'correctness', confidence: 'high', evidence: { path, line, trigger: 'input', consequence: 'failure' },
+    });
+    const selected = selectPostedFindings([
+      finding('a.ts', 1, 'warning', 'shared'), finding('b.ts', 2, 'critical', 'shared'),
+      finding('c.ts', 3, 'warning', 'second'), finding('d.ts', 4, 'nit', 'third'), finding('e.ts', 5, 'warning', 'fourth'),
+    ]);
+    expect(selected).toHaveLength(3);
+    expect(selected[0]).toMatchObject({ path: 'b.ts', line: 2, rootCause: 'shared' });
+    expect(selected[0]!.body).toContain('Related locations: a.ts:1');
+    expect(selected.map((f) => f.rootCause)).toEqual(['shared', 'second', 'fourth']);
+  });
+});
 
 const REPO_ID = 'github:o/r';
 

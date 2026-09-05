@@ -23,6 +23,17 @@ import {
 
 export type Severity = 'critical' | 'warning' | 'nit';
 export type Verdict = 'approve' | 'comment' | 'request_changes';
+export type FindingCategory = 'correctness' | 'edge_case' | 'security' | 'test_gap' | 'repository_rule';
+export type FindingConfidence = 'high' | 'medium' | 'low';
+
+export interface FindingEvidence {
+  path: string;
+  line: number;
+  trigger: string;
+  consequence: string;
+  /** Required when category is repository_rule; verified against repository instructions later. */
+  rule?: { path: string; line: number; quote: string };
+}
 /** Which findings make the commit status fail. */
 export type FailOn = 'critical' | 'warning' | 'never';
 
@@ -37,6 +48,11 @@ export interface Finding {
   severity: Severity;
   title: string;
   body: string;
+  /** Optional in storage so reviews written before evidence was introduced remain readable. */
+  category?: FindingCategory;
+  confidence?: FindingConfidence;
+  rootCause?: string;
+  evidence?: FindingEvidence;
 }
 
 /** Thrown when a new push lands on the PR mid-review; the fresh head gets its own review. */
@@ -407,9 +423,61 @@ function parseFindings(raw: string, file: DiffFile): Finding[] {
     const sevRaw = typeof e.severity === 'string' ? e.severity.toLowerCase().trim() : '';
     if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new Error(`model output contains an invalid finding severity for ${path}`);
     const severity = sevRaw as Severity;
-    out.push({ path, line: bodyOnly ? 0 : line, severity, title: title || body.slice(0, 60), body: body || title });
+    const category = typeof e.category === 'string' ? e.category.trim() : '';
+    if (!(['correctness', 'edge_case', 'security', 'test_gap', 'repository_rule'] as const).includes(category as FindingCategory)) {
+      throw new Error(`model output contains an invalid finding category for ${path}`);
+    }
+    const confidence = typeof e.confidence === 'string' ? e.confidence.toLowerCase().trim() : '';
+    if (!(['high', 'medium', 'low'] as const).includes(confidence as FindingConfidence)) {
+      throw new Error(`model output contains an invalid finding confidence for ${path}`);
+    }
+    const rootCause = typeof e.rootCause === 'string' ? e.rootCause.trim() : '';
+    if (!rootCause) throw new Error(`model output contains no finding rootCause for ${path}`);
+    if (!e.evidence || typeof e.evidence !== 'object' || Array.isArray(e.evidence)) {
+      throw new Error(`model output contains no finding evidence for ${path}`);
+    }
+    const evidence = e.evidence as Record<string, unknown>;
+    const evidencePath = typeof evidence.path === 'string' ? evidence.path.trim() : '';
+    const evidenceLine = typeof evidence.line === 'number' ? evidence.line : typeof evidence.line === 'string' ? Number(evidence.line) : NaN;
+    const trigger = typeof evidence.trigger === 'string' ? evidence.trigger.trim() : '';
+    const consequence = typeof evidence.consequence === 'string' ? evidence.consequence.trim() : '';
+    const ruleRaw = evidence.rule;
+    const rule = ruleRaw && typeof ruleRaw === 'object' && !Array.isArray(ruleRaw) ? ruleRaw as Record<string, unknown> : null;
+    const rulePath = typeof rule?.path === 'string' ? rule.path.trim() : '';
+    const ruleLine = typeof rule?.line === 'number' ? rule.line : typeof rule?.line === 'string' ? Number(rule.line) : NaN;
+    const ruleQuote = typeof rule?.quote === 'string' ? rule.quote.trim() : '';
+    if (evidencePath !== path || evidenceLine !== line || !Number.isInteger(evidenceLine) || !trigger || !consequence ||
+        (category === 'repository_rule' && (!rulePath || !Number.isInteger(ruleLine) || ruleLine < 1 || !ruleQuote))) {
+      throw new Error(`model output contains invalid finding evidence for ${path}`);
+    }
+    out.push({ path, line: bodyOnly ? 0 : line, severity, title: title || body.slice(0, 60), body: body || title,
+      category: category as FindingCategory, confidence: confidence as FindingConfidence, rootCause,
+      evidence: { path: evidencePath, line: evidenceLine, trigger, consequence,
+        ...(rulePath ? { rule: { path: rulePath, line: ruleLine, quote: ruleQuote } } : {}) } });
   }
   return out;
+}
+
+/** Select the comments to send to GitHub while retaining all findings for status and storage. */
+export function selectPostedFindings(findings: Finding[], limit = 3): Finding[] {
+  const groups = new Map<string, Finding[]>();
+  for (const finding of findings) {
+    const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+    const group = groups.get(key);
+    if (group) group.push(finding);
+    else groups.set(key, [finding]);
+  }
+  const rank = (f: Finding) => severityRank(f.severity);
+  const representative = (group: Finding[]) => [...group].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.line - b.line || a.title.localeCompare(b.title))[0]!;
+  return [...groups.entries()]
+    .map(([key, group]) => ({ key, group, finding: representative(group) }))
+    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || a.key.localeCompare(b.key))
+    .slice(0, Math.max(0, limit))
+    .map(({ group, finding }) => {
+      const related = group.filter((other) => other !== finding && other.line > 0);
+      if (!related.length) return finding;
+      return { ...finding, body: `${finding.body}\n\nRelated locations: ${related.map((other) => `${other.path}:${other.line}`).join(', ')}` };
+    });
 }
 
 function plural(n: number, word: string): string {
@@ -508,7 +576,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
       commitId: pr.headSha,
       body,
       event: result.verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT',
-      comments: comments.filter((f) => f.line > 0).map((f) => ({
+      comments: selectPostedFindings(comments.filter((f) => f.line > 0)).map((f) => ({
         path: f.path,
         line: f.line,
         body: `**[${f.severity}] ${f.title}**\n\n${f.body}`,
