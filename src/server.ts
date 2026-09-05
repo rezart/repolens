@@ -1,10 +1,12 @@
 import { serve } from '@hono/node-server';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Config } from './config.js';
 import { openDb } from './db.js';
 import { createProvider } from './llm/index.js';
 import { createEmbeddings } from './embeddings/index.js';
 import { createRetriever } from './search/retrieve.js';
+import { createAppTokenProvider } from './review/github-app.js';
 import { GitHubClient } from './review/github.js';
 import { JobQueue } from './jobs.js';
 import { createApp, type AppDeps } from './app.js';
@@ -13,6 +15,9 @@ import { UsageTracker } from './usage/tracker.js';
 import { startPoller } from './poller.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
+  const token = config.github.app
+    ? createAppTokenProvider({ ...config.github.app, privateKey: readFileSync(config.github.app.privateKeyPath, 'utf8') }, { baseUrl: config.github.apiUrl })
+    : config.github.token;
   const db = openDb(join(config.dataDir, 'repolens.db'));
   // Accounting is wired before the backends so each one gets its role's sink.
   // The price list is public, so it is fetched with or without an OpenRouter key.
@@ -34,7 +39,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   });
   const embeddings = createEmbeddings(config, { onUsage: usage.sinkFor('embed') });
   const retrieve = createRetriever({ db, embeddings });
-  const github = new GitHubClient({ token: config.github.token, baseUrl: config.github.apiUrl });
+  const github = new GitHubClient({ token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
   return { config, db, llm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }

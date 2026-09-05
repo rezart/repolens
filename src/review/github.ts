@@ -66,7 +66,7 @@ export function truncateDescription(text: string, max = STATUS_DESCRIPTION_MAX):
 }
 
 export interface GitHubClientOptions {
-  token: string;
+  token: string | (() => Promise<string>);
   baseUrl?: string;
   fetch?: typeof fetch;
 }
@@ -88,7 +88,7 @@ interface RawResponse {
 }
 
 export class GitHubClient {
-  private readonly token: string;
+  private readonly token: string | (() => Promise<string>);
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
 
@@ -98,14 +98,20 @@ export class GitHubClient {
     this.fetchImpl = opts.fetch ?? fetch;
   }
 
+  async getToken(): Promise<string> {
+    const token = typeof this.token === 'function' ? await this.token() : this.token;
+    return token.trim();
+  }
+
   private async request(path: string, opts: RequestOptions = {}): Promise<RawResponse> {
     const method = opts.method ?? 'GET';
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.token}`,
       Accept: opts.accept ?? 'application/vnd.github+json',
       'X-GitHub-Api-Version': API_VERSION,
       'User-Agent': USER_AGENT,
     };
+    const token = await this.getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
     const init: RequestInit = { method, headers };
     if (opts.body !== undefined) {
       headers['Content-Type'] = 'application/json';
