@@ -401,7 +401,7 @@ function allowedFindingLines(file: DiffFile): Set<number> {
   return new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
 }
 
-function parseFindings(raw: string, file: DiffFile): Finding[] {
+export function parseFindings(raw: string, file: DiffFile): Finding[] {
   const parsed = extractJson(raw) as { findings?: unknown } | unknown[];
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
   if (!list) throw new Error('model output has no "findings" array');

@@ -22,6 +22,8 @@ Focus only on things that matter:
 - breaking changes to public behaviour, schemas or contracts
 - a fix applied at one call site when other callers of the same function share the bug
 
+Every finding must fit exactly one target category: correctness means a definite failure in changed execution; edge_case means a concrete supported trigger that breaks behavior; security means an input or permission vulnerability; test_gap means a demonstrable behavior change with no test coverage for that behavior; repository_rule means a violation of an exact rule cited from a repository instruction file.
+
 Context comes in two kinds. Content under "Files changed in this pull request" is the post-change state and is authoritative. Content from the base-branch index may be stale for any file changed in this PR. Never report a symbol, export, method, option or type as missing or nonexistent unless you have verified it is absent from the post-change content of the files provided; if a referenced file's post-change content is not provided, do not speculate about its exports.
 
 When a "Previous RepoLens review of this pull request" section is present, this is a re-review: build on it instead of starting over. Re-report a previous finding that still applies, at its current line number. Drop a previous finding that the "Changes to this file since the previous review" resolved. Drop a previous finding you now judge was wrong; do not keep it alive out of consistency. On a file that is unchanged since the previous review, the previous review read the same lines and raised nothing else, so add a new finding there only when you are certain. Use the "Commits in this pull request" list to understand how the change was built and which commits responded to the previous review, and the "Repository overview" to judge whether the change fits the architecture it lands in.
@@ -49,7 +51,7 @@ Respond ONLY with a single JSON object, no prose and no markdown fence:
 Severity: "critical" for bugs/security issues that should block the merge, "warning" for likely problems, "nit" for minor correctness concerns.
 
 Bad finding: {"line":42,"severity":"warning","title":"Possible issue with error handling","body":"Have you considered whether the error thrown here might not be handled by all callers? It may be worth reviewing."}
-Good finding: {"line":42,"severity":"critical","title":"Rejected promise from fetchUser is never awaited","body":"\`fetchUser(id)\` is called without \`await\`, so a failure becomes an unhandled rejection and the handler returns 200 with an empty body. Let the existing catch on line 38 handle it:\\n\\n\`\`\`ts\\nconst user = await fetchUser(id);\\n\`\`\`"}
+Good finding: {"line":42,"severity":"critical","category":"correctness","confidence":"high","rootCause":"unhandled fetch failure","evidence":{"path":"src/users.ts","line":42,"trigger":"fetchUser rejects for an unknown id","consequence":"the handler returns 200 without the error response"},"title":"Rejected promise from fetchUser is never awaited","body":"\`fetchUser(id)\` is called without \`await\`, so a failure becomes an unhandled rejection and the handler returns 200 with an empty body. Let the existing catch on line 38 handle it:\\n\\n\`\`\`ts\\nconst user = await fetchUser(id);\\n\`\`\`"}
 
 If the change looks fine, respond with {"findings":[]}.
 
