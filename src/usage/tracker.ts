@@ -68,7 +68,10 @@ export class UsageTracker {
       const cost = role === 'review' ? reviewCallCost.getStore() : undefined;
       if (cost) {
         cost.reported = true;
-        cost.costUsd = cost.costUsd === null || record.costUsd === null ? null : cost.costUsd + record.costUsd;
+        const next = cost.costUsd !== null && typeof record.costUsd === 'number' && Number.isFinite(record.costUsd) && record.costUsd >= 0
+          ? cost.costUsd + record.costUsd
+          : null;
+        cost.costUsd = next !== null && Number.isFinite(next) ? next : null;
       }
       try {
         this.db.insertUsage({

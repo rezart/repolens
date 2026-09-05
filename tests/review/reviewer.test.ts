@@ -343,13 +343,17 @@ describe('reviewPullRequest', () => {
   });
 
   it('records malformed Qwen JSON as an error and continues processing jobs', async () => {
-    const gh = fakeGithub();
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => 'not JSON' };
     const queue = new JobQueue(db);
-    const failed = queue.enqueue('review', REPO_ID, () => reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 }));
+    const failed = queue.enqueue('review', REPO_ID, (ctx) => reviewPullRequest({ db, llm, maxRetries: 3, retrieve: retrieveOne, github: gh.github, log: (m) => ctx.progress(m), statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 }));
     const next = queue.enqueue('review', REPO_ID, async () => 'still running');
     await queue.idle();
     expect(db.getJob(failed.id)?.status).toBe('error');
+    expect(db.getJob(failed.id)?.error).toContain('Last retry error: No JSON object found in model output');
+    expect(db.getJob(failed.id)?.error).toContain('used $0.000000, reserved $');
+    expect(db.getJob(failed.id)?.progress).toContain('commit status error');
+    expect(db.getJob(failed.id)?.error).toContain('next attempt $');
     expect(db.getJob(next.id)?.status).toBe('done');
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
@@ -488,7 +492,7 @@ describe('reviewPullRequest', () => {
   });
 
   it('retries truncated provider output and counts the cost of both attempts', async () => {
-    const gh = fakeGithub();
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
     const llm = new OpenRouterProvider({
@@ -506,6 +510,88 @@ describe('reviewPullRequest', () => {
     expect(result.posted).toBe(true);
     expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(0.02);
     expect(gh.reviews).toHaveLength(1);
+  });
+
+  it.each([
+    { name: 'missing', costs: [] },
+    { name: 'null then valid', costs: [null, 0.02] },
+    { name: 'negative then positive', costs: [-0.01, 0.02] },
+    { name: 'positive then negative', costs: [0.02, -0.01] },
+    { name: 'NaN', costs: [Number.NaN, 0.02] },
+    { name: 'Infinity', costs: [Number.POSITIVE_INFINITY, 0.02] },
+    { name: 'aggregate overflow', costs: [Number.MAX_VALUE, Number.MAX_VALUE] },
+  ])('keeps a full reservation for $name billing', async ({ costs }) => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const record = { provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 };
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        for (const costUsd of costs) tracker.sinkFor('review')({ ...record, costUsd });
+        return '{}';
+      },
+    };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 2, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
+    expect(calls).toBe(1);
+    expect(gh.reviews).toHaveLength(0);
+  });
+
+  it.each([0, 0.02])('reconciles cheap invalid calls billed at %s across model fallback', async (costUsd) => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    const models: string[] = [];
+    const provider = (model: string): LLMProvider => ({
+      name: 'openrouter', model, supportsBatchReview: true, concurrency: 1,
+      async complete(req: CompleteRequest) {
+        expect(reviewCostUpperBound(req) * 2).toBeGreaterThan(REVIEW_MAX_USD);
+        expect(costUsd + reviewCostUpperBound(req)).toBeLessThanOrEqual(REVIEW_MAX_USD);
+        models.push(model);
+        // Multiple valid events are summed for this attempt.
+        const record = { provider: 'openrouter', model, inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 };
+        tracker.sinkFor('review')({ ...record, costUsd: costUsd / 2 });
+        tracker.sinkFor('review')({ ...record, costUsd: costUsd / 2 });
+        return models.length < 2 ? '{}' : JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
+      },
+    });
+    const llm = { ...provider('qwen/qwen3-coder-next'), reviewFallbacks: [provider('qwen/qwen3-coder')] };
+    const result = await reviewPullRequest({ db, llm, maxRetries: 2, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+    expect(models).toEqual(['qwen/qwen3-coder-next', 'qwen/qwen3-coder']);
+    expect(result.posted).toBe(true);
+    expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(costUsd * 2);
+  });
+
+  it.each([0, 1])('keeps maxRetries=%s when failed calls report zero cost', async (maxRetries) => {
+    const gh = fakeGithub();
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, supportsBatchReview: true, async complete() {
+      calls++;
+      tracker.sinkFor('review')({ provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0 });
+      return '{}';
+    } };
+    await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
+    expect(calls).toBe(maxRetries + 1);
+  });
+
+  it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.3, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, supportsBatchReview: true, async complete() {
+      calls++;
+      tracker.sinkFor('review')({ provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd });
+      return content;
+    } };
+    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow(`used $${costUsd.toFixed(6)}`);
+    expect(calls).toBe(1);
+    expect(gh.reviews).toHaveLength(0);
+  });
+
+  it.each([undefined, null, false, 0])('preserves a provider rejection of %s', async (failure) => {
+    const llm = { ...fakeLlm().provider, supportsBatchReview: true, complete: async () => { throw failure; } };
+    await expect(reviewPullRequest(makeDeps(db, { llm }), { repoId: REPO_ID, prNumber: 42 })).rejects.toBe(failure);
   });
 
   it('does not retry provider authentication failures', async () => {
