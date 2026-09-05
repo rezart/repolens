@@ -93,7 +93,7 @@ export class GitHubClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: GitHubClientOptions) {
-    this.token = opts.token.trim();
+    this.token = opts.token;
     this.baseUrl = (opts.baseUrl ?? 'https://api.github.com').replace(/\/+$/, '');
     this.fetchImpl = opts.fetch ?? fetch;
   }
@@ -105,7 +105,8 @@ export class GitHubClient {
       'X-GitHub-Api-Version': API_VERSION,
       'User-Agent': USER_AGENT,
     };
-    if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    const token = this.token.trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
     const init: RequestInit = { method, headers };
     if (opts.body !== undefined) {
       headers['Content-Type'] = 'application/json';
