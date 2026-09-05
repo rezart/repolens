@@ -22,6 +22,8 @@ export interface CreateProviderOptions {
   reasoningEffort?: ReasoningEffort | '';
   /** Where the backend reports each call's tokens; one sink per role. */
   onUsage?: UsageSink;
+  /** OpenRouter review alternatives, in priority order. Omitted for chat. */
+  fallbackModels?: readonly string[];
 }
 
 /**
@@ -34,6 +36,7 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
   if (provider === 'codex-cli') {
     throw new Error('codex-cli is temporarily disabled for security; use claude-cli or openrouter');
   }
+  if (opts.fallbackModels?.length && provider !== 'openrouter') throw new Error('Review fallbacks require OpenRouter');
   const model = opts.model ?? llm.model;
   // `??` so an explicit '' override still means "leave the backend default alone".
   const reasoningEffort = opts.reasoningEffort ?? llm.reasoningEffort;
@@ -46,13 +49,16 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
       if (!model) {
         throw new Error('A model is required for the openrouter provider (set LLM_MODEL or CHAT_MODEL)');
       }
-      return new OpenRouterProvider({
+      return Object.assign(new OpenRouterProvider({
         apiKey: llm.openrouterApiKey,
         model,
         baseUrl: llm.openrouterBaseUrl,
         timeoutMs: llm.timeoutMs,
         reasoningEffort,
         onUsage: opts.onUsage,
+      }), {
+        reviewFallbacks: [...new Set(opts.fallbackModels ?? [])].filter((m) => m !== model).map((model) =>
+          createProvider(config, { ...opts, model, fallbackModels: undefined })),
       });
     case 'claude-cli':
       return new ClaudeCliProvider({

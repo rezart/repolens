@@ -101,3 +101,12 @@ describe('completeStreaming', () => {
     expect(seen).toEqual([]);
   });
 });
+
+it('builds an ordered, deduplicated review fallback list only when requested', () => {
+  const config = loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'k' });
+  const p = createProvider(config, { fallbackModels: ['qwen/qwen3-coder', 'qwen/qwen3-coder-next', 'qwen/qwen3-coder-next', 'other/coder'] });
+  expect(p.supportsBatchReview).toBe(true);
+  expect(p.reviewFallbacks?.map((f) => f.model)).toEqual(['qwen/qwen3-coder-next', 'other/coder']);
+  expect(p.reviewFallbacks?.every((f) => f.supportsBatchReview)).toBe(true);
+  expect(createProvider(config).reviewFallbacks ?? []).toEqual([]);
+});

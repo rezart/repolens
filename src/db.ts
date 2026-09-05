@@ -65,6 +65,9 @@ export interface ReviewRow {
   pr_number: number;
   head_sha: string;
   status: 'done' | 'error';
+  /** Backend that produced the saved review; null for historical reviews. */
+  provider: string | null;
+  model: string | null;
   /** Reported inference total; null for historical or incompletely priced reviews. */
   cost_usd: number | null;
   summary: string | null;
@@ -427,13 +430,13 @@ export class Db {
   }
 
   // ---- reviews ----
-  insertReview(r: Omit<ReviewRow, 'id' | 'created_at' | 'cost_usd'> & { cost_usd?: number | null }): ReviewRow {
+  insertReview(r: Omit<ReviewRow, 'id' | 'created_at' | 'cost_usd' | 'provider' | 'model'> & { cost_usd?: number | null; provider?: string | null; model?: string | null }): ReviewRow {
     const res = this.raw
       .prepare(
-        `insert into reviews (repo_id, pr_number, head_sha, status, summary, verdict, comments_json, posted, error, cost_usd)
-         values (@repo_id, @pr_number, @head_sha, @status, @summary, @verdict, @comments_json, @posted, @error, @cost_usd)`,
+        `insert into reviews (repo_id, pr_number, head_sha, status, summary, verdict, comments_json, posted, error, cost_usd, provider, model)
+         values (@repo_id, @pr_number, @head_sha, @status, @summary, @verdict, @comments_json, @posted, @error, @cost_usd, @provider, @model)`,
       )
-      .run({ cost_usd: null, ...r });
+      .run({ cost_usd: null, provider: null, model: null, ...r });
     return this.getReview(Number(res.lastInsertRowid))!;
   }
 
@@ -556,6 +559,9 @@ export class Db {
 export function migrate(raw: Database.Database) {
   const reviewColumns = raw.pragma('table_info(reviews)') as Array<{ name: string }>;
   if (!reviewColumns.some((c) => c.name === 'cost_usd')) raw.exec(`alter table reviews add column cost_usd real`);
+  for (const column of ['provider', 'model']) {
+    if (!reviewColumns.some((c) => c.name === column)) raw.exec(`alter table reviews add column ${column} text`);
+  }
   const columns = raw.pragma('table_info(jobs)') as Array<{ name: string }>;
   if (!columns.some((c) => c.name === 'pr_number')) raw.exec(`alter table jobs add column pr_number integer`);
 }

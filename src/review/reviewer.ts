@@ -2,7 +2,7 @@ import type { Db, RepoRow } from '../db.js';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
-import { IncompleteResponseError } from '../llm/types.js';
+import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
 import { truncateDescription } from './github.js';
@@ -80,7 +80,7 @@ export interface ReviewDeps {
   /** Injected from search/retrieve.ts in production. */
   formatContext?: (chunks: RetrievedChunk[]) => string;
   maxFiles?: number;
-  /** Extra attempts for invalid batch responses; default 3, within the total budget. */
+  /** Extra attempts for failed batch reviews; default 3, within the total budget. */
   maxRetries?: number;
   /** Commit status context reported on the PR head; blank/undefined disables statuses. */
   statusContext?: string;
@@ -373,26 +373,26 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return results;
 }
 
-function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Finding[] {
+function parseFindings(raw: string, file: DiffFile, allowed: Set<number>, provider: string): Finding[] {
   const parsed = extractJson(raw) as { findings?: unknown } | unknown[];
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
-  if (!list) throw new Error('model output has no "findings" array');
+  if (!list) throw new IncompleteResponseError(provider, 'model output has no "findings" array');
   const path = file.newPath ?? file.oldPath ?? '';
   const bodyAllowed = new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
   const out: Finding[] = [];
   for (const entry of list) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('model output contains a malformed finding');
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new IncompleteResponseError(provider, 'model output contains a malformed finding');
     const e = entry as Record<string, unknown>;
     const line = typeof e.line === 'number' ? e.line : typeof e.line === 'string' ? Number(e.line) : NaN;
     const bodyOnly = file.status === 'deleted' || allowed.size === 0;
     if (!Number.isInteger(line) || (!bodyOnly && !allowed.has(line)) || (bodyOnly && !bodyAllowed.has(line))) {
-      throw new Error(`model output contains an invalid finding line for ${path}`);
+      throw new IncompleteResponseError(provider, `model output contains an invalid finding line for ${path}`);
     }
     const title = typeof e.title === 'string' ? e.title.trim() : '';
     const body = typeof e.body === 'string' ? e.body.trim() : '';
-    if (!title && !body) throw new Error(`model output contains an empty finding for ${path}`);
+    if (!title && !body) throw new IncompleteResponseError(provider, `model output contains an empty finding for ${path}`);
     const sevRaw = typeof e.severity === 'string' ? e.severity.toLowerCase().trim() : '';
-    if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new Error(`model output contains an invalid finding severity for ${path}`);
+    if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new IncompleteResponseError(provider, `model output contains an invalid finding severity for ${path}`);
     const severity = sevRaw as Severity;
     out.push({ path, line: bodyOnly ? 0 : line, severity, title: title || body.slice(0, 60), body: body || title });
   }
@@ -439,7 +439,7 @@ function shortSha(sha: string): string {
 interface PostContext {
   db: Db;
   github: ReviewDeps['github'];
-  llm: LLMProvider;
+  llm: Pick<LLMProvider, 'name' | 'model'>;
   repo: RepoRow;
   pr: PullRequest;
   log: (msg: string) => void;
@@ -514,11 +514,12 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
 
 export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
   const { db, llm, retrieve, github } = deps;
+  let activeLlm = llm;
   let costUsd: number | null = 0;
   const complete = async (req: CompleteRequest) => {
     const call = { reported: false, costUsd: 0 as number | null };
     try {
-      return await reviewCallCost.run(call, () => llm.complete(req));
+      return await reviewCallCost.run(call, () => activeLlm.complete(req));
     } finally {
       costUsd = costUsd === null || !call.reported || call.costUsd === null ? null : costUsd + call.costUsd;
     }
@@ -590,6 +591,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         skippedFiles: [],
         warnings: statusWarnings,
       };
+      postCtx.llm = { name: cached.provider ?? 'unknown', model: cached.model ?? 'unknown' };
       if (post && cached.posted === 0) {
         // A previous run stored the review but failed (or was asked not) to post it.
         log(`review: cached review #${cached.id} was never posted; posting it now`);
@@ -663,7 +665,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       reviewable.push(f);
     }
 
-    const budgeted = llm.name === 'openrouter' && llm.model === 'qwen/qwen3-coder';
+    const budgeted = llm.supportsBatchReview === true;
     // Never silently approve files that did not fit the configured review budget.
     if (reviewable.length > maxFiles) {
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
@@ -765,6 +767,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
+      const providers = [llm, ...(llm.reviewFallbacks ?? [])];
+      if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
+      let providerIndex = 0;
       const maxRetries = deps.maxRetries ?? 3;
       const attemptCost = reviewCostUpperBound(req);
       let reservedUsd = 0;
@@ -782,18 +787,24 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
               files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath ?? f.oldPath)) ||
               obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
-            throw new IncompleteResponseError(llm.name, 'Incomplete review response; no review was published.');
+            throw new IncompleteResponseError(activeLlm.name, 'Incomplete review response; no review was published.');
           }
           batch = {
             findings: files.flatMap((file) => parseFindings(JSON.stringify({
               findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-            }), file, changedNewLines(file))),
+            }), file, changedNewLines(file), activeLlm.name)),
             summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
           };
           break;
         } catch (err) {
-          if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError) || attempt >= maxRetries) throw err;
-          log(`review: invalid response; retry ${attempt + 1}/${maxRetries}`);
+          const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
+            err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
+          if (!retryable || attempt >= maxRetries) throw err;
+          const previous = activeLlm.model;
+          activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
+          const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
+          warnings.push(message);
+          log(`review: ${message}`);
         }
       }
     }
@@ -839,7 +850,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           json: true,
           maxTokens: 2000,
         });
-        return parseFindings(raw, file, allowed);
+        return parseFindings(raw, file, allowed, activeLlm.name);
       } catch (err) {
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);
@@ -899,6 +910,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       head_sha: pr.headSha,
       status: 'done',
       cost_usd: costUsd,
+      provider: activeLlm.name,
+      model: activeLlm.model,
       summary,
       verdict,
       comments_json: JSON.stringify(findings),
@@ -918,6 +931,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       warnings,
     };
 
+    postCtx.llm = activeLlm;
     if (post) await postReview(postCtx, result);
 
     return result;

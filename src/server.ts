@@ -24,7 +24,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const pricing = new OpenRouterPricing({ db, baseUrl: config.llm.openrouterBaseUrl });
   const usage = new UsageTracker({ db, pricing, log });
   // Reviews get the configured reasoning budget.
-  const llm = createProvider(config, { reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
+  const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
   // Chat always gets its own provider so it pins effort to 'low' rather than
   // inheriting the review budget, even when it runs on the same provider/model.
   // Measured on the Claude CLI with haiku, the default budget spends ~17s thinking
