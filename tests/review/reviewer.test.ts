@@ -111,6 +111,12 @@ describe('review context selection', () => {
     expect(selectRelevantChunks(chunks, ['helper'], 'src/app.ts').map((c) => c.chunkId)).toEqual([1, 2]);
   });
 
+  it('returns no arbitrary context when no exact symbol or path term matches', () => {
+    const chunks: RetrievedChunk[] = [{ ...CHUNK, path: 'src/unrelated.ts', content: 'export function other() {}' }];
+    expect(selectRelevantChunks(chunks, ['missing'], 'src/app.ts')).toEqual([]);
+    expect(selectRelevantChunks(chunks, [], 'src/app.ts')).toEqual([]);
+  });
+
   it('finds only root and applicable nested repository rule files', () => {
     expect(repositoryRulePaths(['src/review/app.ts', 'tests/review/app.test.ts'])).toEqual([
       'AGENTS.md', 'CLAUDE.md', 'src/AGENTS.md', 'src/CLAUDE.md',
@@ -1045,7 +1051,7 @@ describe('reviewPullRequest', () => {
     await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
     const msg = llm.fileCalls()[0]!.messages[0]!.content;
     expect(msg).toContain('Always check for SQL injection.');
-    expect(msg).toContain('src/x.ts:1-3');
+    expect(msg).not.toContain('src/x.ts:1-3');
     expect(msg).toContain('if (n = 0) return;');
     expect(llm.fileCalls()[0]!.json).toBe(true);
     expect(llm.fileCalls()[0]!.maxTokens).toBe(2000);
@@ -1060,6 +1066,7 @@ describe('reviewPullRequest', () => {
       expect(req.excludePaths).toEqual(['src/app.ts', 'package-lock.json', 'assets/logo.png']);
       expect(req.limit).toBe(8);
       expect(req.repoIds).toEqual([REPO_ID]);
+      expect(req.lexicalOnly).toBe(true);
       return [];
     };
     const llm = fakeLlm();
@@ -1067,7 +1074,23 @@ describe('reviewPullRequest', () => {
     expect(seen).toHaveLength(2);
     expect(seen[0]).toContain('src/app.ts');
     expect(seen[0]).toContain('run');
-    expect(seen[0]).toContain('number');
+    expect(seen[0]).not.toContain('number');
+    expect(seen[1]).toContain('gone');
+  });
+
+  it.each([false, true])('includes test context keywords in %s batch mode queries', async (batch) => {
+    const diff = [
+      'diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', '@@ -1 +1 @@', '-old', '+runThing();',
+      'diff --git a/tests/app.test.ts b/tests/app.test.ts', '--- a/tests/app.test.ts', '+++ b/tests/app.test.ts', '@@ -1 +1 @@', '-old', '+runThing();',
+    ].join('\n');
+    const queries: string[] = [];
+    const fake = fakeLlm();
+    const llm: LLMProvider = batch ? { ...fake.provider, supportsBatchReview: true, async complete(req) {
+      if (req.system === BATCH_REVIEW_SYSTEM_PROMPT) return JSON.stringify({ reviewedPaths: ['src/app.ts', 'tests/app.test.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
+      return fake.provider.complete(req);
+    } } : fake.provider;
+    await reviewPullRequest({ db, llm, retrieve: async (req) => { queries.push(req.query); return []; }, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(queries.some((query) => query.includes('tests/app.test.ts') && query.includes('test'))).toBe(true);
   });
 
   it('fails closed on maxFiles overflow for every provider', async () => {

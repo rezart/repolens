@@ -191,14 +191,25 @@ export function defaultFormatContext(chunks: RetrievedChunk[]): string {
 export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: string[], changedPath: string): RetrievedChunk[] {
   const terms = [...new Set(identifiers.map((value) => value.toLowerCase()).filter((value) =>
     value.length >= 1 && !CONTEXT_KEYWORDS.has(value)))];
-  if (!terms.length || terms.every((term) => term.length === 1)) return chunks.slice(0, 8);
+  if (!terms.length) return [];
+  const stem = changedPath.slice(changedPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '').toLowerCase();
+  const matches = (text: string, term: string) => new RegExp(`(?:^|[^a-z0-9_$])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^a-z0-9_$])`, 'i').test(text);
   const scored = chunks.map((chunk, index) => {
-    const haystack = `${chunk.path}\n${chunk.content}`.toLowerCase();
-    const score = terms.reduce((total, term) => total + (haystack.includes(term) ? 1 : 0), 0) +
-      (chunk.path.includes(changedPath.split('/').pop()!.replace(/\.[^.]+$/, '')) ? 0.25 : 0);
+    const haystack = `${chunk.path}\n${chunk.content}`;
+    const score = terms.reduce((total, term) => total + (matches(haystack, term) ? 1 : 0), 0) +
+      (stem && matches(chunk.path, stem) ? 0.25 : 0);
     return { chunk, score, index };
   }).filter((item) => item.score > 0);
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 8).map((item) => item.chunk);
+}
+
+function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { query: string; symbols: string[] } {
+  const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
+  const pathTerms = stem.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
+  const testTerms = /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(path) ? ['test'] : [];
+  const symbols = [...new Set([...identifiers(changedText).slice(0, 8), ...pathTerms, ...testTerms])]
+    .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
+  return { query: [path, ...symbols].join(' '), symbols };
 }
 
 /** Root and ancestor rule files that can apply to the changed paths. */
@@ -221,11 +232,6 @@ const CONTEXT_KEYWORDS = new Set([
   'string', 'throw', 'true', 'type', 'undefined', 'var', 'void', 'while',
   'css', 'cts', 'js', 'jsx', 'mjs', 'mts', 'src', 'ts', 'tsx',
 ]);
-
-function contextIdentifiers(text: string, injected: string[]): string[] {
-  const found = text.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [];
-  return [...new Set([...injected, ...found].filter((value) => value.length >= 1 && !CONTEXT_KEYWORDS.has(value.toLowerCase())))];
-}
 
 /* ------------------------------------------------------------------ PR head context */
 
@@ -1016,12 +1022,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const seen = new Set<number>();
       for (const file of files) {
         const path = file.newPath ?? file.oldPath!;
-        const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
+        const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
-          const symbols = contextIdentifiers(hunkText(file, Infinity), identifiers(added));
-          const chunks = await retrieve({ repoIds: [opts.repoId], query: [path, ...identifiers(added)].join(' '), limit: 8, excludePaths: changedPaths, lexicalOnly: true });
+          const targeted = contextQuery(path, changedText, identifiers);
+          const chunks = await retrieve({ repoIds: [opts.repoId], query: targeted.query, limit: 8, excludePaths: changedPaths, lexicalOnly: true });
+          const symbols = targeted.symbols;
           const selected = selectRelevantChunks(chunks, symbols, path);
-          if (!selected.length && symbols.every((symbol) => symbol.length === 1)) selected.push(...chunks.slice(0, 8));
           for (const chunk of selected) {
             if (seen.has(chunk.chunkId)) continue;
             seen.add(chunk.chunkId);
@@ -1092,17 +1098,18 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath ?? file.oldPath!;
-      const addedText = file.hunks
-        .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
+      const changedText = file.hunks
+        .flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content))
         .join('\n');
-      const symbols = contextIdentifiers(hunkText(file, Infinity), identifiers(addedText));
-      const query = [path, ...identifiers(addedText)].join(' ');
-      const headContext = buildHeadContext({ path, addedText, headContents, exportsByPath });
+      const targeted = contextQuery(path, changedText, identifiers);
+      const symbols = targeted.symbols;
+      const query = targeted.query;
+      const headContext = buildHeadContext({ path, addedText: changedText, headContents, exportsByPath });
       let context = '';
       try {
         // Excluding every changed path keeps pre-change chunks of this PR's files
         // out of the prompt; their post-change content is in `headContext` instead.
-        const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePaths: changedPaths });
+        const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePaths: changedPaths, lexicalOnly: true });
         context = formatContext(selectRelevantChunks(chunks, symbols, path));
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
