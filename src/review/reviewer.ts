@@ -527,13 +527,26 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const { db, llm, retrieve, github } = deps;
   let activeLlm = llm;
   let costUsd: number | null = 0;
-  const complete = async (req: CompleteRequest) => {
+  const completeCall = async (req: CompleteRequest): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
     const call = { reported: false, costUsd: 0 as number | null };
+    let raw: string | undefined;
+    let error: unknown;
+    let threw = false;
     try {
-      return await reviewCallCost.run(call, () => activeLlm.complete(req));
+      raw = await reviewCallCost.run(call, () => activeLlm.complete(req));
+    } catch (err) {
+      threw = true;
+      error = err;
     } finally {
-      costUsd = costUsd === null || !call.reported || call.costUsd === null ? null : costUsd + call.costUsd;
+      const next = costUsd !== null && call.reported && call.costUsd !== null ? costUsd + call.costUsd : null;
+      costUsd = next !== null && Number.isFinite(next) ? next : null;
     }
+    return { raw, error: threw ? error : undefined, failed: threw, costUsd: call.reported && call.costUsd !== null ? call.costUsd : null };
+  };
+  const complete = async (req: CompleteRequest) => {
+    const result = await completeCall(req);
+    if (result.failed) throw result.error;
+    return result.raw!;
   };
   const log = deps.log ?? (() => {});
   const identifiers = deps.identifiers ?? defaultIdentifiers;
@@ -830,16 +843,29 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       let providerIndex = 0;
       const attemptCost = reviewCostUpperBound(req);
       let reservedUsd = 0;
+      let usedUsd = 0;
+      let lastRetryError: unknown;
       for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
         if (reservedUsd + attemptCost > REVIEW_MAX_USD) {
-          throw new Error('Review retry exceeds the remaining $0.25 budget; no review was published.');
+          const cause = lastRetryError ? ` Last retry error: ${errMessage(lastRetryError)}.` : '';
+          throw new Error(
+            `Review retry exceeds the remaining $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${attemptCost.toFixed(6)}.${cause} no review was published.`,
+          );
         }
-        // ponytail: reserve each call's upper bound even when usage is missing;
-        // reclaim unused reservations only if trustworthy billing supports it.
+        // Reserve the upper bound before sending; only validated billing can release it.
         reservedUsd += attemptCost;
         try {
-          const obj = extractJson(await complete(req)) as Record<string, unknown>;
+          const call = await completeCall(req);
+          if (call.costUsd !== null) {
+            usedUsd += call.costUsd;
+            reservedUsd += call.costUsd - attemptCost;
+          }
+          if (call.failed) throw call.error;
+          if (reservedUsd > REVIEW_MAX_USD) {
+            throw new Error(`Review exceeds the $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`);
+          }
+          const obj = extractJson(call.raw!) as Record<string, unknown>;
           if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
               !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
               files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath ?? f.oldPath)) ||
@@ -860,6 +886,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
             err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
           if (!retryable || attempt >= maxRetries) throw err;
+          lastRetryError = err;
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
           const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
