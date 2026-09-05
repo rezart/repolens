@@ -14,6 +14,8 @@ import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
   SUMMARY_SYSTEM_PROMPT,
+  FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT,
+  FOLLOWUP_SUMMARY_SYSTEM_PROMPT,
   buildFileReviewMessage,
   buildSummaryMessage,
   renderHistoricalContext,
@@ -772,11 +774,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
-        system: BATCH_REVIEW_SYSTEM_PROMPT,
+        system: lineage.previous ? FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT : BATCH_REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
           prTitle: pr.title, prBody: pr.body, instructions: repo.instructions,
           overview: lineage.overview, commits: lineage.commits,
-          previous: lineage.previous ? { ...lineage.previous, delta: undefined } : undefined,
+          previous: lineage.previous ? { ...lineage.previous, summary: undefined, delta: undefined } : undefined,
           files: files.map((f) => ({
             path: f.newPath ?? f.oldPath!, status: f.status, diff: hunkText(f, Infinity),
             allowedFindingLines: [...allowedFindingLines(f)].sort((a, b) => a - b),
@@ -931,7 +933,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         verdict = batch.verdict;
       } else {
         const raw = await complete({
-          system: SUMMARY_SYSTEM_PROMPT,
+          system: lineage.previous ? FOLLOWUP_SUMMARY_SYSTEM_PROMPT : SUMMARY_SYSTEM_PROMPT,
           messages: [
             {
               role: 'user',
