@@ -225,6 +225,18 @@ describe('hunkText', () => {
     expect(text).toContain('... (truncated)');
   });
 
+  it('renders the full diff by default so the tail cannot be silently approved', () => {
+    const file: DiffFile = {
+      oldPath: 'src/large.ts', newPath: 'src/large.ts', status: 'modified', binary: false,
+      hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, header: '@@ -1 +1 @@', lines: [
+        { type: 'add', newLine: 1, content: 'x'.repeat(20_000) },
+      ] }],
+    };
+    const text = hunkText(file);
+    expect(text).toContain('x'.repeat(20_000));
+    expect(text).not.toContain('... (truncated)');
+  });
+
   it('returns an empty string for a file with no hunks', () => {
     const [f] = parseUnifiedDiff(BINARY);
     expect(hunkText(f!)).toBe('');

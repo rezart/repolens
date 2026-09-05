@@ -8,7 +8,8 @@ The LLM backend is pluggable:
 | --- | --- | --- |
 | `openrouter` | Any model on [OpenRouter](https://openrouter.ai) via its OpenAI-compatible API | `OPENROUTER_API_KEY`, `LLM_MODEL` |
 | `claude-cli` | Your **Claude Pro/Max subscription** through the `claude` CLI (`claude -p`) | `claude` installed and logged in |
-| `codex-cli` | Your **ChatGPT subscription** through the `codex` CLI (`codex exec`) | `codex` installed and logged in |
+
+`codex-cli` is temporarily disabled because its tools can read host files and credentials while processing untrusted repository content. Set both `LLM_PROVIDER` and `CHAT_PROVIDER` to supported providers; startup rejects Codex selections instead of silently switching providers.
 
 Everything runs in one Node process with a SQLite database (FTS5 for lexical search, sqlite-vec for vectors). No external services.
 
@@ -17,7 +18,7 @@ Everything runs in one Node process with a SQLite database (FTS5 for lexical sea
 - **Repository indexing**: clone, chunk by language-aware boundaries, index incrementally by git blob hash.
 - **Codebase Q&A**: hybrid retrieval (BM25 + optional embeddings, fused with reciprocal rank fusion), answers in Markdown with `path:start-end` citations.
 - **PR review**: triggered by a GitHub webhook or the API. Reviews each changed file with related code pulled from the index, then posts a GitHub review with a summary and inline comments on the changed lines.
-- **PR chat**: mention the bot handle in a PR comment (`@repolens why does this change X?`) to get an answer posted back.
+- **PR chat**: owners, members, and collaborators can mention the bot handle in a PR comment (`@repolens why does this change X?`) to get an answer posted back.
 - **REST API** modeled on Greptile's (`/api/repositories`, `/api/query`, `/api/search`, `/api/reviews`).
 - **Dashboard** at `/` for adding repos, chatting, running reviews, and setting per-repo review instructions.
 - **Usage and cost**: every LLM and embedding call is recorded; the dashboard's Usage page shows tokens per day, provider and model with a dollar figure priced from OpenRouter's public model list (exact where the backend reports a cost, estimated for the subscription CLIs).
@@ -33,6 +34,8 @@ npm install
 cp .env.example .env   # edit it
 npm start              # http://localhost:3000
 ```
+
+Set `REPOLENS_API_TOKEN` to a random secret before starting (for example, generate one with `openssl rand -hex 32`). Empty tokens and the example `change-me` value are rejected. The server binds to `127.0.0.1` by default; use `REPOLENS_HOST` to change it deliberately, and terminate HTTPS at your reverse proxy when exposing the service.
 
 ### Option A: OpenRouter (any model)
 
@@ -59,17 +62,6 @@ LLM_MODEL=              # blank = CLI default; or e.g. sonnet / opus
 
 No API key is needed. Leave `EMBEDDING_MODEL` blank to run fully key-free with lexical retrieval, or point `EMBEDDING_BASE_URL` at any OpenAI-compatible embeddings server (OpenRouter, OpenAI, Ollama's `/v1`, LM Studio) for vector search.
 
-### Option C: Codex subscription
-
-```bash
-codex login
-```
-
-```env
-LLM_PROVIDER=codex-cli
-LLM_MODEL=              # blank = CLI default
-```
-
 CLI providers run one completion at a time to stay within subscription rate limits. Reviews of large PRs take a few minutes.
 
 ### Chat vs. review backends
@@ -77,13 +69,14 @@ CLI providers run one completion at a time to stay within subscription rate limi
 Reviews want depth; chat wants first tokens on screen fast. RepoLens runs them on separate backends when you ask it to:
 
 ```env
-LLM_PROVIDER=codex-cli          # reviews
+LLM_PROVIDER=claude-cli         # reviews
+LLM_MODEL=sonnet
 LLM_REASONING_EFFORT=medium     # reviews only; chat never inherits this
 CHAT_PROVIDER=claude-cli        # chat (blank = same as LLM_PROVIDER)
 CHAT_MODEL=haiku                # blank = same as LLM_MODEL
 ```
 
-`CHAT_MODEL` takes whatever the chat provider understands: `haiku` for the Claude CLI, `gpt-5-mini` for the Codex CLI, `openai/gpt-4o-mini` or `anthropic/claude-haiku-4.5` for OpenRouter. `GET /api/health` reports both backends. Chat always runs at low reasoning effort: on the Claude CLI the default thinking budget costs about 17 s before the first token.
+`CHAT_MODEL` takes whatever the chat provider understands: `haiku` for the Claude CLI, `openai/gpt-4o-mini` or `anthropic/claude-haiku-4.5` for OpenRouter. `GET /api/health` reports both backends. Chat always runs at low reasoning effort: on the Claude CLI the default thinking budget costs about 17 s before the first token.
 
 ### Streaming answers
 
@@ -97,7 +90,7 @@ CHAT_MODEL=haiku                # blank = same as LLM_MODEL
 | `done` | `{}` | end of stream |
 | `error` | `{ "error": "…" }` | failure; the response stays 200 |
 
-Prefer `message` over concatenating deltas: the Codex CLI can only stream a preview. The dashboard streams by default and `repolens ask` writes deltas straight to stdout. Providers without streaming support fall back to one completion emitted as a single delta, so the SSE shape never changes.
+Prefer the authoritative `message` over concatenating deltas. The dashboard streams by default and `repolens ask` writes deltas straight to stdout. Providers without streaming support fall back to one completion emitted as a single delta, so the SSE shape never changes.
 
 ## Using it
 
@@ -182,9 +175,10 @@ See `.env.example` for every variable. The important ones:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `REPOLENS_DATA_DIR` | `./data` | SQLite database and repository clones |
-| `REPOLENS_API_TOKEN` | empty | Bearer token for the API. Empty disables auth (local use only) |
+| `REPOLENS_API_TOKEN` | empty | Required bearer token for the server; empty and placeholder values are rejected |
 | `REPOLENS_PORT` | `3000` | |
-| `LLM_PROVIDER` | `openrouter` | `openrouter`, `claude-cli`, `codex-cli` |
+| `REPOLENS_HOST` | `127.0.0.1` | Interface to listen on; Docker Compose binds all container interfaces but publishes only host loopback |
+| `LLM_PROVIDER` | `openrouter` | `openrouter`, `claude-cli`; `codex-cli` is temporarily disabled |
 | `LLM_MODEL` | | Model id (OpenRouter) or model name (CLIs, optional) |
 | `LLM_TIMEOUT_MS` | `300000` | Per-completion timeout |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | OpenRouter / empty / empty | OpenAI-compatible embeddings. Blank model = lexical only |
@@ -202,14 +196,14 @@ See `.env.example` for every variable. The important ones:
 docker compose up --build
 ```
 
-The Docker image works with `LLM_PROVIDER=openrouter`. The CLI providers need the `claude`/`codex` binaries and their login state, so for those run `npm start` directly on the host.
+The Docker image works with `LLM_PROVIDER=openrouter`. Claude CLI needs the `claude` binary and its login state, so for that provider run `npm start` directly on the host.
 
 ## How review works
 
 1. A poll, a webhook, or an API call queues a review job. Jobs run one at a time. A push to the tracked branch queues an incremental reindex first, so reviews see current code.
 2. The PR diff is fetched from GitHub and split into files and hunks. Lockfiles, vendored, generated and binary files are skipped.
-3. For every changed file, related code is retrieved from the index using the file path and the identifiers in the added lines, and the model is asked for findings as JSON. Findings that don't point at an added line are dropped.
-4. A summary and verdict are generated, then a single GitHub review is posted: the summary as the review body and each finding as an inline comment on the changed line. Findings already commented on a previous run are skipped, so `synchronize` events don't pile up duplicates.
+3. For every reviewable changed file, including deletions, related code is retrieved from the index and the model is asked for findings as JSON. Failed or malformed reviews and file-limit overflow produce an error status instead of a successful partial review.
+4. A summary and verdict are generated, then a single GitHub review is posted. Findings on added lines become inline comments; deletion-only findings remain in the review body and still count toward the blocking status. Intentionally excluded files are listed in the body. Findings already commented on a previous run are skipped, so `synchronize` events don't pile up duplicates.
 5. Reviews are deduped by head commit. Use `force: true` to re-run.
 
 ### Blocking merges on the review
@@ -223,6 +217,8 @@ Pushing fixes moves the PR head, which triggers a fresh review of the new commit
 With a personal access token the status shows up under that token owner's account (their avatar and name); a GitHub App installation token reports as the app instead. The token needs write access to the repository's commit statuses (`repo` scope on a classic PAT, or *Commit statuses: read & write* on a fine-grained one).
 
 PR title, body and comments are treated as untrusted data in the prompts, but as with any LLM reviewer, a determined author can still influence the output. Never give RepoLens a token with more scope than it needs.
+
+After upgrading from a version that allowed partial reviews to pass, force a fresh review of open PRs. Existing cached reviews and GitHub statuses are historical results and are not retroactively validated.
 
 ## Development
 

@@ -27,7 +27,7 @@ interface PushEvent {
 interface IssueCommentEvent {
   action?: string;
   issue?: { number: number; pull_request?: unknown };
-  comment?: { body?: string; user?: { login?: string; type?: string } };
+  comment?: { body?: string; user?: { login?: string; type?: string }; author_association?: string };
   repository?: { full_name?: string };
 }
 
@@ -37,6 +37,7 @@ const REVIEW_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'ready_for_
 const SELF_MARKER = '<sub>RepoLens (';
 
 const MAX_PR_BODY = 4000;
+const ALLOWED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -94,6 +95,7 @@ function handleIssueComment(deps: AppDeps, p: IssueCommentEvent): WebhookOutcome
   if (p.action !== 'created') return { action: 'ignored', reason: `action ${p.action}` };
   if (!p.issue?.pull_request) return { action: 'ignored', reason: 'not a pull request comment' };
   if (p.comment?.user?.type === 'Bot') return { action: 'ignored', reason: 'bot comment' };
+  if (!ALLOWED_ASSOCIATIONS.has((p.comment?.author_association ?? '').toUpperCase())) return { action: 'ignored', reason: 'commenter is not a repository collaborator' };
   // Our own answers carry the footer marker; replying to them would loop forever
   // (they can arrive from a user account when a PAT is used to post).
   if (body.includes(SELF_MARKER)) return { action: 'ignored', reason: 'RepoLens comment' };

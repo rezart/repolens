@@ -222,7 +222,7 @@ export function commentableNewLines(file: DiffFile): Set<number> {
 const TRUNCATED = '... (truncated)';
 
 /** Render a file's hunks with line numbers so the model can cite `line` accurately. */
-export function hunkText(file: DiffFile, maxChars = 16000): string {
+export function hunkText(file: DiffFile, maxChars = Infinity): string {
   const out: string[] = [];
   let size = 0;
   let truncated = false;

@@ -3,6 +3,26 @@ import { openDb, type Db } from '../src/db.js';
 import { JobQueue } from '../src/jobs.js';
 
 describe('JobQueue', () => {
+  it('bounds scheduled jobs without silently accepting overflow or blocking reschedules', () => {
+    vi.useFakeTimers();
+    const db = openDb(':memory:');
+    try {
+      const q = new JobQueue(db);
+      for (let i = 0; i < 100; i++) q.schedule(`pr:${i}`, 60_000, () => {});
+      expect(() => q.schedule('pr:0', 60_000, () => {})).not.toThrow();
+      expect(() => q.schedule('overflow', 60_000, () => {})).toThrow(/full/);
+      expect(q.scheduled('overflow')).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      db.close();
+    }
+  });
+  it('bounds queued jobs', () => {
+    const q = new JobQueue(openDb(':memory:'));
+    for (let i = 0; i < 100; i++) q.enqueue('review', null, async () => new Promise(() => {}));
+    expect(() => q.enqueue('review', null, async () => {})).toThrow(/full/);
+  });
   it('runs jobs of one kind sequentially and records status', async () => {
     const db = openDb(':memory:');
     const q = new JobQueue(db);

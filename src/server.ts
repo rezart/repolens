@@ -52,18 +52,12 @@ export function startServer(config: Config, log: (msg: string) => void = console
     log(`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`);
   });
 
-  const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
-    log(`RepoLens listening on http://localhost:${info.port}`);
+  const hostname = config.hostname ?? '127.0.0.1';
+  const server = serve({ fetch: app.fetch, port: config.port, hostname }, (info) => {
+    log(`RepoLens listening on http://${hostname}:${info.port}`);
     const effort = config.llm.reasoningEffort ? `, effort ${config.llm.reasoningEffort}` : '';
     log(`LLM: ${deps.llm.name} (${deps.llm.model}${effort}); chat: ${deps.chatLlm.name} (${deps.chatLlm.model})`);
     log(`Embeddings: ${deps.embeddings?.model ?? 'off (lexical retrieval only)'}`);
-    if (!config.apiToken) {
-      log('*'.repeat(72));
-      log('*** WARNING: REPOLENS_API_TOKEN is empty. The API is UNAUTHENTICATED and');
-      log('*** anyone who can reach this port can read every indexed repository.');
-      log('*** Set REPOLENS_API_TOKEN before exposing it beyond localhost.');
-      log('*'.repeat(72));
-    }
     if (!config.github.webhookSecret) {
       log('WARNING: GITHUB_WEBHOOK_SECRET is empty; /webhooks/github will reject all deliveries with 503');
     }

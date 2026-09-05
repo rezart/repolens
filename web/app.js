@@ -37,7 +37,6 @@ function h(tag, props, children) {
     if (v === null || v === undefined || v === false) continue;
     if (k === 'class') node.className = v;
     else if (k === 'text') node.textContent = v;
-    else if (k === 'html') node.innerHTML = v;
     else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
     else if (k === 'dataset') Object.assign(node.dataset, v);
     else node.setAttribute(k, v === true ? '' : String(v));
@@ -206,29 +205,23 @@ function toast(message) {
 
 /* -------------------------------------------------------------- markdown */
 
-const UNSAFE_TAGS = 'script,style,iframe,object,embed,link,meta,form,base';
-
-function sanitize(root) {
-  root.querySelectorAll(UNSAFE_TAGS).forEach((n) => n.remove());
-  root.querySelectorAll('*').forEach((el) => {
-    for (const attr of Array.from(el.attributes)) {
-      const name = attr.name.toLowerCase();
-      if (name.startsWith('on')) el.removeAttribute(attr.name);
-      else if (/^(href|src|xlink:href|action|formaction)$/.test(name) && /^\s*(javascript|vbscript|data):/i.test(attr.value)) {
-        el.removeAttribute(attr.name);
-      }
-    }
-    if (el.tagName === 'A') { el.setAttribute('target', '_blank'); el.setAttribute('rel', 'noopener noreferrer'); }
-  });
-  return root;
-}
-
 function markdown(textContent) {
   const box = h('div', { class: 'md' });
-  if (window.marked && typeof window.marked.parse === 'function') {
+  if (window.marked && window.DOMPurify && typeof window.marked.parse === 'function') {
     try {
-      box.innerHTML = window.marked.parse(String(textContent || ''));
-      return sanitize(box);
+      box.appendChild(window.DOMPurify.sanitize(window.marked.parse(String(textContent || '')), {
+        RETURN_DOM_FRAGMENT: true,
+        ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'blockquote', 'pre', 'code', 'strong', 'em', 'del', 'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+        ALLOWED_ATTR: ['href', 'title', 'start'],
+        ALLOW_DATA_ATTR: false,
+        ALLOW_ARIA_ATTR: false,
+      }));
+      box.querySelectorAll('a').forEach((link) => {
+        if (!safeUrl(link.getAttribute('href'))) link.removeAttribute('href');
+        link.setAttribute('target', '_blank');
+        link.setAttribute('rel', 'noopener noreferrer');
+      });
+      return box;
     } catch { /* fall through to plain text */ }
   }
   box.appendChild(h('pre', { class: 'md-fallback', text: String(textContent || '') }));

@@ -310,6 +310,7 @@ export function buildReviewBody(input: {
   findings: Finding[];
   providerName: string;
   model: string;
+  skippedFiles?: string[];
   lineage?: Pick<Lineage, 'reviewNumber' | 'previous'>;
 }): string {
   const counts = { critical: 0, warning: 0, nit: 0 };
@@ -325,8 +326,18 @@ export function buildReviewBody(input: {
     for (const f of input.findings) {
       parts.push(`| ${f.severity} | ${f.path}:${f.line} | ${escapeCell(f.title)} |`);
     }
+    const bodyFindings = input.findings.filter((f) => f.line === 0);
+    if (bodyFindings.length) {
+      parts.push('');
+      parts.push('### Findings without an inline location');
+      for (const f of bodyFindings) parts.push(`- **[${f.severity}] ${escapeCell(f.title)}** (${f.path})\n\n${f.body}`);
+    }
   }
   parts.push('');
+  if (input.skippedFiles?.length) {
+    parts.push(`Skipped files (not reviewed): ${input.skippedFiles.join(', ')}`);
+    parts.push('');
+  }
   if (input.lineage?.previous) {
     const n = input.lineage.previous.commitsSince;
     parts.push(
@@ -363,18 +374,23 @@ function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Findi
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
   if (!list) throw new Error('model output has no "findings" array');
   const path = file.newPath ?? file.oldPath ?? '';
+  const bodyAllowed = new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
   const out: Finding[] = [];
   for (const entry of list) {
-    if (!entry || typeof entry !== 'object') continue;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('model output contains a malformed finding');
     const e = entry as Record<string, unknown>;
     const line = typeof e.line === 'number' ? e.line : typeof e.line === 'string' ? Number(e.line) : NaN;
-    if (!Number.isInteger(line) || !allowed.has(line)) continue;
+    const bodyOnly = file.status === 'deleted' || allowed.size === 0;
+    if (!Number.isInteger(line) || (!bodyOnly && !allowed.has(line)) || (bodyOnly && !bodyAllowed.has(line))) {
+      throw new Error(`model output contains an invalid finding line for ${path}`);
+    }
     const title = typeof e.title === 'string' ? e.title.trim() : '';
     const body = typeof e.body === 'string' ? e.body.trim() : '';
-    if (!title && !body) continue;
+    if (!title && !body) throw new Error(`model output contains an empty finding for ${path}`);
     const sevRaw = typeof e.severity === 'string' ? e.severity.toLowerCase().trim() : '';
-    const severity = (SEVERITIES as readonly string[]).includes(sevRaw) ? (sevRaw as Severity) : 'warning';
-    out.push({ path, line, severity, title: title || body.slice(0, 60), body: body || title });
+    if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new Error(`model output contains an invalid finding severity for ${path}`);
+    const severity = sevRaw as Severity;
+    out.push({ path, line: bodyOnly ? 0 : line, severity, title: title || body.slice(0, 60), body: body || title });
   }
   return out;
 }
@@ -441,6 +457,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
     findings: result.findings,
     providerName: llm.name,
     model: llm.model,
+    skippedFiles: result.skippedFiles,
     lineage: ctx.lineage,
   });
   // Retrieved context comes from the last indexed commit, not the PR head.
@@ -474,7 +491,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
       commitId: pr.headSha,
       body,
       event: result.verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT',
-      comments: comments.map((f) => ({
+      comments: comments.filter((f) => f.line > 0).map((f) => ({
         path: f.path,
         line: f.line,
         body: `**[${f.severity}] ${f.title}**\n\n${f.body}`,
@@ -614,19 +631,19 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     // so they are excluded from retrieval even when the file itself is not reviewed.
     const changedPaths: string[] = [];
     for (const f of parsed) {
-      if (f.status !== 'deleted' && f.newPath) changedPaths.push(f.newPath);
+      for (const path of [f.oldPath, f.newPath]) if (path && !changedPaths.includes(path)) changedPaths.push(path);
     }
 
     const skippedFiles: string[] = [];
     const reviewable: DiffFile[] = [];
     for (const f of parsed) {
-      const path = f.newPath;
-      if (f.binary || f.status === 'deleted' || !path || !isReviewablePath(path)) {
+      const path = f.newPath ?? f.oldPath;
+      if (f.binary || !path || !isReviewablePath(path)) {
         const label = path ?? f.oldPath ?? '(unknown)';
         skippedFiles.push(label);
         continue;
       }
-      if (changedNewLines(f).size === 0) {
+      if (!f.hunks.length || f.hunks.every((h) => h.lines.length === 0)) {
         skippedFiles.push(path);
         continue;
       }
@@ -634,12 +651,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
 
     const budgeted = llm.name === 'openrouter' && llm.model === 'qwen/qwen3-coder';
-    // Check the unsliced list: `files` below can never exceed maxFiles.
-    if (budgeted && reviewable.length > maxFiles) {
+    // Never silently approve files that did not fit the configured review budget.
+    if (reviewable.length > maxFiles) {
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
     }
-    const files = reviewable.slice(0, maxFiles);
-    for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
+    const files = reviewable;
 
     // Fetch the PR head once for the whole review: the search index only knows the
     // base branch, so without this the model judges new code against old exports.
@@ -696,8 +712,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           overview: lineage.overview, commits: lineage.commits,
           previous: lineage.previous ? { ...lineage.previous, delta: undefined } : undefined,
           files: files.map((f) => ({
-            path: f.newPath!, status: f.status, diff: hunkText(f, Infinity),
-            delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath!) : undefined,
+            path: f.newPath ?? f.oldPath!, status: f.status, diff: hunkText(f, Infinity),
+            delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath ?? f.oldPath!) : undefined,
           })),
         }) }],
         json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true,
@@ -722,16 +738,17 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }
       const seen = new Set<number>();
       for (const file of files) {
+        const path = file.newPath ?? file.oldPath!;
         const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
         try {
-          const chunks = await retrieve({ repoIds: [opts.repoId], query: [file.newPath!, ...identifiers(added)].join(' '), limit: 8, excludePaths: changedPaths, lexicalOnly: true });
+          const chunks = await retrieve({ repoIds: [opts.repoId], query: [path, ...identifiers(added)].join(' '), limit: 8, excludePaths: changedPaths, lexicalOnly: true });
           for (const chunk of chunks) {
             if (seen.has(chunk.chunkId)) continue;
             seen.add(chunk.chunkId);
             addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
           }
         } catch (err) {
-          warnings.push(`${file.newPath}: retrieval failed: ${errMessage(err)}`);
+          warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
         }
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.05; all file diffs included.`);
@@ -741,20 +758,20 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const obj = extractJson(await llm.complete(req)) as Record<string, unknown>;
       if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
           !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
-          files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath)) ||
-          obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => file.newPath === (f as { path?: unknown }).path))) {
+          files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath ?? f.oldPath)) ||
+          obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
         throw new Error('Incomplete review response; no review was published.');
       }
       batch = {
         findings: files.flatMap((file) => parseFindings(JSON.stringify({
-          findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === file.newPath),
+          findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
         }), file, changedNewLines(file))),
         summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
       };
     }
 
     const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
-      const path = file.newPath!;
+      const path = file.newPath ?? file.oldPath!;
       const allowed = changedNewLines(file);
       const addedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
@@ -799,7 +816,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);
         log(`review: ${msg}`);
-        return [] as Finding[];
+        throw new Error(`file review failed for ${path}: ${errMessage(err)}`);
       }
     });
 
@@ -822,7 +839,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               content: buildSummaryMessage({
                 prTitle: pr.title,
                 prBody: pr.body,
-                files: files.map((f) => ({ path: f.newPath!, status: f.status })),
+                files: files.map((f) => ({ path: f.newPath ?? f.oldPath!, status: f.status })),
                 findings,
                 lineage,
               }),
@@ -840,8 +857,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const msg = `summary: ${errMessage(err)}`;
       warnings.push(msg);
       log(`review: ${msg}`);
-      summary = `Reviewed ${files.length} files, ${findings.length} findings.`;
-      verdict = 'comment';
+      throw new Error(`summary review failed: ${errMessage(err)}`);
     }
     if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
 

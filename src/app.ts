@@ -1,11 +1,12 @@
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import type { Config } from './config.js';
+import { ConfigError, type Config } from './config.js';
 import type { Db } from './db.js';
 import type { LLMProvider } from './llm/types.js';
 import type { EmbeddingProvider } from './embeddings/types.js';
@@ -45,25 +46,25 @@ export const VERSION = '0.1.0';
 
 const addRepoSchema = z.object({
   remote: z.string().default('github'),
-  repository: z.string().min(1),
-  branch: z.string().optional(),
+  repository: z.string().min(1).max(200),
+  branch: z.string().max(200).optional(),
 });
 
 const querySchema = z.object({
-  messages: z.array(z.object({ role: z.enum(['user', 'assistant', 'system']), content: z.string() })).min(1),
-  repositories: z.array(z.union([z.string(), z.object({ remote: z.string().optional(), repository: z.string(), branch: z.string().optional() })])).min(1),
+  messages: z.array(z.object({ role: z.enum(['user', 'assistant', 'system']), content: z.string().max(20_000) })).min(1).max(50),
+  repositories: z.array(z.union([z.string().max(200), z.object({ remote: z.string().max(50).optional(), repository: z.string().max(200), branch: z.string().max(200).optional() })])).min(1).max(50),
   stream: z.boolean().optional(),
   limit: z.number().int().positive().max(50).optional(),
 });
 
 const searchSchema = z.object({
-  query: z.string().min(1),
-  repositories: z.array(z.string()).min(1),
+  query: z.string().min(1).max(10_000),
+  repositories: z.array(z.string().max(200)).min(1).max(50),
   limit: z.number().int().positive().max(100).optional(),
 });
 
 const reviewPullsSchema = z.object({
-  prNumbers: z.array(z.number().int().positive()).optional(),
+  prNumbers: z.array(z.number().int().positive()).max(100).optional(),
   post: z.boolean().optional(),
   force: z.boolean().optional(),
 });
@@ -78,7 +79,7 @@ const reviewListSchema = z.object({
 });
 
 const reviewSchema = z.object({
-  repository: z.string().min(1),
+  repository: z.string().min(1).max(200),
   prNumber: z.number().int().positive(),
   post: z.boolean().optional(),
   force: z.boolean().optional(),
@@ -109,8 +110,7 @@ export function normalizeRepoId(ref: string | { remote?: string; repository: str
 export function enqueueIndex(deps: AppDeps, repoId: string) {
   const repo = deps.db.getRepo(repoId);
   if (!repo) throw new Error(`Unknown repository ${repoId}`);
-  deps.db.setRepoStatus(repoId, 'queued');
-  return deps.jobs.enqueue('index', repoId, async (ctx) => {
+  const job = deps.jobs.enqueue('index', repoId, async (ctx) => {
     const checkout = checkoutFor(deps, repo);
     ctx.progress('cloning');
     await checkout.ensureClone();
@@ -129,6 +129,8 @@ export function enqueueIndex(deps: AppDeps, repoId: string) {
       onProgress: ctx.progress,
     });
   });
+  deps.db.setRepoStatus(repoId, 'queued');
+  return job;
 }
 
 /**
@@ -223,8 +225,17 @@ export async function streamAnswer(stream: SSEWriter, run: (hooks: AnswerHooks) 
 
 export function createApp(deps: AppDeps): Hono {
   const { config, db } = deps;
+  if (!config.apiToken.trim() || new Set(['change-me', 'changeme', 'your-token', 'your-token-here', 'replace-me']).has(config.apiToken.trim().toLowerCase())) {
+    throw new ConfigError('REPOLENS_API_TOKEN must be a non-placeholder API token when starting the API');
+  }
   const log = deps.log ?? (() => {});
   const app = new Hono();
+  const seenWebhooks = new Map<string, number>();
+
+  app.use('*', async (c, next) => {
+    c.res.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    await next();
+  });
 
   app.onError((err, c) => {
     log(`error: ${err.message}`);
@@ -234,14 +245,17 @@ export function createApp(deps: AppDeps): Hono {
 
   // ---- auth ----
   // The token is only accepted in the Authorization header: query strings leak into
-  // logs, proxies and referrers. An empty REPOLENS_API_TOKEN disables auth entirely.
+  // logs, proxies and referrers. Startup rejects empty and placeholder tokens.
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/health' || !config.apiToken) return next();
+    if (c.req.path === '/api/health') return next();
     const header = c.req.header('authorization') ?? '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : '';
     if (!secretEquals(token, config.apiToken)) return c.json({ error: 'Unauthorized' }, 401);
     return next();
   });
+  app.use('/api/*', bodyLimit({ maxSize: 1_048_576 }));
+  // Apply this before reading the body or checking the signature so unsigned oversized deliveries are cheap to reject.
+  app.use('/webhooks/github', bodyLimit({ maxSize: 5 * 1024 * 1024 }));
 
   app.get('/api/health', (c) =>
     c.json({
@@ -269,6 +283,7 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ error: (err as Error).message }, 400);
     }
     if (parsed.host !== body.data.remote) return c.json({ error: `${body.data.repository} is not a ${body.data.remote} repository` }, 400);
+    if (!deps.jobs.hasCapacity('index')) return c.json({ error: 'job queue (index) is full' }, 429);
     const id = repoIdOf(parsed);
     // An unset branch is stored as '' and resolved from the remote by the index job.
     const repo = db.upsertRepo({ id, remote: parsed.url, owner: parsed.owner, name: parsed.name, branch: body.data.branch ?? '' });
@@ -291,8 +306,9 @@ export function createApp(deps: AppDeps): Hono {
   app.put('/api/repositories/:id/instructions', async (c) => {
     const id = decodeURIComponent(c.req.param('id'));
     if (!db.getRepo(id)) return c.json({ error: 'Not found' }, 404);
-    const body = (await c.req.json().catch(() => ({}))) as { instructions?: string };
-    db.setRepoInstructions(id, body.instructions?.trim() ? body.instructions : null);
+    const body = z.object({ instructions: z.string().max(20_000).optional() }).safeParse(await c.req.json().catch(() => ({})));
+    if (!body.success) return c.json({ error: body.error.message }, 400);
+    db.setRepoInstructions(id, body.data.instructions?.trim() ? body.data.instructions : null);
     return c.json(db.getRepo(id));
   });
 
@@ -403,6 +419,12 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ error: 'Invalid signature' }, 401);
     }
     const event = c.req.header('x-github-event') ?? '';
+    const now = Date.now();
+    const webhookKey = event === 'issue_comment' ? createHash('sha256').update(event + '\0' + raw).digest('hex') : '';
+    if (webhookKey) {
+      for (const [key, at] of seenWebhooks) if (now - at > 60 * 60 * 1000) seenWebhooks.delete(key);
+      if (seenWebhooks.has(webhookKey)) return c.json({ action: 'ignored', reason: 'duplicate webhook delivery' }, 202);
+    }
     let payload: unknown;
     try {
       payload = JSON.parse(raw);
@@ -410,11 +432,25 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ error: 'Invalid JSON' }, 400);
     }
     const outcome = handleGitHubWebhook(deps, event, payload);
+    if (webhookKey) {
+      if (seenWebhooks.size >= 1000) seenWebhooks.delete(seenWebhooks.keys().next().value!);
+      seenWebhooks.set(webhookKey, now);
+    }
     return c.json(outcome, 202);
   });
 
   // ---- dashboard ----
   const webDir = deps.webDir ?? join(process.cwd(), 'web');
+  app.get('/vendor/marked.js', async (c) => {
+    c.header('Content-Type', 'text/javascript');
+    c.header('Cache-Control', 'no-cache');
+    return c.body(await readFile(join(process.cwd(), 'node_modules/marked/lib/marked.umd.js')));
+  });
+  app.get('/vendor/purify.js', async (c) => {
+    c.header('Content-Type', 'text/javascript');
+    c.header('Cache-Control', 'no-cache');
+    return c.body(await readFile(join(process.cwd(), 'node_modules/dompurify/dist/purify.min.js')));
+  });
   // The dashboard has no build step or hashed filenames, so browsers must
   // revalidate on every load; otherwise heuristic caching keeps serving a
   // pre-deploy app.js and new features never appear without a hard reload.

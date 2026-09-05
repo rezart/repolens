@@ -17,6 +17,8 @@ export interface JobMeta {
  * the API can report progress.
  */
 export class JobQueue {
+  private static readonly MAX_PENDING_PER_KIND = 100;
+  private static readonly MAX_SCHEDULED = 100;
   private queues = new Map<JobKind, Array<{ id: number; fn: JobFn }>>();
   private running = new Set<JobKind>();
   private timers = new Map<string, NodeJS.Timeout>();
@@ -27,8 +29,13 @@ export class JobQueue {
   ) {}
 
   enqueue(kind: JobKind, repoId: string | null, fn: JobFn, meta: JobMeta = {}): JobRow {
-    const job = this.db.createJob(kind, repoId, meta.prNumber ?? null);
     const q = this.queues.get(kind) ?? [];
+    if (!this.hasCapacity(kind)) {
+      const error = new Error(`job queue (${kind}) is full`) as Error & { status?: number };
+      error.status = 429;
+      throw error;
+    }
+    const job = this.db.createJob(kind, repoId, meta.prNumber ?? null);
     q.push({ id: job.id, fn });
     this.queues.set(kind, q);
     void this.drain(kind).catch((err: unknown) => {
@@ -37,11 +44,20 @@ export class JobQueue {
     return job;
   }
 
+  hasCapacity(kind: JobKind): boolean {
+    return (this.queues.get(kind)?.length ?? 0) + (this.running.has(kind) ? 1 : 0) < JobQueue.MAX_PENDING_PER_KIND;
+  }
+
   /**
    * Debounced deferral: `fn` runs once `delayMs` after the most recent call for `key`.
    * Lets a burst of triggers (pushes to one PR) collapse into a single job.
    */
   schedule(key: string, delayMs: number, fn: () => void): void {
+    if (!this.timers.has(key) && this.timers.size >= JobQueue.MAX_SCHEDULED) {
+      const error = new Error('scheduled job queue is full') as Error & { status?: number };
+      error.status = 429;
+      throw error;
+    }
     clearTimeout(this.timers.get(key));
     const t = setTimeout(() => {
       this.timers.delete(key);

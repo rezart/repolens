@@ -1,7 +1,6 @@
 import type { Config, LLMProviderName } from '../config.js';
 import { OpenRouterProvider } from './openrouter.js';
 import { ClaudeCliProvider } from './claude-cli.js';
-import { CodexCliProvider } from './codex-cli.js';
 import type { LLMProvider } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
@@ -32,6 +31,9 @@ export interface CreateProviderOptions {
 export function createProvider(config: Config, opts: CreateProviderOptions = {}): LLMProvider {
   const llm = config.llm;
   const provider = opts.provider ?? llm.provider;
+  if (provider === 'codex-cli') {
+    throw new Error('codex-cli is temporarily disabled for security; use claude-cli or openrouter');
+  }
   const model = opts.model ?? llm.model;
   // `??` so an explicit '' override still means "leave the backend default alone".
   const reasoningEffort = opts.reasoningEffort ?? llm.reasoningEffort;
@@ -56,14 +58,6 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
       return new ClaudeCliProvider({
         model: model || undefined,
         bin: llm.claudeBin,
-        timeoutMs: llm.timeoutMs,
-        reasoningEffort,
-        onUsage: opts.onUsage,
-      });
-    case 'codex-cli':
-      return new CodexCliProvider({
-        model: model || undefined,
-        bin: llm.codexBin,
         timeoutMs: llm.timeoutMs,
         reasoningEffort,
         onUsage: opts.onUsage,
