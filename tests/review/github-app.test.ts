@@ -71,3 +71,30 @@ it('does not expose a malformed token response in JSON parsing errors', async ()
   const getToken = createAppTokenProvider(credentials, { fetch: async () => new Response('secret-token-is-not-json') });
   await expect(getToken()).rejects.toThrow('Invalid GitHub App token response');
 });
+
+it('wires App credentials ahead of a configured PAT and reads the PEM from disk', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { loadConfig } = await import('../../src/config.js');
+  const { buildDeps } = await import('../../src/server.js');
+  const dir = mkdtempSync(join(tmpdir(), 'repolens-app-'));
+  const keyPath = join(dir, 'app.pem');
+  writeFileSync(keyPath, credentials.privateKey, { mode: 0o600 });
+  const config = loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_DATA_DIR: dir, GITHUB_TOKEN: 'personal-token', GITHUB_APP_ID: '123', GITHUB_APP_INSTALLATION_ID: '456', GITHUB_APP_PRIVATE_KEY_PATH: keyPath });
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    const auth = new Headers(init?.headers).get('Authorization');
+    expect(auth).not.toContain('personal-token');
+    if (String(url).endsWith('/access_tokens')) return Response.json({ token: 'app-token', expires_at: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(auth).toBe('Bearer app-token');
+    return Response.json({ number: 21 });
+  });
+  const deps = buildDeps(config);
+  try {
+    expect((await deps.github.getPull('o', 'r', 21)).number).toBe(21);
+    expect(await deps.github.getToken()).toBe('app-token');
+  } finally {
+    deps.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

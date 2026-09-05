@@ -174,13 +174,15 @@ describe('RepoCheckout', () => {
       dir: dest,
       url: 'https://github.com/o/n.git',
       token,
-      git: async (args) => {
+      git: async (args, opts) => {
         seen.push(args);
-        throw new Error(`fatal: could not read from ${args.join(' ')}`);
+        expect(opts?.env?.REPOLENS_GIT_AUTH_HEADER).toBe(`Authorization: Basic ${basic}`);
+        throw new Error(`fatal: could not read from ${args.join(' ')} ${opts?.env?.REPOLENS_GIT_AUTH_HEADER} ${token}`);
       },
     });
     await expect(c.ensureClone()).rejects.toThrow(/could not read/);
-    expect(seen[0]!.slice(0, 2)).toEqual(['-c', `http.extraheader=Authorization: Basic ${basic}`]);
+    expect(seen[0]![0]).toBe('--config-env=http.https://github.com/.extraheader=REPOLENS_GIT_AUTH_HEADER');
+    expect(seen[0]!.join(' ')).not.toContain(basic);
     // the clone url stays clean, so no credential is written into .git/config
     expect(seen[0]).toContain('https://github.com/o/n.git');
     expect(seen[0]!.join(' ')).not.toContain(`${token}@`);
@@ -236,15 +238,16 @@ describe('RepoCheckout', () => {
 
 it('refreshes checkout credentials per invocation and redacts the refreshed token', async () => {
   let n = 0;
-  const seen: string[][] = [];
-  const checkout = new RepoCheckout({ dir: '/tmp/repolens-app-token-test', url: 'https://github.com/o/r.git', token: async () => `secret-${++n}`, git: async (args) => {
-    seen.push(args);
-    throw new Error(args.join(' ') + ` secret-${n}`);
+  const headers: string[] = [];
+  const checkout = new RepoCheckout({ dir: '/tmp/repolens-app-token-test', url: 'https://github.com/o/r.git', token: async () => `secret-${++n}`, git: async (args, opts) => {
+    headers.push(opts?.env?.REPOLENS_GIT_AUTH_HEADER ?? '');
+    expect(args.join(' ')).not.toContain(Buffer.from(`x-access-token:secret-${n}`).toString('base64'));
+    throw new Error(headers.at(-1) + ` secret-${n}`);
   } });
   await expect(checkout.fetchRef('main')).rejects.not.toThrow('secret-1');
   await expect(checkout.fetchRef('main')).rejects.not.toThrow('secret-2');
-  expect(seen.map((args) => args[1])).toEqual([
-    'http.extraheader=Authorization: Basic ' + Buffer.from('x-access-token:secret-1').toString('base64'),
-    'http.extraheader=Authorization: Basic ' + Buffer.from('x-access-token:secret-2').toString('base64'),
+  expect(headers).toEqual([
+    'Authorization: Basic ' + Buffer.from('x-access-token:secret-1').toString('base64'),
+    'Authorization: Basic ' + Buffer.from('x-access-token:secret-2').toString('base64'),
   ]);
 });

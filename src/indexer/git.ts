@@ -64,6 +64,7 @@ export function repoIdFor(remote: string): string {
 
 export interface GitRunOptions {
   cwd?: string;
+  env?: Record<string, string>;
 }
 
 export type GitRunner = (args: string[], opts?: GitRunOptions) => Promise<string>;
@@ -103,7 +104,7 @@ function defaultRunner(defaultCwd: string): GitRunner {
       execFile(
         'git',
         args,
-        { cwd: opts?.cwd ?? defaultCwd, maxBuffer: MAX_GIT_BUFFER, encoding: 'utf8' },
+        { cwd: opts?.cwd ?? defaultCwd, env: opts?.env ? { ...process.env, ...opts.env } : process.env, maxBuffer: MAX_GIT_BUFFER, encoding: 'utf8' },
         (err, stdout, stderr) => {
           if (err) {
             const detail = (stderr || err.message || '').trim();
@@ -146,9 +147,9 @@ export class RepoCheckout {
   private async git(args: string[], opts?: GitRunOptions): Promise<string> {
     const token = typeof this.token === 'function' ? await this.token() : this.token;
     const basic = token ? Buffer.from(`x-access-token:${token}`).toString('base64') : undefined;
-    const full = basic ? ['-c', `http.extraheader=Authorization: Basic ${basic}`, ...args] : args;
+    const full = basic ? ['--config-env=http.https://github.com/.extraheader=REPOLENS_GIT_AUTH_HEADER', ...args] : args;
     try {
-      return await this.run(full, opts);
+      return await this.run(full, basic ? { ...opts, env: { ...opts?.env, REPOLENS_GIT_AUTH_HEADER: `Authorization: Basic ${basic}` } } : opts);
     } catch (err) {
       const message = this.redact(err instanceof Error ? err.message : String(err), token, basic);
       throw new Error(message);
