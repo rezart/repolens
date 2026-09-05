@@ -11,7 +11,7 @@ const envSchema = z.object({
   LLM_MODEL: z.string().default(''),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
   OPENROUTER_API_KEY: z.string().default(''),
-  OPENROUTER_BASE_URL: z.string().default('https://openrouter.ai/api/v1'),
+  OPENROUTER_BASE_URL: z.string().url().regex(/^https?:\/\//).default('https://openrouter.ai/api/v1'),
   CLAUDE_BIN: z.string().default('claude'),
   CODEX_BIN: z.string().default('codex'),
 
@@ -37,7 +37,10 @@ const envSchema = z.object({
   REVIEW_STATUS_CONTEXT: z.string().default('repolens/review'),
   /** Which finding severity makes the status fail: critical | warning | never. */
   REVIEW_FAIL_ON: z.enum(['critical', 'warning', 'never']).default('critical'),
-  /** Extra attempts for invalid batch review responses, within the total review budget. */
+  /** Ordered OpenRouter alternatives for review failures; chat keeps its own backend. */
+  REVIEW_FALLBACK_MODELS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((m) => m.trim()) : [])
+    .pipe(z.array(z.string().regex(/^[^\s,]+$/))),
+  /** Extra attempts for failed batch reviews, within the total review budget. */
   REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
   /** Seconds a PR must go without a new push before an automatic review starts. 0 reviews immediately. */
   REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(300),
@@ -67,7 +70,7 @@ export interface Config {
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
   chatModel: string;
-  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number };
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; fallbackModels?: string[] };
 }
 
 export class ConfigError extends Error {}
@@ -80,6 +83,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const e = parsed.data;
   if (e.LLM_PROVIDER === 'codex-cli' || e.CHAT_PROVIDER === 'codex-cli') {
     throw new ConfigError('codex-cli is temporarily disabled for security; use claude-cli or openrouter');
+  }
+  if (e.REVIEW_FALLBACK_MODELS.length && e.LLM_PROVIDER !== 'openrouter') {
+    throw new ConfigError('REVIEW_FALLBACK_MODELS requires the OpenRouter review provider');
   }
   const appFields = [e.GITHUB_APP_ID, e.GITHUB_APP_INSTALLATION_ID, e.GITHUB_APP_PRIVATE_KEY_PATH];
   if (appFields.some(Boolean) && !appFields.every(Boolean)) {
@@ -121,7 +127,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     chatProvider: e.CHAT_PROVIDER,
     chatModel: e.CHAT_MODEL,
-    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES },
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, fallbackModels: e.REVIEW_FALLBACK_MODELS },
     github: {
       token: e.GITHUB_TOKEN,
       app: e.GITHUB_APP_ID ? { appId: e.GITHUB_APP_ID, installationId: e.GITHUB_APP_INSTALLATION_ID, privateKeyPath: e.GITHUB_APP_PRIVATE_KEY_PATH } : undefined,

@@ -30,7 +30,7 @@ const usage: UsageRecord[] = [];
 const provider = new OpenRouterProvider({ apiKey, model: 'qwen/qwen3-coder', onUsage: (r) => { usage.push(r); console.log('usage', JSON.stringify(r)); } });
 let upperBound = 0;
 const result = await reviewPullRequest({ db, github, retrieve: async () => [], llm: {
-  name: provider.name, model: provider.model, concurrency: provider.concurrency,
+  name: provider.name, model: provider.model, concurrency: provider.concurrency, supportsBatchReview: provider.supportsBatchReview,
   complete: async (req) => { upperBound = reviewCostUpperBound(req); console.log('reservedUsd', upperBound); return provider.complete(req); },
 } }, { repoId, prNumber: 1, post: false });
 assert.equal(usage.length, 1);

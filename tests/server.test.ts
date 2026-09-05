@@ -747,6 +747,21 @@ describe('buildDeps', () => {
   // without spawning the CLI.
   const effortOf = (p: LLMProvider): string | undefined => (p as unknown as { effort?: string }).effort;
 
+  it('wires configured alternatives only into the review provider', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_FALLBACK_MODELS: 'qwen/qwen3-coder-next',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.llm.reviewFallbacks?.map((p) => p.model)).toEqual(['qwen/qwen3-coder-next']);
+      expect(deps.chatLlm.reviewFallbacks ?? []).toEqual([]);
+    } finally {
+      deps.db.close();
+    }
+  });
+
   it('always gives chat its own low-effort provider, even without CHAT_PROVIDER/CHAT_MODEL', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'claude-cli',

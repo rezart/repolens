@@ -16,6 +16,7 @@ const DELTA = [
 
 const PREV: ReviewRow = {
   id: 3, repo_id: 'github:o/r', pr_number: 42, head_sha: 'old-sha', status: 'done', cost_usd: null,
+  provider: null, model: null,
   summary: 'Earlier summary.', verdict: 'request_changes',
   comments_json: JSON.stringify([{ path: 'src/app.ts', line: 2, severity: 'critical', title: 'Bad thing', body: 'Fix it.' }]),
   posted: 1, error: null, created_at: '2026-09-04T00:00:00Z',

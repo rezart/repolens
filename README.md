@@ -38,12 +38,13 @@ npm start              # http://localhost:3000
 
 Set `REPOLENS_API_TOKEN` to a random secret before starting (for example, generate one with `openssl rand -hex 32`). Empty tokens and the example `change-me` value are rejected. The server binds to `127.0.0.1` by default; use `REPOLENS_HOST` to change it deliberately, and terminate HTTPS at your reverse proxy when exposing the service.
 
-### Option A: OpenRouter (any model)
+### Option A: OpenRouter
 
 ```env
 LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-...
-LLM_MODEL=anthropic/claude-sonnet-4.5     # or openai/gpt-5, google/gemini-2.5-pro, deepseek/deepseek-chat, ...
+LLM_MODEL=qwen/qwen3-coder
+REVIEW_FALLBACK_MODELS=qwen/qwen3-coder-next
 EMBEDDING_API_KEY=sk-or-...               # optional, enables vector search
 EMBEDDING_MODEL=openai/text-embedding-3-small   # or qwen/qwen3-embedding-8b, etc.
 ```
@@ -58,6 +59,7 @@ claude login            # once, on the machine that runs RepoLens
 
 ```env
 LLM_PROVIDER=claude-cli
+REVIEW_FALLBACK_MODELS=
 LLM_MODEL=              # blank = CLI default; or e.g. sonnet / opus
 ```
 
@@ -95,13 +97,19 @@ Prefer the authoritative `message` over concatenating deltas. The dashboard stre
 
 ## Using it
 
-With `LLM_PROVIDER=openrouter` and `LLM_MODEL=qwen/qwen3-coder`, a review uses one request for all files and the summary. Shared context is sent once, and retrieval uses the local lexical index without paid query embeddings. Other models keep the per-file pipeline.
+With `LLM_PROVIDER=openrouter`, a review uses one request for all files and the summary, regardless of model ID. Shared context is sent once, and retrieval uses the local lexical index without paid query embeddings. CLI providers keep the per-file pipeline.
 
-Qwen review requests reserve at most **$0.245**, below the $0.25 per-run limit: UTF-8 bytes conservatively bound input tokens (plus message overhead), output is limited to 8,000 tokens, and OpenRouter routing is capped at $0.40/M input and $2/M output with no per-request fee. Retries and provider fallbacks are disabled to avoid duplicate charges after an ambiguous failure. If no provider meets those prices, the run fails rather than exceeding the budget. This covers review inference, not separate repository indexing jobs.
+Set `LLM_MODEL=qwen/qwen3-coder` and `REVIEW_FALLBACK_MODELS=qwen/qwen3-coder-next` to try the current model first, then Coder Next when it fails. The fallback setting accepts a comma-separated list of OpenRouter model IDs in priority order; blank disables model fallback. Chat keeps its separate configuration.
+
+HTTP 408/429/5xx, transport failures (including `LLM_TIMEOUT_MS` expiry), and malformed, truncated, or incomplete review responses advance to the next model. The final model is retried if attempts remain. `REVIEW_MAX_RETRIES` limits **all** extra attempts (default 3; 0 disables retries and fallback). Each review starts at the primary again; there is no persistent health score or quality-based routing. Authentication, credit, and configuration errors stop immediately.
+
+Every attempt reserves its full conservative cost bound against the same $0.25 review ceiling, including failed requests with unknown billing. OpenRouter routing is restricted to endpoints at or below $0.40/M input and $2/M output with no per-request fee; models without an eligible endpoint fail closed. Hidden provider retries and routing fallbacks stay disabled, so model fallback cannot reset the budget. Logs and review warnings include retry reasons and model choices. Usage is attributed per model, and saved reviews retain the successful model for later posting.
+
+Review attempts together reserve at most **$0.245**, below the $0.25 per-run limit. UTF-8 bytes conservatively bound input tokens (plus message overhead), and output is limited to 8,000 tokens per attempt. This covers review inference, not separate repository indexing jobs.
 
 The dashboard’s past-review list shows the reported inference cost for each new review, summed across its calls. Historical reviews and reviews with missing cost reports show “Cost unavailable”; cached reviews retain their original cost. This excludes chat and repository indexing costs.
 
-All selected file diffs are included in full; optional post-change and indexed context is added only while it fits. Reviews exceeding the budget or the 40-file limit fail with an explicit error asking for a smaller PR. Truncated responses or responses missing a reviewed path also fail without posting or caching a clean review.
+All selected file diffs are included in full; optional post-change and indexed context is added only while it fits. Reviews exceeding the budget or the 40-file limit fail with an explicit error asking for a smaller PR. If retries are exhausted, truncated responses or responses missing a reviewed path fail without posting or caching a clean review.
 
 Run the opt-in paid check with `node --env-file=.env --import tsx scripts/check-review-cost.ts`. It sends only generated synthetic code, reviews 40 files, checks for a planted authorization bug in the last file, asserts the reported cost is at most $0.25, and never posts to GitHub. A run on 2026-09-04 cost **$0.00608** (23,749 input tokens, 509 output tokens), with a conservative reservation of $0.04278.
 
@@ -183,6 +191,7 @@ See `.env.example` for every variable. The important ones:
 | `REPOLENS_HOST` | `127.0.0.1` | Interface to listen on; Docker Compose binds all container interfaces but publishes only host loopback |
 | `LLM_PROVIDER` | `openrouter` | `openrouter`, `claude-cli`; `codex-cli` is temporarily disabled |
 | `LLM_MODEL` | | Model id (OpenRouter) or model name (CLIs, optional) |
+| `REVIEW_FALLBACK_MODELS` | blank | Ordered, comma-separated OpenRouter review alternatives; shares the retry limit and total budget |
 | `LLM_TIMEOUT_MS` | `300000` | Per-completion timeout |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | OpenRouter / empty / empty | OpenAI-compatible embeddings. Blank model = lexical only |
 | `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews (PAT fallback) |
