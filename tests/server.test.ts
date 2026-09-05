@@ -354,6 +354,14 @@ describe('API', () => {
       });
       expect(res.status).toBe(429);
       expect(deps.db.listJobs()).toHaveLength(before);
+      const listOpenPulls = vi.fn();
+      deps.github.listOpenPulls = listOpenPulls;
+      const bulk = await app.request('/api/repositories/github%3Ao%2Fn/pulls/review', {
+        method: 'POST', headers: auth, body: JSON.stringify({ prNumbers: [101] }),
+      });
+      expect(bulk.status).toBe(429);
+      expect(listOpenPulls).not.toHaveBeenCalled();
+      expect(deps.db.listReviewJobsForRepo('github:o/n')).toHaveLength(100);
     });
 
     it('pages past reviews newest first with a total', async () => {

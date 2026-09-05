@@ -154,6 +154,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
   const repo = deps.db.getRepo(repoId);
   if (!repo) throw new Error(`Unknown repository ${repoId}`);
   if (!repoId.startsWith('github:')) throw new Error(`Pull request review needs a GitHub repository; ${repoId} is local`);
+  // enqueue enforces the review capacity before writing a job, for every trigger.
   return deps.jobs.enqueue(
     'review',
     repoId,
@@ -338,6 +339,8 @@ export function createApp(deps: AppDeps): Hono {
     if (!id.startsWith('github:')) return c.json({ error: 'pull requests need a GitHub repository' }, 400);
     const body = reviewPullsSchema.safeParse(await c.req.json().catch(() => ({})));
     if (!body.success) return c.json({ error: body.error.message }, 400);
+    // Avoid an external GitHub request when no review can be queued.
+    if (!deps.jobs.hasCapacity('review')) return c.json({ error: 'job queue (review) is full' }, 429);
     let pulls;
     try {
       pulls = await listPullStatuses(deps, id);
