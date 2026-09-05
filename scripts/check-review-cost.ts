@@ -8,7 +8,7 @@ import type { UsageRecord } from '../src/usage/types.js';
 // Only generated synthetic code is sent. No repository files, database, or
 // GitHub data are read. The environment supplies authentication only.
 const apiKey = process.env.OPENROUTER_API_KEY;
-if (!apiKey) throw new Error('Set OPENROUTER_API_KEY to run the paid synthetic benchmark (at most $0.05).');
+if (!apiKey) throw new Error('Set OPENROUTER_API_KEY to run the paid synthetic benchmark (at most $0.25).');
 const db = openDb(':memory:');
 const repoId = 'github:synthetic/example';
 db.upsertRepo({ id: repoId, remote: 'https://example.invalid/synthetic.git', owner: 'synthetic', name: 'example', branch: 'main' });
@@ -35,7 +35,7 @@ const result = await reviewPullRequest({ db, github, retrieve: async () => [], l
 assert.equal(usage.length, 1);
 assert(usage.every((r) => r.costUsd !== null));
 const cost = usage.reduce((sum, r) => sum + r.costUsd!, 0);
-assert(cost <= 0.05);
+assert(cost <= 0.25);
 assert(result.findings.some((f) => f.path === paths[39] && f.line === 2 && f.severity === 'critical'));
 console.log(JSON.stringify({ costUsd: cost, upperBound, findings: result.findings, summary: result.summary, warnings: result.warnings, posted: result.posted }, null, 2));
 db.close();

@@ -704,7 +704,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       // Reject the core prompt before the retrieval loop or any inference call.
       if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
-        throw new Error('Review exceeds the $0.05 budget; split this pull request into smaller reviews.');
+        throw new Error('Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
@@ -734,7 +734,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           warnings.push(`${file.newPath}: retrieval failed: ${errMessage(err)}`);
         }
       }
-      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.05; all file diffs included.`);
+      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
       await assertHeadUnchanged();
       // Parsing failures reach reviewPullRequest's outer catch (error status),
       // then JobQueue records a failed job. Never turn invalid JSON into approval.

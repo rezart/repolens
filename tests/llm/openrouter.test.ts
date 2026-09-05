@@ -35,13 +35,16 @@ describe('Qwen review budget', () => {
   it('enforces routing prices and counts UTF-8 bytes before making a request', async () => {
     const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, reasoningEffort: 'high' });
-    await p.complete(req);
+    const larger = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(20000) }] };
+    expect(REVIEW_MAX_USD).toBe(0.245);
+    expect(reviewCostUpperBound(larger)).toBeGreaterThan(0.045);
+    await p.complete(larger);
     const body = JSON.parse(String(f.calls[0]!.init.body));
     expect(body.provider).toEqual({ sort: 'price', require_parameters: true, allow_fallbacks: false, max_price: { prompt: 0.4, completion: 2, request: 0 } });
     expect(body.reasoning).toBeUndefined();
-    const huge = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(20000) }] };
+    const huge = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(150000) }] };
     expect(reviewCostUpperBound(huge)).toBeGreaterThan(REVIEW_MAX_USD);
-    await expect(p.complete(huge)).rejects.toThrow('$0.05');
+    await expect(p.complete(huge)).rejects.toThrow('$0.25');
     expect(f.calls).toHaveLength(1);
   });
 

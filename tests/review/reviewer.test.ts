@@ -200,7 +200,7 @@ describe('reviewPullRequest', () => {
 
   it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
     const paths = Array.from({ length: 40 }, (_, i) => `src/file${i}.ts`);
-    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+new\n`).join('');
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+${'n'.repeat(2000)}\n`).join('');
     const gh = fakeGithub(diff);
     const calls: CompleteRequest[] = [];
     const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 4, async complete(req) {
@@ -213,11 +213,12 @@ describe('reviewPullRequest', () => {
     const retrieve: RetrieveFn = async (req) => {
       expect(req.lexicalOnly).toBe(true);
       expect(req.excludePaths).toEqual(paths);
-      return [CHUNK, { ...CHUNK, chunkId: 2, content: '💸'.repeat(50000) }];
+      return [CHUNK, { ...CHUNK, chunkId: 2, content: '💸'.repeat(200000) }];
     };
     const result = await reviewPullRequest({ db, llm, retrieve, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.reviewBudget).toBe(true);
+    expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(0.045);
     expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
     expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(2);
     expect(result.findings).toHaveLength(1);
@@ -228,10 +229,10 @@ describe('reviewPullRequest', () => {
 
   it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => { throw new Error('must not call'); } };
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(20000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(150000)));
     let retrievals = 0;
     const retrieve: RetrieveFn = async () => { retrievals++; return [CHUNK]; };
-    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.05');
+    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.25');
     expect(retrievals).toBe(0);
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
