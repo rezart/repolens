@@ -1,4 +1,5 @@
 import type { Db, RepoRow } from '../db.js';
+import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
 import { extractJson } from '../llm/json.js';
@@ -493,6 +494,15 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
 
 export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
   const { db, llm, retrieve, github } = deps;
+  let costUsd: number | null = 0;
+  const complete = async (req: CompleteRequest) => {
+    const call = { reported: false, costUsd: 0 as number | null };
+    try {
+      return await reviewCallCost.run(call, () => llm.complete(req));
+    } finally {
+      costUsd = costUsd === null || !call.reported || call.costUsd === null ? null : costUsd + call.costUsd;
+    }
+  };
   const log = deps.log ?? (() => {});
   const identifiers = deps.identifiers ?? defaultIdentifiers;
   const formatContext = deps.formatContext ?? defaultFormatContext;
@@ -704,7 +714,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       // Reject the core prompt before the retrieval loop or any inference call.
       if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
-        throw new Error('Review exceeds the $0.05 budget; split this pull request into smaller reviews.');
+        throw new Error('Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
@@ -734,11 +744,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           warnings.push(`${file.newPath}: retrieval failed: ${errMessage(err)}`);
         }
       }
-      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.05; all file diffs included.`);
+      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
       await assertHeadUnchanged();
       // Parsing failures reach reviewPullRequest's outer catch (error status),
       // then JobQueue records a failed job. Never turn invalid JSON into approval.
-      const obj = extractJson(await llm.complete(req)) as Record<string, unknown>;
+      const obj = extractJson(await complete(req)) as Record<string, unknown>;
       if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
           !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
           files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath)) ||
@@ -772,7 +782,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }
       await assertHeadUnchanged();
       try {
-        const raw = await llm.complete({
+        const raw = await complete({
           system: FILE_REVIEW_SYSTEM_PROMPT,
           messages: [
             {
@@ -814,7 +824,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         summary = batch.summary;
         verdict = batch.verdict;
       } else {
-        const raw = await llm.complete({
+        const raw = await complete({
           system: SUMMARY_SYSTEM_PROMPT,
           messages: [
             {
@@ -854,6 +864,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       pr_number: opts.prNumber,
       head_sha: pr.headSha,
       status: 'done',
+      cost_usd: costUsd,
       summary,
       verdict,
       comments_json: JSON.stringify(findings),

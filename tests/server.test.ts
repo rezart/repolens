@@ -320,11 +320,12 @@ describe('API', () => {
       for (const n of [1, 2, 3]) {
         deps.db.insertReview({
           repo_id: 'github:o/n', pr_number: n, head_sha: 'h' + n, status: 'done', summary: null, verdict: null,
-          comments_json: '[]', posted: 0, error: null,
+          comments_json: '[]', posted: 0, error: null, cost_usd: n === 1 ? 0.00608 : null,
         });
       }
       const page = await (await app.request('/api/reviews?repository=github:o/n&limit=2&offset=2', { headers: auth })).json();
       expect(page.total).toBe(3);
+      expect(page.reviews[0].cost_usd).toBe(0.00608);
       expect(page.reviews.map((r: { pr_number: number }) => r.pr_number)).toEqual([1]);
       expect((await app.request('/api/reviews?limit=0', { headers: auth })).status).toBe(400);
     });

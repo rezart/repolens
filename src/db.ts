@@ -65,6 +65,8 @@ export interface ReviewRow {
   pr_number: number;
   head_sha: string;
   status: 'done' | 'error';
+  /** Reported inference total; null for historical or incompletely priced reviews. */
+  cost_usd: number | null;
   summary: string | null;
   verdict: string | null;
   comments_json: string;
@@ -177,6 +179,7 @@ create table if not exists reviews (
   pr_number integer not null,
   head_sha text not null,
   status text not null,
+  cost_usd real,
   summary text,
   verdict text,
   comments_json text not null default '[]',
@@ -424,13 +427,13 @@ export class Db {
   }
 
   // ---- reviews ----
-  insertReview(r: Omit<ReviewRow, 'id' | 'created_at'>): ReviewRow {
+  insertReview(r: Omit<ReviewRow, 'id' | 'created_at' | 'cost_usd'> & { cost_usd?: number | null }): ReviewRow {
     const res = this.raw
       .prepare(
-        `insert into reviews (repo_id, pr_number, head_sha, status, summary, verdict, comments_json, posted, error)
-         values (@repo_id, @pr_number, @head_sha, @status, @summary, @verdict, @comments_json, @posted, @error)`,
+        `insert into reviews (repo_id, pr_number, head_sha, status, summary, verdict, comments_json, posted, error, cost_usd)
+         values (@repo_id, @pr_number, @head_sha, @status, @summary, @verdict, @comments_json, @posted, @error, @cost_usd)`,
       )
-      .run(r);
+      .run({ cost_usd: null, ...r });
     return this.getReview(Number(res.lastInsertRowid))!;
   }
 
@@ -551,6 +554,8 @@ export class Db {
  * safe to re-run: the schema above already contains the result for fresh databases.
  */
 export function migrate(raw: Database.Database) {
+  const reviewColumns = raw.pragma('table_info(reviews)') as Array<{ name: string }>;
+  if (!reviewColumns.some((c) => c.name === 'cost_usd')) raw.exec(`alter table reviews add column cost_usd real`);
   const columns = raw.pragma('table_info(jobs)') as Array<{ name: string }>;
   if (!columns.some((c) => c.name === 'pr_number')) raw.exec(`alter table jobs add column pr_number integer`);
 }
