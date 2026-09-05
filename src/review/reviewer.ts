@@ -674,10 +674,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
     const files = reviewable;
 
-    const historyPaths: string[] = [];
+    const historyPathSet = new Set<string>();
     for (const file of files) {
-      for (const path of [file.oldPath, file.newPath]) if (path && !historyPaths.includes(path)) historyPaths.push(path);
+      for (const path of [file.oldPath, file.newPath]) if (path) historyPathSet.add(path);
     }
+    const historyPaths = [...historyPathSet];
     const historical = await buildHistoricalContext(
       {
         listPathCommits: (path, ref) => github.listPathCommits(repo.owner, repo.name, path, ref),
