@@ -15,6 +15,7 @@ import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
+import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
 import {
   reviewPullRequest,
   ReviewSupersededError,
@@ -422,6 +423,38 @@ describe('reviewPullRequest', () => {
     expect(calls).toBe(1);
     expect(reserved).toBeLessThanOrEqual(REVIEW_MAX_USD);
     expect(gh.reviews).toHaveLength(0);
+  });
+
+  it('leaves retry budget after admitting optional context while preserving the full diff and history', async () => {
+    const calls: CompleteRequest[] = [];
+    const invalid = JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Incomplete.', verdict: 'approve',
+      findings: [{ path: 'src/app.ts', line: 999, severity: 'critical', title: 'Bad', body: 'Fix.' }] });
+    const valid = JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Complete.', verdict: 'approve', findings: [] });
+    const fallback: LLMProvider = { name: 'fake', model: 'fallback', concurrency: 1, supportsBatchReview: true, complete: async (req) => {
+      calls.push(req);
+      return valid;
+    } };
+    const primary: LLMProvider = { name: 'fake', model: 'primary', concurrency: 1, supportsBatchReview: true, reviewFallbacks: [fallback], complete: async (req) => {
+      calls.push(req);
+      return invalid;
+    } };
+    const gh = fakeGithub(DIFF, PR, {
+      headFiles: { 'src/app.ts': 'x'.repeat(50_000) },
+      historyCommits: [{ sha: 'history-commit', message: 'history', htmlUrl: 'https://github.com/o/r/commit/history-commit' }],
+      historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
+    });
+    const result = await reviewPullRequest({ db, llm: primary, retrieve: async () => [{ ...CHUNK, content: 'x'.repeat(300_000) }], github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(result.summary).toBe('Complete.');
+    expect(calls).toHaveLength(2);
+    const primaryContent = calls[0]!.messages[0]!.content;
+    expect(calls[1]!.messages[0]!.content).toBe(primaryContent);
+    expect(primaryContent).toContain('Historical description');
+    const payload = JSON.parse(primaryContent.split('\n\n', 1)[0]!) as { files: Array<{ path: string; status: string; diff: string }> };
+    const expected = parseUnifiedDiff(DIFF)
+      .filter((file) => file.newPath === 'src/app.ts' || file.oldPath === 'src/gone.ts')
+      .map((file) => ({ path: file.newPath ?? file.oldPath!, status: file.status, diff: hunkText(file, Infinity) }));
+    expect(payload.files).toEqual(expected);
+    expect(reviewCostUpperBound(calls[0]!) * 2).toBeLessThanOrEqual(REVIEW_MAX_USD);
   });
 
   it('retries truncated provider output and counts the cost of both attempts', async () => {

@@ -777,17 +777,21 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }) }],
         json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true,
       };
+      const maxRetries = deps.maxRetries ?? 3;
       // Reject the core prompt before the retrieval loop or any inference call.
-      if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+      const coreCost = reviewCostUpperBound(req);
+      if (coreCost > REVIEW_MAX_USD) {
         throw new Error('Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
+      // Reserve half the ceiling for one retry while keeping the full core diff.
+      const optionalContextBudget = maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
       let omitted = 0;
       const addContext = (block: string) => {
         const previous = req.messages[0]!.content;
         req.messages[0]!.content += `\n\n${block}`;
-        if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+        if (reviewCostUpperBound(req) > optionalContextBudget) {
           req.messages[0]!.content = previous;
           omitted++;
         }
@@ -816,7 +820,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let providerIndex = 0;
-      const maxRetries = deps.maxRetries ?? 3;
       const attemptCost = reviewCostUpperBound(req);
       let reservedUsd = 0;
       for (let attempt = 0; ; attempt++) {

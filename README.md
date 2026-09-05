@@ -99,6 +99,8 @@ Prefer the authoritative `message` over concatenating deltas. The dashboard stre
 
 With `LLM_PROVIDER=openrouter`, a review uses one request for all files and the summary, regardless of model ID. Shared context is sent once, and retrieval uses the local lexical index without paid query embeddings. CLI providers keep the per-file pipeline.
 
+When retries are enabled, optional context is admitted only while the request reserves at most half the review budget, leaving room for one retry. All file diffs remain complete. A core prompt that already exceeds half the budget can still receive one review attempt, but optional context is omitted and a retry may not fit.
+
 Set `LLM_MODEL=qwen/qwen3-coder` and `REVIEW_FALLBACK_MODELS=qwen/qwen3-coder-next` to try the current model first, then Coder Next when it fails. The fallback setting accepts a comma-separated list of OpenRouter model IDs in priority order; blank disables model fallback. Chat keeps its separate configuration.
 
 HTTP 408/429/5xx, transport failures (including `LLM_TIMEOUT_MS` expiry), and malformed, truncated, or incomplete review responses advance to the next model. The final model is retried if attempts remain. `REVIEW_MAX_RETRIES` limits **all** extra attempts (default 3; 0 disables retries and fallback). Each review starts at the primary again; there is no persistent health score or quality-based routing. Authentication, credit, and configuration errors stop immediately.
