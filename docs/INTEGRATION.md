@@ -16,7 +16,7 @@ This is a step-by-step recipe for wiring a GitHub repository to a running RepoLe
 ## Prerequisites
 
 1. A running RepoLens instance (`npm start`, the launchd service, or Docker). See the README.
-2. A GitHub token in RepoLens's `GITHUB_TOKEN` with, for the target repo: `Contents: read`, `Pull requests: read & write`, `Commit statuses: write` (classic PAT: `repo` scope covers all three). Statuses and reviews appear under the token owner's account.
+2. A [GitHub App installation](#github-app-authentication), or a GitHub token in RepoLens's `GITHUB_TOKEN` with, for the target repo: `Contents: read`, `Pull requests: read & write`, `Commit statuses: write` (classic PAT: `repo` scope covers all three). Statuses and reviews appear under the token owner's account.
 3. `gh` authenticated as a repo admin on the machine where you run the commands below.
 4. RepoLens reachable by you (default `http://localhost:3000`) and its `REPOLENS_API_TOKEN`.
 
@@ -27,6 +27,54 @@ export REPOLENS_URL=http://localhost:3000
 export REPOLENS_API_TOKEN=...      # from RepoLens's .env
 export REPO=OWNER/REPO
 ```
+
+## GitHub App authentication
+
+Use an App to post reviews under its own bot identity. A personal token cannot
+request changes on a PR opened by the token owner. Marketplace publication is
+not required.
+
+1. Open **Settings → Developer settings → GitHub Apps → New GitHub App** on the
+   account that owns the repositories. Choose a unique name and use your RepoLens
+   repository URL as the homepage.
+2. Leave user authorization/OAuth disabled. For polling only, uncheck **Active**
+   under Webhook; no public server URL is needed.
+3. Set repository permissions: **Contents: read**, **Pull requests: read & write**,
+   and **Commit statuses: read & write**. If using issue-comment mentions, also
+   grant **Issues: read & write**. Metadata read access is included by GitHub.
+4. Choose **Only on this account** and create the App. Generate a private key,
+   store the downloaded PEM outside version control (for example
+   `data/github-app.pem`), and restrict its file permissions (`chmod 600`).
+5. Under **Install App**, install it on the selected repositories RepoLens indexes.
+   Copy the App ID from the App settings and the installation ID from the
+   installation settings URL (`/settings/installations/<id>`).
+6. Set these values in RepoLens's `.env` and restart:
+
+   ```dotenv
+   GITHUB_APP_ID=123456
+   GITHUB_APP_INSTALLATION_ID=789012
+   GITHUB_APP_PRIVATE_KEY_PATH=./data/github-app.pem
+   ```
+
+All three values are required together. App authentication takes precedence over
+`GITHUB_TOKEN` for both API requests and private-repository fetches; it never
+silently falls back to your personal identity if App authentication fails. Tokens
+are cached in memory and renewed before expiry. Keep the PEM accessible to the
+server user; in Docker, mount it read-only and use its container path.
+
+This setup supports one installation per RepoLens instance. A private App can be
+installed only on its owning account; use a separate instance/installation for
+another account. Existing PAT-only configuration continues to work.
+
+For webhooks, enable the App webhook with the existing `/webhooks/github` URL and
+`GITHUB_WEBHOOK_SECRET`, subscribing to **Pull request**, **Push**, and optionally
+**Issue comment**. Polling can remain enabled.
+
+Verify the next posted review is authored by the App and the head commit has a
+`repolens/review` status. RepoLens does not automatically submit approving reviews:
+if branch protection requires reviews and an App request-changes review blocks a
+later clean commit, dismiss that outdated review through GitHub. The required
+`repolens/review` status remains the automatic severity-based merge gate.
 
 ## Step 1: register the repository with RepoLens
 

@@ -233,3 +233,18 @@ describe('RepoCheckout', () => {
     expect(calls[1]).toEqual(['rev-parse', 'refs/remotes/pr/42']);
   });
 });
+
+it('refreshes checkout credentials per invocation and redacts the refreshed token', async () => {
+  let n = 0;
+  const seen: string[][] = [];
+  const checkout = new RepoCheckout({ dir: '/tmp/repolens-app-token-test', url: 'https://github.com/o/r.git', token: async () => `secret-${++n}`, git: async (args) => {
+    seen.push(args);
+    throw new Error(args.join(' ') + ` secret-${n}`);
+  } });
+  await expect(checkout.fetchRef('main')).rejects.not.toThrow('secret-1');
+  await expect(checkout.fetchRef('main')).rejects.not.toThrow('secret-2');
+  expect(seen.map((args) => args[1])).toEqual([
+    'http.extraheader=Authorization: Basic ' + Buffer.from('x-access-token:secret-1').toString('base64'),
+    'http.extraheader=Authorization: Basic ' + Buffer.from('x-access-token:secret-2').toString('base64'),
+  ]);
+});

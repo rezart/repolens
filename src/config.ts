@@ -19,6 +19,9 @@ const envSchema = z.object({
   EMBEDDING_MODEL: z.string().default(''),
 
   GITHUB_TOKEN: z.string().default(''),
+  GITHUB_APP_ID: z.string().regex(/^(?:[1-9][0-9]*)?$/).default(''),
+  GITHUB_APP_INSTALLATION_ID: z.string().regex(/^(?:[1-9][0-9]*)?$/).default(''),
+  GITHUB_APP_PRIVATE_KEY_PATH: z.string().trim().default(''),
   GITHUB_API_URL: z.string().default('https://api.github.com'),
   GITHUB_WEBHOOK_SECRET: z.string().default(''),
   REVIEW_BOT_HANDLE: z.string().default('@repolens'),
@@ -55,7 +58,7 @@ export interface Config {
     reasoningEffort: 'low' | 'medium' | 'high' | '';
   };
   embedding: { baseUrl: string; apiKey: string; model: string } | null;
-  github: { token: string; apiUrl: string; webhookSecret: string; botHandle: string };
+  github: { token: string; apiUrl: string; webhookSecret: string; botHandle: string; app?: { appId: string; installationId: string; privateKeyPath: string } };
   pollIntervalSeconds: number;
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
@@ -71,6 +74,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new ConfigError(`Invalid configuration: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   }
   const e = parsed.data;
+  const appFields = [e.GITHUB_APP_ID, e.GITHUB_APP_INSTALLATION_ID, e.GITHUB_APP_PRIVATE_KEY_PATH];
+  if (appFields.some(Boolean) && !appFields.every(Boolean)) {
+    throw new ConfigError('GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and GITHUB_APP_PRIVATE_KEY_PATH must all be set');
+  }
   if (e.LLM_PROVIDER === 'openrouter' && !e.OPENROUTER_API_KEY) {
     throw new ConfigError('OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter');
   }
@@ -109,6 +116,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS },
     github: {
       token: e.GITHUB_TOKEN,
+      app: e.GITHUB_APP_ID ? { appId: e.GITHUB_APP_ID, installationId: e.GITHUB_APP_INSTALLATION_ID, privateKeyPath: e.GITHUB_APP_PRIVATE_KEY_PATH } : undefined,
       apiUrl: e.GITHUB_API_URL,
       webhookSecret: e.GITHUB_WEBHOOK_SECRET,
       botHandle: e.REVIEW_BOT_HANDLE,

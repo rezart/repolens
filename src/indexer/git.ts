@@ -74,7 +74,7 @@ export interface RepoCheckoutOptions {
   /** Clone url (may be a local path in tests). */
   url: string;
   /** GitHub token; passed per invocation as an http header, never echoed in errors. */
-  token?: string;
+  token?: string | (() => Promise<string>);
   /** Override for tests. */
   git?: GitRunner;
 }
@@ -120,24 +120,21 @@ function defaultRunner(defaultCwd: string): GitRunner {
 export class RepoCheckout {
   readonly dir: string;
   readonly url: string;
-  private readonly token?: string;
-  /** base64 of `x-access-token:<token>`, used in the per-invocation auth header. */
-  private readonly basic?: string;
+  private readonly token?: string | (() => Promise<string>);
   private readonly run: GitRunner;
 
   constructor(opts: RepoCheckoutOptions) {
     this.dir = resolve(opts.dir);
     this.url = opts.url;
     this.token = opts.token;
-    this.basic = opts.token ? Buffer.from(`x-access-token:${opts.token}`).toString('base64') : undefined;
     this.run = opts.git ?? defaultRunner(this.dir);
   }
 
   /** Strip credentials from anything we surface to callers or logs. */
-  private redact(text: string): string {
+  private redact(text: string, token?: string, basic?: string): string {
     let out = text.replace(/(https?:\/\/)[^@\s/]+:[^@\s/]+@/g, '$1***:***@');
-    if (this.token) out = out.split(this.token).join('***');
-    if (this.basic) out = out.split(this.basic).join('***');
+    if (token) out = out.split(token).join('***');
+    if (basic) out = out.split(basic).join('***');
     return out;
   }
 
@@ -147,11 +144,13 @@ export class RepoCheckout {
    * picked up on the next call.
    */
   private async git(args: string[], opts?: GitRunOptions): Promise<string> {
-    const full = this.basic ? ['-c', `http.extraheader=Authorization: Basic ${this.basic}`, ...args] : args;
+    const token = typeof this.token === 'function' ? await this.token() : this.token;
+    const basic = token ? Buffer.from(`x-access-token:${token}`).toString('base64') : undefined;
+    const full = basic ? ['-c', `http.extraheader=Authorization: Basic ${basic}`, ...args] : args;
     try {
       return await this.run(full, opts);
     } catch (err) {
-      const message = this.redact(err instanceof Error ? err.message : String(err));
+      const message = this.redact(err instanceof Error ? err.message : String(err), token, basic);
       throw new Error(message);
     }
   }
@@ -169,7 +168,7 @@ export class RepoCheckout {
     }
     // Clones made by older versions embedded the token in the remote url; drop it so
     // the header is the only credential and a rotated token takes effect.
-    if (this.basic) await this.git(['remote', 'set-url', 'origin', this.url]);
+    if (this.token) await this.git(['remote', 'set-url', 'origin', this.url]);
     await this.git(['fetch', '--all', '--prune']);
   }
 
