@@ -84,7 +84,7 @@ export function createRetriever({ db, embeddings }: { db: Db; embeddings?: Embed
     const lexical = db.ftsSearch(req.repoIds, buildFtsQuery(tokens), pool);
 
     let semantic: SearchHit[] = [];
-    if (embeddings && db.vectorDimension !== null) {
+    if (!req.lexicalOnly && embeddings && db.vectorDimension !== null) {
       try {
         const [vector] = await embeddings.embed([req.query]);
         if (vector && vector.length === db.vectorDimension) {

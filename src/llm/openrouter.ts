@@ -2,6 +2,7 @@ import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE } from '../review/budget.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -33,7 +34,7 @@ interface RawUsage {
 }
 
 interface ChatCompletionResponse {
-  choices?: Array<{ message?: { content?: unknown } }>;
+  choices?: Array<{ message?: { content?: unknown }; finish_reason?: string }>;
   usage?: RawUsage | null;
   error?: unknown;
 }
@@ -113,12 +114,26 @@ export class OpenRouterProvider implements LLMProvider {
     if (req.json) body.response_format = { type: 'json_object' };
     if (this.effort) body.reasoning = { effort: this.effort };
     if (streaming) body.stream = true;
+    if (req.reviewBudget) {
+      if (this.model !== 'qwen/qwen3-coder' || streaming || !Number.isInteger(req.maxTokens) ||
+          req.maxTokens! <= 0 || req.maxTokens! > REVIEW_MAX_OUTPUT || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+        throw new ProviderError('openrouter', 'Review exceeds the $0.05 budget; split this pull request into smaller reviews.');
+      }
+      body.provider = {
+        sort: 'price', require_parameters: true, allow_fallbacks: false,
+        max_price: { prompt: REVIEW_INPUT_PRICE, completion: REVIEW_OUTPUT_PRICE, request: 0 },
+      };
+      delete body.reasoning;
+    }
     return JSON.stringify(body);
   }
 
   async complete(req: CompleteRequest): Promise<string> {
-    const { content, usage } = await this.readContent(await this.post(this.buildPayload(req, false)));
+    const { content, usage, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS));
     this.reportUsage(usage);
+    if (req.reviewBudget && finishReason !== 'stop') {
+      throw new ProviderError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
+    }
     return content;
   }
 
@@ -198,10 +213,10 @@ export class OpenRouterProvider implements LLMProvider {
   }
 
   /** POST with retries, returning the successful response. */
-  private async post(payload: string): Promise<Response> {
+  private async post(payload: string, maxAttempts = MAX_ATTEMPTS): Promise<Response> {
     let lastError: ProviderError | undefined;
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let res: Response;
       try {
         res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
@@ -218,7 +233,7 @@ export class OpenRouterProvider implements LLMProvider {
       } catch (err) {
         // DNS failures, resets and timeouts arrive as a thrown error, not a response.
         const netErr = new ProviderError('openrouter', `request failed: ${err instanceof Error ? err.message : String(err)}`);
-        if (attempt === MAX_ATTEMPTS) throw netErr;
+        if (attempt === maxAttempts) throw netErr;
         lastError = netErr;
         await this.sleep(backoffMs(attempt));
         continue;
@@ -228,7 +243,7 @@ export class OpenRouterProvider implements LLMProvider {
 
       const detail = await safeText(res);
       const err = new ProviderError('openrouter', `HTTP ${res.status}`, res.status, detail);
-      if (!isRetryable(res.status) || attempt === MAX_ATTEMPTS) throw err;
+      if (!isRetryable(res.status) || attempt === maxAttempts) throw err;
       lastError = err;
       await this.sleep(backoffMs(attempt));
     }
@@ -237,7 +252,7 @@ export class OpenRouterProvider implements LLMProvider {
   }
 
   /** The message text plus the usage block, if the response carried one. */
-  private async readContent(res: Response): Promise<{ content: string; usage: RawUsage | null | undefined }> {
+  private async readContent(res: Response): Promise<{ content: string; usage: RawUsage | null | undefined; finishReason?: string }> {
     let parsed: ChatCompletionResponse;
     const text = await safeText(res);
     try {
@@ -249,7 +264,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (typeof content !== 'string') {
       throw new ProviderError('openrouter', 'response had no message content', res.status, text.slice(0, 500));
     }
-    return { content, usage: parsed.usage };
+    return { content, usage: parsed.usage, finishReason: parsed.choices?.[0]?.finish_reason };
   }
 }
 

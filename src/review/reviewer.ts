@@ -1,5 +1,6 @@
 import type { Db, RepoRow } from '../db.js';
-import type { LLMProvider } from '../llm/types.js';
+import type { CompleteRequest, LLMProvider } from '../llm/types.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
 import { extractJson } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
 import { truncateDescription } from './github.js';
@@ -8,6 +9,7 @@ import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './di
 import { buildLineage, deltaForFile, type Lineage } from './lineage.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
+  BATCH_REVIEW_SYSTEM_PROMPT,
   SUMMARY_SYSTEM_PROMPT,
   buildFileReviewMessage,
   buildSummaryMessage,
@@ -631,6 +633,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       reviewable.push(f);
     }
 
+    const budgeted = llm.name === 'openrouter' && llm.model === 'qwen/qwen3-coder';
+    // Check the unsliced list: `files` below can never exceed maxFiles.
+    if (budgeted && reviewable.length > maxFiles) {
+      throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
+    }
     const files = reviewable.slice(0, maxFiles);
     for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
 
@@ -680,7 +687,73 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       if (sha && sha !== pr.headSha) throw new ReviewSupersededError(pr.headSha, sha);
     };
 
-    const perFile = await mapPool(files, llm.concurrency, async (file) => {
+    let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
+    if (budgeted) {
+      const req: CompleteRequest = {
+        system: BATCH_REVIEW_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: JSON.stringify({
+          prTitle: pr.title, prBody: pr.body, instructions: repo.instructions,
+          overview: lineage.overview, commits: lineage.commits,
+          previous: lineage.previous ? { ...lineage.previous, delta: undefined } : undefined,
+          files: files.map((f) => ({
+            path: f.newPath!, status: f.status, diff: hunkText(f, Infinity),
+            delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath!) : undefined,
+          })),
+        }) }],
+        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true,
+      };
+      // Reject the core prompt before the retrieval loop or any inference call.
+      if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+        throw new Error('Review exceeds the $0.05 budget; split this pull request into smaller reviews.');
+      }
+      // Share each context block once across all files; changed code always gets
+      // its full diff before optional context consumes any of the budget.
+      let omitted = 0;
+      const addContext = (block: string) => {
+        const previous = req.messages[0]!.content;
+        req.messages[0]!.content += `\n\n${block}`;
+        if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+          req.messages[0]!.content = previous;
+          omitted++;
+        }
+      };
+      for (const [path, content] of headContents) {
+        addContext(`Files changed in this pull request (post-change content, authoritative):\n${JSON.stringify({ path, content })}`);
+      }
+      const seen = new Set<number>();
+      for (const file of files) {
+        const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
+        try {
+          const chunks = await retrieve({ repoIds: [opts.repoId], query: [file.newPath!, ...identifiers(added)].join(' '), limit: 8, excludePaths: changedPaths, lexicalOnly: true });
+          for (const chunk of chunks) {
+            if (seen.has(chunk.chunkId)) continue;
+            seen.add(chunk.chunkId);
+            addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
+          }
+        } catch (err) {
+          warnings.push(`${file.newPath}: retrieval failed: ${errMessage(err)}`);
+        }
+      }
+      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.05; all file diffs included.`);
+      await assertHeadUnchanged();
+      // Parsing failures reach reviewPullRequest's outer catch (error status),
+      // then JobQueue records a failed job. Never turn invalid JSON into approval.
+      const obj = extractJson(await llm.complete(req)) as Record<string, unknown>;
+      if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
+          !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
+          files.some((f) => !(obj.reviewedPaths as unknown[]).includes(f.newPath)) ||
+          obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => file.newPath === (f as { path?: unknown }).path))) {
+        throw new Error('Incomplete review response; no review was published.');
+      }
+      batch = {
+        findings: files.flatMap((file) => parseFindings(JSON.stringify({
+          findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === file.newPath),
+        }), file, changedNewLines(file))),
+        summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
+      };
+    }
+
+    const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath!;
       const allowed = changedNewLines(file);
       const addedText = file.hunks
@@ -737,27 +810,32 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let summary = '';
     let verdict: Verdict = 'comment';
     try {
-      const raw = await llm.complete({
-        system: SUMMARY_SYSTEM_PROMPT,
-        messages: [
-          {
-            role: 'user',
-            content: buildSummaryMessage({
-              prTitle: pr.title,
-              prBody: pr.body,
-              files: files.map((f) => ({ path: f.newPath!, status: f.status })),
-              findings,
-              lineage,
-            }),
-          },
-        ],
-        json: true,
-        maxTokens: 800,
-      });
-      const obj = extractJson(raw) as Record<string, unknown>;
-      summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
-      verdict = toVerdict(obj?.verdict) ?? 'comment';
-      if (!summary) throw new Error('summary missing from model output');
+      if (batch) {
+        summary = batch.summary;
+        verdict = batch.verdict;
+      } else {
+        const raw = await llm.complete({
+          system: SUMMARY_SYSTEM_PROMPT,
+          messages: [
+            {
+              role: 'user',
+              content: buildSummaryMessage({
+                prTitle: pr.title,
+                prBody: pr.body,
+                files: files.map((f) => ({ path: f.newPath!, status: f.status })),
+                findings,
+                lineage,
+              }),
+            },
+          ],
+          json: true,
+          maxTokens: 800,
+        });
+        const obj = extractJson(raw) as Record<string, unknown>;
+        summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
+        verdict = toVerdict(obj?.verdict) ?? 'comment';
+        if (!summary) throw new Error('summary missing from model output');
+      }
     } catch (err) {
       const msg = `summary: ${errMessage(err)}`;
       warnings.push(msg);

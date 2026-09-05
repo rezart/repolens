@@ -9,6 +9,8 @@ import type {
   CommitStatusInput,
 } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
+import { JobQueue } from '../../src/jobs.js';
 import {
   reviewPullRequest,
   ReviewSupersededError,
@@ -195,6 +197,78 @@ describe('reviewPullRequest', () => {
     db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
   });
   afterEach(() => db.close());
+
+  it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
+    const paths = Array.from({ length: 40 }, (_, i) => `src/file${i}.ts`);
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+new\n`).join('');
+    const gh = fakeGithub(diff);
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 4, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Updates the files.', verdict: 'request_changes', findings: [
+        { path: paths[39], line: 1, severity: 'critical', title: 'Bug', body: 'Fix it.' },
+        { path: paths[0], line: 999, severity: 'warning', title: 'Invalid line', body: 'Ignored.' },
+      ] });
+    } };
+    const retrieve: RetrieveFn = async (req) => {
+      expect(req.lexicalOnly).toBe(true);
+      expect(req.excludePaths).toEqual(paths);
+      return [CHUNK, { ...CHUNK, chunkId: 2, content: '💸'.repeat(50000) }];
+    };
+    const result = await reviewPullRequest({ db, llm, retrieve, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.reviewBudget).toBe(true);
+    expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
+    expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(2);
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]!.path).toBe(paths[39]);
+    expect(result.verdict).toBe('request_changes');
+    expect(result.warnings.some((w) => w.includes('optional context'))).toBe(true);
+  });
+
+  it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => { throw new Error('must not call'); } };
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(20000)));
+    let retrievals = 0;
+    const retrieve: RetrieveFn = async () => { retrievals++; return [CHUNK]; };
+    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.05');
+    expect(retrievals).toBe(0);
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.reviews).toHaveLength(0);
+    expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
+
+  it.each([40, 2])('rejects Qwen reviews above the %i-file limit before fetching head content', async (maxFiles) => {
+    const paths = Array.from({ length: maxFiles + 1 }, (_, i) => `src/file${i}.ts`);
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+new\n`).join('');
+    const gh = fakeGithub(diff);
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder' };
+    await expect(reviewPullRequest({ db, llm, maxFiles, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('file limit');
+    expect(gh.contentCalls.filter((c) => c.ref === PR.headSha)).toEqual([]);
+    expect(gh.reviews).toHaveLength(0);
+  });
+
+  it('records malformed Qwen JSON as an error and continues processing jobs', async () => {
+    const gh = fakeGithub();
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => 'not JSON' };
+    const queue = new JobQueue(db);
+    const failed = queue.enqueue('review', REPO_ID, () => reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 }));
+    const next = queue.enqueue('review', REPO_ID, async () => 'still running');
+    await queue.idle();
+    expect(db.getJob(failed.id)?.status).toBe('error');
+    expect(db.getJob(next.id)?.status).toBe('done');
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.reviews).toHaveLength(0);
+    expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
+
+  it('rejects a Qwen response that omitted a reviewed path', async () => {
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => JSON.stringify({ findings: [], summary: 'Fine', verdict: 'approve', reviewedPaths: [] }) };
+    const gh = fakeGithub();
+    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
+    expect(gh.reviews).toHaveLength(0);
+    expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
 
   it('abandons the review without posting when the PR head moves mid-review', async () => {
     const llm = fakeLlm();

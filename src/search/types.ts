@@ -12,6 +12,8 @@ export interface RetrieveRequest {
   repoIds: string[];
   query: string;
   limit?: number;
+  /** Use the local index without a paid query embedding. */
+  lexicalOnly?: boolean;
   /** Chunks whose path equals this are excluded (used by the reviewer to avoid echoing the file under review). */
   excludePath?: string;
   /**
