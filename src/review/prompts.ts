@@ -60,7 +60,7 @@ When a previous review is present, lead with what changed in the commits since t
 
 export const BATCH_REVIEW_SYSTEM_PROMPT = `${REVIEW_SYSTEM_PROMPT}
 
-Review ALL files in the input, including deleted and deletion-only source files. Shared post-change context is authoritative for every file. Reconcile previous findings against the current code and per-file delta.
+Review ALL files in the input, including deleted and deletion-only source files. Shared post-change context is authoritative for every file. Reconcile previous findings against the current code and per-file delta. Each file includes an allowedFindingLines list; every finding's line MUST be one of the listed numbers. Normal files list added new-file lines; deleted and deletion-only files list old diff lines. Never invent a line number or omit a finding to evade this constraint.
 ${SUMMARY_GUIDANCE}
 Severity: critical for bugs/security issues that should block merging, warning for likely problems, nit for minor correctness concerns.
 Verdict: request_changes when there are critical findings, comment for other findings, approve when no findings remain.

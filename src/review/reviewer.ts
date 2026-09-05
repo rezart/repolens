@@ -377,19 +377,25 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return results;
 }
 
-function parseFindings(raw: string, file: DiffFile, allowed: Set<number>): Finding[] {
+function allowedFindingLines(file: DiffFile): Set<number> {
+  const added = changedNewLines(file);
+  if (file.status !== 'deleted' && added.size > 0) return added;
+  return new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
+}
+
+function parseFindings(raw: string, file: DiffFile): Finding[] {
   const parsed = extractJson(raw) as { findings?: unknown } | unknown[];
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? (parsed.findings as unknown[]) : null;
   if (!list) throw new Error('model output has no "findings" array');
   const path = file.newPath ?? file.oldPath ?? '';
-  const bodyAllowed = new Set(file.hunks.flatMap((h) => h.lines.flatMap((l) => l.oldLine === undefined ? [] : [l.oldLine])));
+  const allowed = allowedFindingLines(file);
+  const bodyOnly = file.status === 'deleted' || changedNewLines(file).size === 0;
   const out: Finding[] = [];
   for (const entry of list) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('model output contains a malformed finding');
     const e = entry as Record<string, unknown>;
     const line = typeof e.line === 'number' ? e.line : typeof e.line === 'string' ? Number(e.line) : NaN;
-    const bodyOnly = file.status === 'deleted' || allowed.size === 0;
-    if (!Number.isInteger(line) || (!bodyOnly && !allowed.has(line)) || (bodyOnly && !bodyAllowed.has(line))) {
+    if (!Number.isInteger(line) || !allowed.has(line)) {
       throw new Error(`model output contains an invalid finding line for ${path}`);
     }
     const title = typeof e.title === 'string' ? e.title.trim() : '';
@@ -772,6 +778,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           previous: lineage.previous ? { ...lineage.previous, delta: undefined } : undefined,
           files: files.map((f) => ({
             path: f.newPath ?? f.oldPath!, status: f.status, diff: hunkText(f, Infinity),
+            allowedFindingLines: [...allowedFindingLines(f)].sort((a, b) => a - b),
             delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath ?? f.oldPath!) : undefined,
           })),
         }) }],
@@ -842,7 +849,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           try {
             findings = files.flatMap((file) => parseFindings(JSON.stringify({
               findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-            }), file, changedNewLines(file)));
+            }), file));
           } catch (err) {
             throw new IncompleteResponseError(activeLlm.name, errMessage(err));
           }
@@ -863,7 +870,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath ?? file.oldPath!;
-      const allowed = changedNewLines(file);
       const addedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
         .join('\n');
@@ -903,7 +909,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           json: true,
           maxTokens: 2000,
         });
-        return parseFindings(raw, file, allowed);
+        return parseFindings(raw, file);
       } catch (err) {
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);

@@ -290,6 +290,36 @@ describe('reviewPullRequest', () => {
     expect(result.warnings.some((w) => w.includes('optional context'))).toBe(true);
   });
 
+  it('lists exactly the validator-allowed finding lines for normal, deleted and deletion-only files', async () => {
+    const diff = [
+      'diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', '@@ -1,2 +1,2 @@',
+      ' context', '-old', '+new',
+      'diff --git a/src/gone.ts b/src/gone.ts', 'deleted file mode 100644', '--- a/src/gone.ts', '+++ /dev/null', '@@ -10,2 +0,0 @@',
+      '-gone', '-also gone',
+      'diff --git a/src/auth.ts b/src/auth.ts', '--- a/src/auth.ts', '+++ b/src/auth.ts', '@@ -4,3 +4,1 @@',
+      ' context', '-const auth = true;', '-const allowed = true;', '',
+    ].join('\n');
+    const requests: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'fake', model: 'batch', supportsBatchReview: true, concurrency: 1, async complete(req) {
+      requests.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts', 'src/auth.ts'], summary: 'Reviewed.', verdict: 'request_changes', findings: [
+        { path: 'src/app.ts', line: 2, severity: 'warning', title: 'Normal', body: 'Check.' },
+        { path: 'src/gone.ts', line: 10, severity: 'critical', title: 'Deleted', body: 'Restore.' },
+        { path: 'src/auth.ts', line: 4, severity: 'warning', title: 'Deletion only', body: 'Check.' },
+      ] });
+    } };
+    const result = await reviewPullRequest({ db, llm, retrieve: async () => [], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    const payload = JSON.parse(requests[0]!.messages[0]!.content) as { files: Array<{ path: string; allowedFindingLines: number[] }> };
+    expect(payload.files.map((file) => [file.path, file.allowedFindingLines])).toEqual([
+      ['src/app.ts', [2]],
+      ['src/gone.ts', [10, 11]],
+      ['src/auth.ts', [4, 5, 6]],
+    ]);
+    expect(result.findings.map((finding) => [finding.path, finding.line])).toEqual([
+      ['src/gone.ts', 0], ['src/app.ts', 2], ['src/auth.ts', 0],
+    ]);
+  });
+
   it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => { throw new Error('must not call'); } };
     const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(150000)));
@@ -453,7 +483,7 @@ describe('reviewPullRequest', () => {
     const expected = parseUnifiedDiff(DIFF)
       .filter((file) => file.newPath === 'src/app.ts' || file.oldPath === 'src/gone.ts')
       .map((file) => ({ path: file.newPath ?? file.oldPath!, status: file.status, diff: hunkText(file, Infinity) }));
-    expect(payload.files).toEqual(expected);
+    expect(payload.files.map(({ path, status, diff }) => ({ path, status, diff }))).toEqual(expected);
     expect(reviewCostUpperBound(calls[0]!) * 2).toBeLessThanOrEqual(REVIEW_MAX_USD);
   });
 
