@@ -92,9 +92,9 @@ function secretEquals(a: string, b: string): boolean {
   return timingSafeEqual(x, y);
 }
 
-export function checkoutFor(deps: Pick<AppDeps, 'config'>, repo: { id: string; remote: string }): RepoCheckout {
+export function checkoutFor(deps: Pick<AppDeps, 'config' | 'github'>, repo: { id: string; remote: string }): RepoCheckout {
   const dir = join(deps.config.dataDir, 'repos', repo.id.replace(/[^a-zA-Z0-9._-]/g, '_'));
-  return new RepoCheckout({ dir, url: repo.remote, token: deps.config.github.token || undefined });
+  return new RepoCheckout({ dir, url: repo.remote, token: repo.id.startsWith('github:') ? () => deps.github.getToken() : undefined });
 }
 
 /**

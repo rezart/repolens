@@ -29,3 +29,12 @@ describe('loadConfig', () => {
     expect(c.chatProvider).toBe('openrouter');
   });
 });
+
+it('requires a complete GitHub App configuration and preserves PAT-only setups', () => {
+  const base = { LLM_PROVIDER: 'claude-cli', GITHUB_TOKEN: 'pat' };
+  expect(loadConfig(base).github.app).toBeUndefined();
+  expect(() => loadConfig({ ...base, GITHUB_APP_ID: '123' })).toThrow(/GITHUB_APP/);
+  expect(() => loadConfig({ ...base, GITHUB_APP_ID: '123', GITHUB_APP_INSTALLATION_ID: '../bad', GITHUB_APP_PRIVATE_KEY_PATH: '/key.pem' })).toThrow(/GITHUB_APP_INSTALLATION_ID/);
+  expect(loadConfig({ ...base, GITHUB_APP_ID: '123', GITHUB_APP_INSTALLATION_ID: '456', GITHUB_APP_PRIVATE_KEY_PATH: '/key.pem' }).github.app)
+    .toEqual({ appId: '123', installationId: '456', privateKeyPath: '/key.pem' });
+});
