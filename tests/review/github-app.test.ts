@@ -60,6 +60,16 @@ describe('GitHub App authentication', () => {
     await gh.getPull('o', 'r', 1);
     expect(headers).toEqual(['Bearer rotated-1', 'Bearer rotated-2']);
   });
+
+  it('omits authorization when the token provider returns whitespace', async () => {
+    let authorization: string | null = 'unset';
+    const gh = new GitHubClient({ token: async () => '   ', fetch: async (_url, init) => {
+      authorization = new Headers(init?.headers).get('Authorization');
+      return Response.json({ number: 1 });
+    } });
+    await gh.getPull('o', 'r', 1);
+    expect(authorization).toBeNull();
+  });
 });
 
 it('rejects an expired installation token', async () => {

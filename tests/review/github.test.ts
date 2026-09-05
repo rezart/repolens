@@ -86,6 +86,13 @@ describe('GitHubClient.getPull', () => {
     await gh.getPull('o', 'r', 42);
     expect(f.calls[0]!.url).toBe('https://ghe.corp/api/v3/repos/o/r/pulls/42');
   });
+
+  it('omits authorization when no token is configured', async () => {
+    const f = fakeFetch([jsonResponse(PULL_PAYLOAD)]);
+    const gh = new GitHubClient({ token: '   ', fetch: f.fetch });
+    await gh.getPull('o', 'r', 42);
+    expect(f.calls[0]!.headers).not.toHaveProperty('Authorization');
+  });
 });
 
 describe('GitHubClient.getPullDiff', () => {

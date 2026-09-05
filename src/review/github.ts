@@ -99,17 +99,19 @@ export class GitHubClient {
   }
 
   async getToken(): Promise<string> {
-    return typeof this.token === 'function' ? this.token() : this.token;
+    const token = typeof this.token === 'function' ? await this.token() : this.token;
+    return token.trim();
   }
 
   private async request(path: string, opts: RequestOptions = {}): Promise<RawResponse> {
     const method = opts.method ?? 'GET';
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${await this.getToken()}`,
       Accept: opts.accept ?? 'application/vnd.github+json',
       'X-GitHub-Api-Version': API_VERSION,
       'User-Agent': USER_AGENT,
     };
+    const token = await this.getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
     const init: RequestInit = { method, headers };
     if (opts.body !== undefined) {
       headers['Content-Type'] = 'application/json';
