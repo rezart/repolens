@@ -11,6 +11,7 @@ import type {
 import { FILE_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
+import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
 import {
   reviewPullRequest,
@@ -312,6 +313,91 @@ describe('reviewPullRequest', () => {
     await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
     expect(gh.reviews).toHaveLength(0);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
+
+  it.each(['not JSON', JSON.stringify({ findings: [], summary: 'Fine', verdict: 'approve', reviewedPaths: [] })])('retries invalid batch responses and publishes only the valid fourth attempt: %s', async (invalid) => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => {
+      calls++;
+      return calls < 4 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts'] });
+    } };
+    const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+    expect(calls).toBe(4);
+    expect(result.posted).toBe(true);
+    expect(result.summary).toBe('Reviewed all changes.');
+    expect(gh.reviews).toHaveLength(1);
+  });
+
+  it.each([undefined, 0, 1])('stops invalid response retries at the configured limit %s', async (maxRetries) => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => { calls++; return '{}'; } };
+    await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
+    expect(calls).toBe((maxRetries ?? 3) + 1);
+    expect(gh.reviews).toHaveLength(0);
+    expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
+
+  it('stops retries when the next attempt would exceed the total review budget', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300000)));
+    let reserved = 0;
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async (req: CompleteRequest) => {
+      calls++;
+      reserved += reviewCostUpperBound(req);
+      return '{}';
+    } };
+    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
+    expect(calls).toBe(1);
+    expect(reserved).toBeLessThanOrEqual(REVIEW_MAX_USD);
+    expect(gh.reviews).toHaveLength(0);
+  });
+
+  it('retries truncated provider output and counts the cost of both attempts', async () => {
+    const gh = fakeGithub();
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const llm = new OpenRouterProvider({
+      apiKey: 'fake', model: 'qwen/qwen3-coder', onUsage: tracker.sinkFor('review'),
+      fetch: async () => {
+        calls++;
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts'] }) }, finish_reason: calls === 1 ? 'length' : 'stop' }],
+          usage: { prompt_tokens: 100, completion_tokens: 100, cost: 0.01 },
+        }), { status: 200 });
+      },
+    });
+    const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+    expect(calls).toBe(2);
+    expect(result.posted).toBe(true);
+    expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(0.02);
+    expect(gh.reviews).toHaveLength(1);
+  });
+
+  it('does not retry provider authentication failures', async () => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder', fetch: async () => {
+      calls++;
+      return new Response('unauthorized', { status: 401 });
+    } });
+    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('401');
+    expect(calls).toBe(1);
+    expect(gh.reviews).toHaveLength(0);
+  });
+
+  it('abandons retries if the PR changes after an invalid response', async () => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', complete: async () => {
+      calls++;
+      gh.github.getPull = async () => ({ ...PR, headSha: 'moved' });
+      return '{}';
+    } };
+    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toBeInstanceOf(ReviewSupersededError);
+    expect(calls).toBe(1);
+    expect(gh.reviews).toHaveLength(0);
   });
 
   it('abandons the review without posting when the PR head moves mid-review', async () => {

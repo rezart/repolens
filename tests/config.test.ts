@@ -8,6 +8,13 @@ describe('loadConfig', () => {
     expect(c.port).toBe(3000);
     expect(c.embedding).toBeNull();
   });
+  it('defaults to three response retries and validates overrides', () => {
+    expect(loadConfig({ LLM_PROVIDER: 'claude-cli' }).review.maxRetries).toBe(3);
+    expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: '0' }).review.maxRetries).toBe(0);
+    for (const value of ['-1', '1.5', 'invalid']) {
+      expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: value })).toThrow(ConfigError);
+    }
+  });
   it('requires an OpenRouter key for the openrouter provider', () => {
     expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'x' })).toThrow(ConfigError);
   });
