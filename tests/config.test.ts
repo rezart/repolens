@@ -8,6 +8,10 @@ describe('loadConfig', () => {
     expect(c.port).toBe(3000);
     expect(c.embedding).toBeNull();
     expect(c.hostname).toBe('127.0.0.1');
+    expect(c.revision).toBeNull();
+  });
+  it('trims the running image revision', () => {
+    expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');
   });
   it('allows an explicit bind hostname for containers', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_HOST: '0.0.0.0' }).hostname).toBe('0.0.0.0');
