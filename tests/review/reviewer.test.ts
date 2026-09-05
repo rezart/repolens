@@ -117,11 +117,19 @@ describe('review context selection', () => {
     expect(selectRelevantChunks(chunks, [], 'src/app.ts')).toEqual([]);
   });
 
+  it('reserves only a test chunk that matches the changed symbol or stem', () => {
+    const chunks: RetrievedChunk[] = [
+      { ...CHUNK, chunkId: 1, path: 'tests/unrelated.test.ts', content: 'otherThing()' },
+      { ...CHUNK, chunkId: 2, path: 'tests/helper.test.ts', content: 'helper()' },
+    ];
+    expect(selectRelevantChunks(chunks, ['helper'], 'src/app.ts').map((chunk) => chunk.chunkId)).toEqual([2]);
+  });
+
   it('finds only root and applicable nested repository rule files', () => {
     expect(repositoryRulePaths(['src/review/app.ts', 'tests/review/app.test.ts'])).toEqual([
+      'AGENTS.md', 'CLAUDE.md',
       'src/review/AGENTS.md', 'src/review/CLAUDE.md', 'src/AGENTS.md', 'src/CLAUDE.md',
       'tests/review/AGENTS.md', 'tests/review/CLAUDE.md', 'tests/AGENTS.md', 'tests/CLAUDE.md',
-      'AGENTS.md', 'CLAUDE.md',
     ]);
   });
 
@@ -132,9 +140,8 @@ describe('review context selection', () => {
 
   it('prioritizes the closest deep rule before ancestor candidates', () => {
     const paths = repositoryRulePaths(['a/b/c/d/e/f/g/h/file.ts']);
-    expect(paths.slice(0, 4)).toEqual(['a/b/c/d/e/f/g/h/AGENTS.md', 'a/b/c/d/e/f/g/h/CLAUDE.md', 'a/b/c/d/e/f/g/AGENTS.md', 'a/b/c/d/e/f/g/CLAUDE.md']);
-    expect(paths.at(-2)).toBe('AGENTS.md');
-    expect(paths.at(-1)).toBe('CLAUDE.md');
+    expect(paths.slice(0, 2)).toEqual(['AGENTS.md', 'CLAUDE.md']);
+    expect(paths.slice(2, 6)).toEqual(['a/b/c/d/e/f/g/h/AGENTS.md', 'a/b/c/d/e/f/g/h/CLAUDE.md', 'a/b/c/d/e/f/g/AGENTS.md', 'a/b/c/d/e/f/g/CLAUDE.md']);
   });
 });
 

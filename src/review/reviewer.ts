@@ -229,9 +229,9 @@ async function retrieveTargetedChunks(
   for (const query of queries) {
     chunks.push(...await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true }));
   }
-  const symbols = [...changedSymbols, targeted.stem, 'test'];
-  const selected = selectRelevantChunks(chunks, symbols, path);
-  const testChunk = chunks.find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
+  const relevant = selectRelevantChunks(chunks, [...changedSymbols, targeted.stem], path);
+  const selected = [...relevant];
+  const testChunk = relevant.find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
   if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
     selected.pop();
     selected.push(testChunk);
@@ -244,6 +244,7 @@ export function repositoryRulePaths(changedPaths: string[]): string[] {
   const paths: string[] = [];
   const seen = new Set<string>();
   const add = (path: string) => { if (!seen.has(path)) { seen.add(path); paths.push(path); } };
+  add('AGENTS.md'); add('CLAUDE.md');
   for (const path of changedPaths) {
     const parts = path.split('/');
     for (let i = parts.length - 1; i >= 1; i--) {
@@ -251,7 +252,6 @@ export function repositoryRulePaths(changedPaths: string[]): string[] {
       add(`${dir}/AGENTS.md`); add(`${dir}/CLAUDE.md`);
     }
   }
-  add('AGENTS.md'); add('CLAUDE.md');
   return paths;
 }
 
