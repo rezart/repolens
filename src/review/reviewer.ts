@@ -395,6 +395,7 @@ function parseFindings(raw: string, file: DiffFile): Finding[] {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('model output contains a malformed finding');
     const e = entry as Record<string, unknown>;
     const line = typeof e.line === 'number' ? e.line : typeof e.line === 'string' ? Number(e.line) : NaN;
+    // allowed already contains old diff lines for deleted/deletion-only files.
     if (!Number.isInteger(line) || !allowed.has(line)) {
       throw new Error(`model output contains an invalid finding line for ${path}`);
     }
