@@ -11,7 +11,15 @@ function dashboard(withSanitizer = true) {
   dom.window.eval(readFileSync(new URL('../../node_modules/marked/lib/marked.umd.js', import.meta.url), 'utf8'));
   if (withSanitizer) dom.window.eval(readFileSync(new URL('../../node_modules/dompurify/dist/purify.js', import.meta.url), 'utf8'));
   // Load the real renderer without starting network requests or mounting the dashboard.
-  dom.window.eval(app.slice(0, app.lastIndexOf("if (document.readyState === 'loading')")) + '\nwindow.markdown = markdown;');
+  dom.window.eval(app.slice(0, app.lastIndexOf("if (document.readyState === 'loading')")) + `
+    window.markdown = markdown;
+    window.renderHealthForTest = (health) => {
+      state.health = health;
+      dom.health = document.getElementById('health');
+      dom.version = document.getElementById('version');
+      renderHealth();
+    };
+  `);
   return dom;
 }
 
@@ -66,6 +74,25 @@ describe('dashboard Markdown security', () => {
       const node = dom.window.markdown(payload);
       expect(node.querySelector('img')).toBeNull();
       expect(node.textContent).toBe(payload);
+    } finally {
+      dom.window.close();
+    }
+  });
+});
+
+describe('dashboard version', () => {
+  it('shows the running revision as the version tooltip', () => {
+    const dom = dashboard();
+    try {
+      dom.window.document.body.innerHTML = '<div id="health"></div><span id="version"></span>';
+      const health = { ok: true, version: '0.1.0', revision: 'abc123', llm: {}, chat: {} };
+      dom.window.renderHealthForTest(health);
+      const version = dom.window.document.getElementById('version');
+      expect(version?.textContent).toBe('v0.1.0');
+      expect(version?.getAttribute('title')).toBe('abc123');
+
+      dom.window.renderHealthForTest({ ...health, revision: null });
+      expect(version?.hasAttribute('title')).toBe(false);
     } finally {
       dom.window.close();
     }

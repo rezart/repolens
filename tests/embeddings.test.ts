@@ -48,6 +48,7 @@ function baseConfig(overrides: Partial<Config> = {}): Config {
     review: { statusContext: 'repolens/review', failOn: 'critical', settleSeconds: 0, maxRetries: 3 },
     port: 3000,
     publicUrl: '',
+    revision: null,
     llm: {
       provider: 'openrouter',
       model: 'anthropic/claude-sonnet-4.5',

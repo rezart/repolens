@@ -6,6 +6,7 @@ const envSchema = z.object({
   REPOLENS_PORT: z.coerce.number().int().positive().default(3000),
   REPOLENS_HOST: z.string().min(1).default('127.0.0.1'),
   REPOLENS_PUBLIC_URL: z.string().default(''),
+  REPOLENS_REVISION: z.string().trim().default(''),
 
   LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli']).default('openrouter'),
   LLM_MODEL: z.string().default(''),
@@ -54,6 +55,7 @@ export interface Config {
   port: number;
   hostname?: string;
   publicUrl: string;
+  revision: string | null;
   llm: {
     provider: LLMProviderName;
     model: string;
@@ -111,6 +113,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     port: e.REPOLENS_PORT,
     hostname: e.REPOLENS_HOST,
     publicUrl: e.REPOLENS_PUBLIC_URL,
+    revision: e.REPOLENS_REVISION || null,
     llm: {
       provider: e.LLM_PROVIDER,
       model: e.LLM_MODEL,

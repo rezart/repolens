@@ -263,6 +263,7 @@ export function createApp(deps: AppDeps): Hono {
     c.json({
       ok: true,
       version: VERSION,
+      revision: config.revision,
       llm: { provider: deps.llm.name, model: deps.llm.model, effort: config.llm.reasoningEffort || null },
       chat: { provider: deps.chatLlm.name, model: deps.chatLlm.model },
       embeddings: deps.embeddings?.model ?? null,
