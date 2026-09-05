@@ -633,6 +633,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       reviewable.push(f);
     }
 
+    const budgeted = llm.name === 'openrouter' && llm.model === 'qwen/qwen3-coder';
+    // Check the unsliced list: `files` below can never exceed maxFiles.
+    if (budgeted && reviewable.length > maxFiles) {
+      throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
+    }
     const files = reviewable.slice(0, maxFiles);
     for (const extra of reviewable.slice(maxFiles)) skippedFiles.push(extra.newPath!);
 
@@ -682,10 +687,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       if (sha && sha !== pr.headSha) throw new ReviewSupersededError(pr.headSha, sha);
     };
 
-    const budgeted = llm.name === 'openrouter' && llm.model === 'qwen/qwen3-coder';
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
-      if (reviewable.length > files.length) throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
       const req: CompleteRequest = {
         system: BATCH_REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
@@ -699,6 +702,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }) }],
         json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true,
       };
+      // Reject the core prompt before the retrieval loop or any inference call.
       if (reviewCostUpperBound(req) > REVIEW_MAX_USD) {
         throw new Error('Review exceeds the $0.05 budget; split this pull request into smaller reviews.');
       }
@@ -732,6 +736,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.05; all file diffs included.`);
       await assertHeadUnchanged();
+      // Parsing failures reach reviewPullRequest's outer catch (error status),
+      // then JobQueue records a failed job. Never turn invalid JSON into approval.
       const obj = extractJson(await llm.complete(req)) as Record<string, unknown>;
       if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
           !toVerdict(obj.verdict) || !Array.isArray(obj.reviewedPaths) ||
