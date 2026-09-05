@@ -93,7 +93,7 @@ export class GitHubClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: GitHubClientOptions) {
-    this.token = opts.token;
+    this.token = opts.token.trim();
     this.baseUrl = (opts.baseUrl ?? 'https://api.github.com').replace(/\/+$/, '');
     this.fetchImpl = opts.fetch ?? fetch;
   }
