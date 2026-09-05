@@ -784,12 +784,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
             throw new IncompleteResponseError(llm.name, 'Incomplete review response; no review was published.');
           }
-          batch = {
-            findings: files.flatMap((file) => parseFindings(JSON.stringify({
+          let findings: Finding[];
+          try {
+            findings = files.flatMap((file) => parseFindings(JSON.stringify({
               findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-            }), file, changedNewLines(file))),
-            summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)!,
-          };
+            }), file, changedNewLines(file)));
+          } catch (err) {
+            throw new IncompleteResponseError(llm.name, errMessage(err));
+          }
+          batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
           break;
         } catch (err) {
           if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError) || attempt >= maxRetries) throw err;
