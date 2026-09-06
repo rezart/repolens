@@ -217,6 +217,14 @@ create table if not exists llm_usage (
   cost_usd real
 );
 create index if not exists llm_usage_ts on llm_usage(ts);
+create table if not exists embedding_cache (
+  model text not null,
+  input_hash text not null,
+  dimension integer not null,
+  embedding blob not null,
+  created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  primary key (model, input_hash)
+);
 `;
 
 export class Db {
@@ -394,7 +402,46 @@ export class Db {
     if (!this.vecDim) throw new Error('ensureVecTable() must be called before insertVectors()');
     const stmt = this.raw.prepare(`insert or replace into chunk_vec (chunk_id, repo_id, embedding) values (?, ?, ?)`);
     const tx = this.raw.transaction((items: typeof rows) => {
-      for (const r of items) stmt.run(BigInt(r.chunkId), r.repoId, new Float32Array(r.embedding));
+      for (const r of items) {
+        if (!isDenseFiniteVector(r.embedding)) throw new Error('Cannot insert an invalid embedding');
+        stmt.run(BigInt(r.chunkId), r.repoId, new Float32Array(r.embedding));
+      }
+    });
+    tx(rows);
+  }
+
+  getEmbeddingCache(model: string, inputHashes: string[]): Map<string, { dimension: number; embedding: number[] }> {
+    if (inputHashes.length === 0) return new Map();
+    const placeholders = inputHashes.map(() => '?').join(',');
+    const rows = this.raw
+      .prepare(`select input_hash, dimension, embedding from embedding_cache where model=? and input_hash in (${placeholders})`)
+      .all(model, ...inputHashes) as Array<{ input_hash: string; dimension: number; embedding: Buffer }>;
+    const result = new Map<string, { dimension: number; embedding: number[] }>();
+    for (const row of rows) {
+      if (!Number.isInteger(row.dimension) || row.dimension <= 0 || !Buffer.isBuffer(row.embedding)) continue;
+      if (row.embedding.byteLength !== row.dimension * Float32Array.BYTES_PER_ELEMENT) continue;
+      const view = new DataView(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength);
+      const embedding = Array.from({ length: row.dimension }, (_, i) => view.getFloat32(i * Float32Array.BYTES_PER_ELEMENT, true));
+      if (!isDenseFiniteVector(embedding)) continue;
+      result.set(row.input_hash, { dimension: row.dimension, embedding });
+    }
+    return result;
+  }
+
+  insertEmbeddingCache(model: string, rows: Array<{ inputHash: string; embedding: number[] }>) {
+    if (rows.length === 0) return;
+    const stmt = this.raw.prepare(
+      `insert or replace into embedding_cache (model, input_hash, dimension, embedding) values (?, ?, ?, ?)`,
+    );
+    const tx = this.raw.transaction((items: typeof rows) => {
+      for (const row of items) {
+        if (!isDenseFiniteVector(row.embedding)) {
+          throw new Error('Cannot cache an invalid embedding');
+        }
+        const vector = new Float32Array(row.embedding);
+        if (!isDenseFiniteVector(vector)) throw new Error('Cannot cache an invalid embedding');
+        stmt.run(model, row.inputHash, vector.length, Buffer.from(vector.buffer));
+      }
     });
     tx(rows);
   }
@@ -550,6 +597,10 @@ export class Db {
       .prepare(`select * from jobs where kind='review' and repo_id=? order by id desc limit ?`)
       .all(repoId, limit) as JobRow[];
   }
+}
+
+function isDenseFiniteVector(vector: ArrayLike<number>): boolean {
+  return vector.length > 0 && Array.from(vector).every((n) => typeof n === 'number' && Number.isFinite(n));
 }
 
 /**
