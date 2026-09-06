@@ -9,6 +9,7 @@ describe('loadConfig', () => {
     expect(c.embedding).toBeNull();
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
+    expect(c.review.escalationModel).toBe('moonshotai/kimi-k2.7-code');
   });
   it('trims the running image revision', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');
@@ -34,6 +35,12 @@ describe('loadConfig', () => {
   });
   it('requires an OpenRouter key for the openrouter provider', () => {
     expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'x' })).toThrow(ConfigError);
+  });
+  it('accepts an explicit review escalation model', () => {
+    const c = loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: ' strong/model ' });
+    expect(c.review.escalationModel).toBe('strong/model');
+    expect(loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: '' }).review.escalationModel).toBe('');
+    expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: 'bad model' })).toThrow(ConfigError);
   });
   it('enables embeddings when a model is set', () => {
     const c = loadConfig({ LLM_PROVIDER: 'claude-cli', EMBEDDING_MODEL: 'm', EMBEDDING_API_KEY: 'k' });

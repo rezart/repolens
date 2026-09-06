@@ -12,7 +12,8 @@ export interface ReviewCandidate {
 }
 
 const SIGNALS: Array<[string, RegExp, number]> = [
-  ['security', /\b(auth|authoriz|permission|token|secret|password|credential|crypto|encrypt|decrypt|sql|xss|csrf|eval|exec)\b/i, 4],
+  // ponytail: lexical security routing is bounded; replace with syntax-aware analysis if false negatives become measurable.
+  ['security', /\b(auth|authenticat\w*|authoriz\w*|permissions?|sessions?|token|secret|password|credential|crypto|encrypt|decrypt|sql|xss|csrf|eval|exec)\b/i, 4],
   ['control-flow', /\b(if|else|for|while|switch|case|return|throw|catch|finally|await|async|yield)\b|&&|\|\||\?\?/i, 2],
   ['contracts', /\b(export|public|private|protected|interface|type|schema|route|endpoint|api)\b/i, 3],
   ['dependencies', /(^|\s)(import|export)\b|\b(require|package|dependency|dependencies)\b/i, 2],
@@ -31,7 +32,7 @@ function isProvablyNoOp(hunk: Hunk): boolean {
 }
 
 export function assessChange(file: DiffFile): ChangeRisk {
-  const text = file.hunks.flatMap(changedLines).join('\n');
+  const text = `${file.newPath ?? file.oldPath ?? ''}\n${file.hunks.flatMap(changedLines).join('\n')}`;
   let score = 0;
   const signals: string[] = [];
   for (const [name, pattern, weight] of SIGNALS) {

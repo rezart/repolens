@@ -2,7 +2,7 @@ import { IncompleteResponseError, NetworkProviderError, ProviderError } from './
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE } from '../review/budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE, REVIEW_ESCALATION_INPUT_PRICE, REVIEW_ESCALATION_OUTPUT_PRICE } from '../review/budget.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -127,7 +127,11 @@ export class OpenRouterProvider implements LLMProvider {
       }
       body.provider = {
         sort: 'price', require_parameters: true, allow_fallbacks: false,
-        max_price: { prompt: REVIEW_INPUT_PRICE, completion: REVIEW_OUTPUT_PRICE, request: 0 },
+        max_price: {
+          prompt: req.reviewStage === 'escalation' ? REVIEW_ESCALATION_INPUT_PRICE : REVIEW_INPUT_PRICE,
+          completion: req.reviewStage === 'escalation' ? REVIEW_ESCALATION_OUTPUT_PRICE : REVIEW_OUTPUT_PRICE,
+          request: 0,
+        },
       };
       delete body.reasoning;
     }

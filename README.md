@@ -194,6 +194,7 @@ See `.env.example` for every variable. The important ones:
 | `LLM_PROVIDER` | `openrouter` | `openrouter`, `claude-cli`; `codex-cli` is temporarily disabled |
 | `LLM_MODEL` | | Model id (OpenRouter) or model name (CLIs, optional) |
 | `REVIEW_FALLBACK_MODELS` | blank | Ordered, comma-separated OpenRouter review alternatives; shares the retry limit and total budget |
+| `REVIEW_ESCALATION_MODEL` | `moonshotai/kimi-k2.7-code` | OpenRouter model for security/high-risk hunk rechecks; blank disables escalation. Initial, escalation, verification, and retries share the $0.25 review cap |
 | `LLM_TIMEOUT_MS` | `300000` | Per-completion timeout |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | OpenRouter / empty / empty | OpenAI-compatible embeddings. Blank model = lexical only |
 | `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews (PAT fallback) |

@@ -59,4 +59,23 @@ describe('review candidate selection', () => {
     expect(result.signals).toContain('execution');
     expect(selectReviewCandidates(file).file.hunks).toHaveLength(1);
   });
+
+  it('treats security-sensitive paths and common auth terms as security risk', () => {
+    const pathRisk = one(`diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1 +1 @@
+-oldValue();
++newValue();
+`);
+    const termRisk = one(`diff --git a/src/app.ts b/src/app.ts
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1 +1 @@
+-oldValue();
++authenticateSession(permissions);
+`);
+    expect(assessChange(pathRisk).signals).toContain('security');
+    expect(assessChange(termRisk).signals).toContain('security');
+  });
 });
