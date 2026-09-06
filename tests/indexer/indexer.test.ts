@@ -21,13 +21,15 @@ async function commitAll(cwd: string, message: string) {
   await git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', message], cwd);
 }
 
-function fakeEmbeddings(): EmbeddingProvider & { calls: number } {
+function fakeEmbeddings(model = 'fake'): EmbeddingProvider & { calls: number; inputs: string[][] } {
   return {
-    model: 'fake',
+    model,
     dimension: 4,
     calls: 0,
+    inputs: [],
     async embed(texts: string[]) {
       this.calls++;
+      this.inputs.push(texts);
       return texts.map((t) => [t.length % 7, 1, 0, 0]);
     },
   };
@@ -89,6 +91,50 @@ describe('indexRepo', () => {
     expect(second.files).toBe(0);
     expect(second.removed).toBe(0);
     expect(db.countChunks(REPO_ID)).toBe(first.chunks);
+  });
+
+  it('reuses embeddings across different repository ids', async () => {
+    const embeddings = fakeEmbeddings();
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings });
+
+    const otherRepo = 'github:other/n';
+    db.upsertRepo({ id: otherRepo, remote: 'https://github.com/other/n', owner: 'other', name: 'n', branch: 'main' });
+    await indexRepo({ db, checkout, repoId: otherRepo, embeddings });
+
+    expect(embeddings.calls).toBe(1);
+    expect(embeddings.inputs).toHaveLength(1);
+    expect(db.chunkIdsWithoutVectors(otherRepo)).toEqual([]);
+    expect(db.vecSearch([otherRepo], [1, 1, 0, 0], 1)).toHaveLength(1);
+  });
+
+  it('does not reuse embeddings from a different model', async () => {
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings: fakeEmbeddings('model-a') });
+
+    const otherRepo = 'github:other/n';
+    db.upsertRepo({ id: otherRepo, remote: 'https://github.com/other/n', owner: 'other', name: 'n', branch: 'main' });
+    const modelB = fakeEmbeddings('model-b');
+    await indexRepo({ db, checkout, repoId: otherRepo, embeddings: modelB });
+
+    expect(modelB.calls).toBe(1);
+    expect(modelB.inputs[0]).toHaveLength(db.countChunks(otherRepo));
+  });
+
+  it('sends only cache misses while preserving vectors for mixed hit and miss batches', async () => {
+    const first = fakeEmbeddings();
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings: first });
+
+    writeFileSync(join(repoDir, 'c.ts'), 'export function gamma() { return 3; }\n');
+    await commitAll(repoDir, 'two');
+
+    const otherRepo = 'github:other/n';
+    db.upsertRepo({ id: otherRepo, remote: 'https://github.com/other/n', owner: 'other', name: 'n', branch: 'main' });
+    const second = fakeEmbeddings();
+    await indexRepo({ db, checkout, repoId: otherRepo, embeddings: second });
+
+    expect(second.calls).toBe(1);
+    expect(second.inputs[0]).toEqual(['c.ts\nexport function gamma() { return 3; }\n']);
+    expect(db.chunkIdsWithoutVectors(otherRepo)).toEqual([]);
+    expect(db.vecSearch([otherRepo], [1, 1, 0, 0], 3)).toHaveLength(3);
   });
 
   it('re-chunks only the modified file', async () => {

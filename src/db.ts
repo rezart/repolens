@@ -217,6 +217,14 @@ create table if not exists llm_usage (
   cost_usd real
 );
 create index if not exists llm_usage_ts on llm_usage(ts);
+create table if not exists embedding_cache (
+  model text not null,
+  input_hash text not null,
+  dimension integer not null,
+  embedding text not null,
+  created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  primary key (model, input_hash)
+);
 `;
 
 export class Db {
@@ -395,6 +403,41 @@ export class Db {
     const stmt = this.raw.prepare(`insert or replace into chunk_vec (chunk_id, repo_id, embedding) values (?, ?, ?)`);
     const tx = this.raw.transaction((items: typeof rows) => {
       for (const r of items) stmt.run(BigInt(r.chunkId), r.repoId, new Float32Array(r.embedding));
+    });
+    tx(rows);
+  }
+
+  getEmbeddingCache(model: string, inputHashes: string[]): Map<string, { dimension: number; embedding: number[] }> {
+    if (inputHashes.length === 0) return new Map();
+    const placeholders = inputHashes.map(() => '?').join(',');
+    const rows = this.raw
+      .prepare(`select input_hash, dimension, embedding from embedding_cache where model=? and input_hash in (${placeholders})`)
+      .all(model, ...inputHashes) as Array<{ input_hash: string; dimension: number; embedding: string }>;
+    const result = new Map<string, { dimension: number; embedding: number[] }>();
+    for (const row of rows) {
+      try {
+        const embedding = JSON.parse(row.embedding);
+        if (!Array.isArray(embedding) || embedding.length !== row.dimension || !embedding.every((n) => typeof n === 'number' && Number.isFinite(n))) continue;
+        result.set(row.input_hash, { dimension: row.dimension, embedding });
+      } catch {
+        // Ignore a malformed cache entry and let the provider regenerate it.
+      }
+    }
+    return result;
+  }
+
+  insertEmbeddingCache(model: string, rows: Array<{ inputHash: string; embedding: number[] }>) {
+    if (rows.length === 0) return;
+    const stmt = this.raw.prepare(
+      `insert or replace into embedding_cache (model, input_hash, dimension, embedding) values (?, ?, ?, ?)`,
+    );
+    const tx = this.raw.transaction((items: typeof rows) => {
+      for (const row of items) {
+        if (row.embedding.length === 0 || !row.embedding.every((n) => Number.isFinite(n))) {
+          throw new Error('Cannot cache an invalid embedding');
+        }
+        stmt.run(model, row.inputHash, row.embedding.length, JSON.stringify(row.embedding));
+      }
     });
     tx(rows);
   }

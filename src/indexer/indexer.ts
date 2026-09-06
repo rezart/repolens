@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Db } from '../db.js';
 import type { EmbeddingProvider } from '../embeddings/types.js';
 import type { RepoCheckout } from './git.js';
@@ -159,16 +160,58 @@ async function embedPending(
   }
   if (work.length === 0) return;
 
-  for (let i = 0; i < work.length; i += EMBED_BATCH) {
-    const batch = work.slice(i, i + EMBED_BATCH);
+  const expectedDim = embeddings.dimension ?? db.vectorDimension;
+  const hashes = work.map((b) => embeddingInputHash(b.text));
+  const cached = db.getEmbeddingCache(embeddings.model, hashes);
+  const resolved = new Array<number[] | undefined>(work.length);
+  const missing: number[] = [];
+  for (let i = 0; i < work.length; i++) {
+    const entry = cached.get(hashes[i]);
+    if (entry && entry.dimension === entry.embedding.length && isValidVector(entry.embedding, expectedDim)) {
+      resolved[i] = entry.embedding;
+    } else {
+      missing.push(i);
+    }
+  }
+
+  const cacheRows: Array<{ inputHash: string; embedding: number[] }> = [];
+  let completed = work.length - missing.length;
+  for (let i = 0; i < missing.length; i += EMBED_BATCH) {
+    const indexes = missing.slice(i, i + EMBED_BATCH);
+    const batch = indexes.map((index) => work[index]);
     const vectors = await embeddings.embed(batch.map((b) => b.text));
     if (vectors.length !== batch.length) {
       throw new Error(`Embedding provider returned ${vectors.length} vectors for ${batch.length} inputs`);
     }
     const dim = vectors[0]?.length ?? 0;
     if (!dim) throw new Error('Embedding provider returned empty vectors');
-    db.ensureVecTable(dim);
-    db.insertVectors(batch.map((b, j) => ({ chunkId: b.chunkId, repoId, embedding: vectors[j] })));
-    progress(`Embedded ${Math.min(i + batch.length, work.length)}/${work.length} chunks`);
+    for (let j = 0; j < vectors.length; j++) {
+      if (!isValidVector(vectors[j], expectedDim) || vectors[j].length !== dim) {
+        throw new Error('Embedding provider returned vectors with inconsistent dimensions');
+      }
+      const index = indexes[j];
+      resolved[index] = vectors[j];
+      cacheRows.push({ inputHash: hashes[index], embedding: vectors[j] });
+    }
+    completed += batch.length;
+    progress(`Embedded ${completed}/${work.length} chunks`);
   }
+
+  const rows = resolved.map((embedding, i) => {
+    if (!embedding) throw new Error(`Missing embedding for chunk ${work[i].chunkId}`);
+    return { chunkId: work[i].chunkId, repoId, embedding };
+  });
+  const dim = rows[0]?.embedding.length ?? 0;
+  if (!dim) throw new Error('Embedding provider returned empty vectors');
+  db.ensureVecTable(dim);
+  db.insertVectors(rows);
+  db.insertEmbeddingCache(embeddings.model, cacheRows);
+}
+
+function embeddingInputHash(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function isValidVector(vector: number[], expectedDim: number | null): boolean {
+  return vector.length > 0 && (expectedDim === null || vector.length === expectedDim) && vector.every((n) => Number.isFinite(n));
 }
