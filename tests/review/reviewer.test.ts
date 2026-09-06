@@ -24,6 +24,9 @@ import {
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
+  selectRelevantChunks,
+  repositoryRulePaths,
+  renderRepositoryRules,
   statusForFindings,
   selectPostedFindings,
   parseFindings,
@@ -96,6 +99,50 @@ describe('fresh finding evidence validation', () => {
     expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
     expect(second.warnings).toContain('Skipped 2 findings already commented');
     ruleDb.close();
+  });
+});
+
+describe('review context selection', () => {
+  it('keeps matching definitions and callers while dropping unrelated chunks', () => {
+    const chunks: RetrievedChunk[] = [
+      { ...CHUNK, chunkId: 1, path: 'src/helper.ts', content: 'export function helper() {}' },
+      { ...CHUNK, chunkId: 2, path: 'tests/helper.test.ts', content: 'expect(helper()).toBe(1)' },
+      { ...CHUNK, chunkId: 3, path: 'src/unrelated.ts', content: 'export function other() {}' },
+    ];
+    expect(selectRelevantChunks(chunks, ['helper'], 'src/app.ts').map((c) => c.chunkId)).toEqual([1, 2]);
+  });
+
+  it('returns no arbitrary context when no exact symbol or path term matches', () => {
+    const chunks: RetrievedChunk[] = [{ ...CHUNK, path: 'src/unrelated.ts', content: 'export function other() {}' }];
+    expect(selectRelevantChunks(chunks, ['missing'], 'src/app.ts')).toEqual([]);
+    expect(selectRelevantChunks(chunks, [], 'src/app.ts')).toEqual([]);
+  });
+
+  it('reserves only a test chunk that matches the changed symbol or stem', () => {
+    const chunks: RetrievedChunk[] = [
+      { ...CHUNK, chunkId: 1, path: 'tests/unrelated.test.ts', content: 'otherThing()' },
+      { ...CHUNK, chunkId: 2, path: 'tests/helper.test.ts', content: 'helper()' },
+    ];
+    expect(selectRelevantChunks(chunks, ['helper'], 'src/app.ts').map((chunk) => chunk.chunkId)).toEqual([2]);
+  });
+
+  it('finds only root and applicable nested repository rule files', () => {
+    expect(repositoryRulePaths(['src/review/app.ts', 'tests/review/app.test.ts'])).toEqual([
+      'AGENTS.md', 'CLAUDE.md',
+      'src/review/AGENTS.md', 'src/review/CLAUDE.md', 'src/AGENTS.md', 'src/CLAUDE.md',
+      'tests/review/AGENTS.md', 'tests/review/CLAUDE.md', 'tests/AGENTS.md', 'tests/CLAUDE.md',
+    ]);
+  });
+
+  it('renders rule sources with their base revision citation', () => {
+    expect(renderRepositoryRules(new Map([['src/AGENTS.md', 'Run focused tests.']]), 'base123'))
+      .toContain('### src/AGENTS.md (base base123)\n1 | Run focused tests.');
+  });
+
+  it('prioritizes the closest deep rule before ancestor candidates', () => {
+    const paths = repositoryRulePaths(['a/b/c/d/e/f/g/h/file.ts']);
+    expect(paths.slice(0, 2)).toEqual(['AGENTS.md', 'CLAUDE.md']);
+    expect(paths.slice(2, 6)).toEqual(['a/b/c/d/e/f/g/h/AGENTS.md', 'a/b/c/d/e/f/g/h/CLAUDE.md', 'a/b/c/d/e/f/g/AGENTS.md', 'a/b/c/d/e/f/g/CLAUDE.md']);
   });
 });
 
@@ -389,11 +436,10 @@ describe('reviewPullRequest', () => {
     expect(calls[0]!.reviewBudget).toBe(true);
     expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(0.045);
     expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
-    expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(2);
+    expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(1);
     expect(result.findings).toHaveLength(2);
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
-    expect(result.warnings.some((w) => w.includes('optional context'))).toBe(true);
   });
 
   it('lists exactly the validator-allowed finding lines for normal, deleted and deletion-only files', async () => {
@@ -896,7 +942,7 @@ describe('reviewPullRequest', () => {
       prNumber: 42,
     });
     expect(llm.fileCalls()).toHaveLength(2);
-    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('src/app.ts');
+    expect(llm.fileCalls().some((call) => call.messages[0]!.content.includes('src/app.ts'))).toBe(true);
     expect(res.skippedFiles.sort()).toEqual(['assets/logo.png', 'package-lock.json']);
   });
 
@@ -1028,9 +1074,9 @@ describe('reviewPullRequest', () => {
     const llm = fakeLlm();
     const gh = fakeGithub();
     await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
-    const msg = llm.fileCalls()[0]!.messages[0]!.content;
+    const msg = llm.fileCalls().find((call) => call.messages[0]!.content.includes('File under review: src/app.ts'))!.messages[0]!.content;
     expect(msg).toContain('Always check for SQL injection.');
-    expect(msg).toContain('src/x.ts:1-3');
+    expect(msg).not.toContain('src/x.ts:1-3');
     expect(msg).toContain('if (n = 0) return;');
     expect(llm.fileCalls()[0]!.json).toBe(true);
     expect(llm.fileCalls()[0]!.maxTokens).toBe(2000);
@@ -1045,14 +1091,38 @@ describe('reviewPullRequest', () => {
       expect(req.excludePaths).toEqual(['src/app.ts', 'package-lock.json', 'assets/logo.png']);
       expect(req.limit).toBe(8);
       expect(req.repoIds).toEqual([REPO_ID]);
+      expect(req.lexicalOnly).toBe(true);
       return [];
     };
     const llm = fakeLlm();
     await reviewPullRequest({ db, llm: llm.provider, retrieve, github: fakeGithub().github }, { repoId: REPO_ID, prNumber: 42 });
-    expect(seen).toHaveLength(2);
-    expect(seen[0]).toContain('src/app.ts');
-    expect(seen[0]).toContain('run');
-    expect(seen[0]).toContain('number');
+    expect(seen).toContain('run');
+    expect(seen.some((query) => query.includes('gone'))).toBe(true);
+    expect(seen).not.toContain('number');
+  });
+
+  it.each([false, true])('includes test context keywords in %s batch mode queries', async (batch) => {
+    const diff = [
+      'diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', '@@ -1 +1 @@', '-old', '+runThing();',
+      'diff --git a/tests/app.test.ts b/tests/app.test.ts', '--- a/tests/app.test.ts', '+++ b/tests/app.test.ts', '@@ -1 +1 @@', '-old', '+runThing();',
+    ].join('\n');
+    const queries: string[] = [];
+    const fake = fakeLlm();
+    const llm: LLMProvider = batch ? { ...fake.provider, supportsBatchReview: true, async complete(req) {
+      if (req.system === BATCH_REVIEW_SYSTEM_PROMPT) return JSON.stringify({ reviewedPaths: ['src/app.ts', 'tests/app.test.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
+      return fake.provider.complete(req);
+    } } : fake.provider;
+    const matchingTest = { ...CHUNK, chunkId: 99, path: 'tests/app.test.ts', content: 'runThing() assertion' };
+    const noisySources = Array.from({ length: 8 }, (_, i) => ({ ...CHUNK, chunkId: 100 + i, path: `src/helper${i}.ts`, content: 'runThing() implementation' }));
+    await reviewPullRequest({ db, llm, retrieve: async (req) => {
+      queries.push(req.query);
+      return req.query.includes('test') ? [...noisySources, matchingTest] : [];
+    }, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(queries.some((query) => query.includes('test'))).toBe(true);
+    if (!batch) {
+      expect(fake.calls.some((call) => call.messages[0]!.content.includes('tests/app.test.ts:1-3'))).toBe(true);
+      expect(fake.calls.every((call) => !call.messages[0]!.content.includes('src/helper0.ts:1-3') || call.messages[0]!.content.includes('tests/app.test.ts:1-3'))).toBe(true);
+    }
   });
 
   it('fails closed on maxFiles overflow for every provider', async () => {
@@ -1300,14 +1370,14 @@ describe('reviewPullRequest PR-head context', () => {
     expect(msg).toContain('### src/b.ts (content after this pull request)');
     expect(msg).toContain('export function helper(n: number) { return n + base; }');
     expect(msg.indexOf(AUTHORITATIVE)).toBeLessThan(msg.indexOf('### src/b.ts (content after this pull request)'));
-    expect(msg.indexOf('### src/b.ts (content after this pull request)')).toBeLessThan(msg.indexOf(INDEXED));
+    expect(msg).not.toContain(INDEXED);
     // The reviewed file's own new content is there too, so the model sees past the hunk.
     expect(msg).toContain('### src/a.ts (content after this pull request)');
 
     // Every changed path is excluded from retrieval, so no stale chunk survives.
     for (const paths of excludes) expect(paths).toEqual(['src/a.ts', 'src/b.ts']);
     expect(msg).not.toContain('STALE b.ts');
-    expect(msg).toContain('export const other = 2;');
+    expect(msg).not.toContain('export const other = 2;');
   });
 
   it('matches an added identifier to the changed file that exports it', async () => {
@@ -1406,7 +1476,7 @@ describe('reviewPullRequest lineage', () => {
     const result = await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 });
 
     expect(gh.compareCalls).toEqual([{ base: 'head-sha-0', head: 'head-sha-1' }]);
-    const file = llm.fileCalls()[0]!.messages[0]!.content as string;
+    const file = llm.fileCalls().find((call) => call.messages[0]!.content.includes('File under review: src/app.ts'))!.messages[0]!.content as string;
     expect(file).toContain('review 1 at head-sh');
     expect(file).toContain('- [critical] src/app.ts:5 — Assignment in condition');
     expect(file).toMatch(/\+\s+if \(n === 0\) return;/);
@@ -1478,9 +1548,10 @@ describe('reviewPullRequest lineage', () => {
       historyPulls: [{ number: 7, title: 'Old fix', body: 'Description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
     });
     await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('[#7 Old fix](https://github.com/o/r/pull/7)');
-    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('[abc1234](https://github.com/o/r/commit/abc1234)');
-    expect(llm.fileCalls()[0]!.messages[0]!.content).toContain('Old issue');
+    const file = llm.fileCalls().find((call) => call.messages[0]!.content.includes('File under review: src/app.ts'))!.messages[0]!.content;
+    expect(file).toContain('[#7 Old fix](https://github.com/o/r/pull/7)');
+    expect(file).toContain('[abc1234](https://github.com/o/r/commit/abc1234)');
+    expect(file).toContain('Old issue');
   });
 
   it('adds deduplicated historical context as optional Qwen batch input', async () => {

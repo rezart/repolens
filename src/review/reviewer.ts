@@ -213,6 +213,85 @@ export function defaultFormatContext(chunks: RetrievedChunk[]): string {
   return chunks.map((c) => `### ${c.path}:${c.startLine}-${c.endLine}\n\`\`\`\n${c.content}\n\`\`\``).join('\n\n');
 }
 
+/** Keep only base-index chunks that can explain the changed identifiers. */
+export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: string[], changedPath: string, limit = 8): RetrievedChunk[] {
+  const terms = [...new Set(identifiers.map((value) => value.toLowerCase()).filter((value) =>
+    value.length >= 2 && !CONTEXT_KEYWORDS.has(value)))];
+  if (!terms.length) return [];
+  const stem = changedPath.slice(changedPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '').toLowerCase();
+  const matches = (text: string, term: string) => new RegExp(`(?:^|[^a-z0-9_$])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^a-z0-9_$])`, 'i').test(text);
+  const scored = chunks.map((chunk, index) => {
+    const haystack = `${chunk.path}\n${chunk.content}`;
+    const score = terms.reduce((total, term) => total + (matches(haystack, term) ? 1 : 0), 0) +
+      (stem && matches(chunk.path, stem) ? 0.25 : 0);
+    return { chunk, score, index };
+  }).filter((item) => item.score > 0);
+  return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map((item) => item.chunk);
+}
+
+function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
+  const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
+  const pathTerms = stem.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
+  const symbols = [...new Set([...identifiers(changedText).slice(0, 3), ...pathTerms])]
+    .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
+  return { stem, symbols };
+}
+
+async function retrieveTargetedChunks(
+  retrieve: RetrieveFn,
+  repoId: string,
+  path: string,
+  changedText: string,
+  identifiers: (text: string) => string[],
+  excludePaths: string[],
+): Promise<RetrievedChunk[]> {
+  const targeted = contextQuery(path, changedText, identifiers);
+  const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 3);
+  const queries = [...changedSymbols];
+  const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
+  if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
+  if (!queries.length) queries.push(targeted.stem || path);
+  const chunksById = new Map<number, RetrievedChunk>();
+  for (const query of queries) {
+    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true })) chunksById.set(chunk.chunkId, chunk);
+  }
+  const relevant = selectRelevantChunks([...chunksById.values()], [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
+  const selected = relevant.slice(0, 8);
+  const testChunk = relevant.find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
+  if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
+    selected.pop();
+    selected.push(testChunk);
+  }
+  return selected.slice(0, 8);
+}
+
+/** Root and ancestor rule files that can apply to the changed paths. */
+export function repositoryRulePaths(changedPaths: string[]): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const add = (path: string) => { if (!seen.has(path)) { seen.add(path); paths.push(path); } };
+  add('AGENTS.md'); add('CLAUDE.md');
+  for (const path of changedPaths) {
+    const parts = path.split('/');
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const dir = parts.slice(0, i).join('/');
+      add(`${dir}/AGENTS.md`); add(`${dir}/CLAUDE.md`);
+    }
+  }
+  return paths;
+}
+
+export function renderRepositoryRules(rules: Map<string, string>, baseSha: string): string {
+  return [...rules].map(([path, content]) => `### ${path} (base ${baseSha.slice(0, 12)})\n${content.split('\n').map((line, i) => `${i + 1} | ${line}`).join('\n')}`).join('\n\n');
+}
+
+const CONTEXT_KEYWORDS = new Set([
+  'abstract', 'async', 'await', 'boolean', 'case', 'catch', 'class', 'const', 'else', 'export', 'extends', 'false',
+  'function', 'if', 'import', 'interface', 'let', 'new', 'null', 'number', 'private', 'protected', 'public', 'return',
+  'string', 'throw', 'true', 'type', 'undefined', 'var', 'void', 'while',
+  'css', 'cts', 'js', 'jsx', 'mjs', 'mts', 'src', 'ts', 'tsx',
+]);
+
 /* ------------------------------------------------------------------ PR head context */
 
 /** How many changed files RepoLens fetches the post-change content of. */
@@ -227,6 +306,9 @@ const HEAD_SNIPPET_CHARS_MAX = 8_000;
 const HEAD_CONTEXT_CHARS_MAX = 24_000;
 /** The reviewed file's own content is included in full only up to this size. */
 const OWN_HEAD_CHARS_MAX = 12_000;
+const RULE_FILES_MAX = 16;
+const RULE_REQUESTS_MAX = 128;
+const RULE_CHARS_MAX = 12_000;
 
 /** Module specifiers of `import`, `import()`, `export ... from` and `require()`. */
 const SPECIFIER_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g;
@@ -903,6 +985,29 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     );
     warnings.push(...historical.warnings);
 
+    // Read applicable policy at the PR base so a head change cannot rewrite the
+    // rules used to judge it. Keep the paths in the prompt as citations.
+    const repositoryRules = new Map<string, string>();
+    let rulesUsed = 0;
+    const rulePaths = repositoryRulePaths(changedPaths);
+    let ruleRequests = 0;
+    for (const rulePath of rulePaths) {
+      if (rulesUsed >= RULE_CHARS_MAX || ruleRequests >= RULE_REQUESTS_MAX || [...repositoryRules].length >= RULE_FILES_MAX) break;
+      ruleRequests++;
+      try {
+        const content = await github.getFileContent(repo.owner, repo.name, rulePath, pr.baseSha);
+        if (!content?.trim()) continue;
+        const room = RULE_CHARS_MAX - rulesUsed;
+        const clipped = content.length > room ? `${content.slice(0, room)}\n... (truncated)` : content;
+        repositoryRules.set(rulePath, clipped);
+        rulesUsed += clipped.length;
+      } catch (err) {
+        warnings.push(`rules: reading ${rulePath} at base failed: ${errMessage(err)}`);
+      }
+    }
+    if (ruleRequests < rulePaths.length && ruleRequests >= RULE_REQUESTS_MAX) warnings.push(`rules: skipped ${rulePaths.length - ruleRequests} candidate paths after ${RULE_REQUESTS_MAX} requests.`);
+    const rules = renderRepositoryRules(repositoryRules, pr.baseSha);
+
     const historyFor = (...paths: Array<string | null>): HistoricalPr[] => {
       const merged = new Map<number, HistoricalPr>();
       for (const path of paths) {
@@ -1003,18 +1108,22 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           omitted++;
         }
       };
-      for (const [path, content] of headContents) {
-        addContext(`Files changed in this pull request (post-change content, authoritative):\n${JSON.stringify({ path, content })}`);
+      for (const file of files) {
+        const path = file.newPath ?? file.oldPath!;
+        const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
+        const headContext = buildHeadContext({ path, addedText: added, headContents, exportsByPath });
+        if (headContext) addContext(`Relevant post-change context for ${path} (authoritative):\n${headContext}`);
       }
+      if (rules) addContext(rules);
       const batchHistory = historyFor(...historyPaths);
       if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
       const seen = new Set<number>();
       for (const file of files) {
         const path = file.newPath ?? file.oldPath!;
-        const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
+        const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
-          const chunks = await retrieve({ repoIds: [opts.repoId], query: [path, ...identifiers(added)].join(' '), limit: 8, excludePaths: changedPaths, lexicalOnly: true });
-          for (const chunk of chunks) {
+          const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
+          for (const chunk of selected) {
             if (seen.has(chunk.chunkId)) continue;
             seen.add(chunk.chunkId);
             addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
@@ -1084,17 +1193,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath ?? file.oldPath!;
-      const addedText = file.hunks
-        .flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content))
+      const changedText = file.hunks
+        .flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content))
         .join('\n');
-      const query = [path, ...identifiers(addedText)].join(' ');
-      const headContext = buildHeadContext({ path, addedText, headContents, exportsByPath });
+      const headContext = buildHeadContext({ path, addedText: changedText, headContents, exportsByPath });
       let context = '';
       try {
         // Excluding every changed path keeps pre-change chunks of this PR's files
         // out of the prompt; their post-change content is in `headContext` instead.
-        const chunks = await retrieve({ repoIds: [opts.repoId], query, limit: 8, excludePaths: changedPaths });
-        context = formatContext(chunks);
+        context = formatContext(await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths));
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
       }
@@ -1114,6 +1221,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
                 headContext,
                 context,
                 instructions: repo.instructions,
+                rules,
                 lineage,
                 delta: lineage.previous ? deltaForFile(lineage.previous, path) : undefined,
                 historical: historyFor(file.oldPath, file.newPath),
