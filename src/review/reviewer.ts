@@ -3,7 +3,7 @@ import { matchesGlob } from 'node:path';
 import { createHash } from 'node:crypto';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT } from './budget.js';
 import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
@@ -1302,7 +1302,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const call = await completeCall({
         system: ESCALATION_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
-        json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'escalation',
+        json: true, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'escalation',
       }, escalationLlm);
       if (call.failed) throw call.error;
       const obj = extractJson(call.raw!) as Record<string, unknown>;
@@ -1342,6 +1342,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
         return hunks.length ? [{
           path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
+          currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
+            line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
+          }])),
+          removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
+            line: line.oldLine, kind: 'removed', content: line.content,
+          }])),
           headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), headContents, exportsByPath }),
           relevantContext: relevantContextByPath.get(path) ?? '',
         }] : [];
@@ -1349,7 +1355,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const call = await completeCall({
         system: VERIFIER_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
-          prTitle: pr.title, prBody: pr.body, rules, files: verifierFiles,
+          rules, files: verifierFiles,
           findings: findings.map((finding, id) => ({ id, finding })),
         }) }],
         json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',

@@ -1,8 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { IncompleteResponseError, ProviderError } from '../../src/llm/types.js';
 import type { UsageRecord } from '../../src/usage/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from '../../src/review/budget.js';
+import { reviewCostUpperBound, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from '../../src/review/budget.js';
 
 interface Call {
   url: string;
@@ -56,6 +56,17 @@ describe('OpenRouter review budget', () => {
     expect(body.provider.max_price).toEqual({ prompt: 1, completion: 4, request: 0 });
   });
 
+  it('allows 16k output only for escalation and rejects larger or other-stage requests before fetch', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
+    await p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewStage: 'escalation' });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).max_tokens).toBe(16000);
+    await expect(p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT + 1, reviewStage: 'escalation' })).rejects.toThrow('$0.25');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'initial' })).rejects.toThrow('$0.25');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'verification' })).rejects.toThrow('$0.25');
+    expect(f.calls).toHaveLength(1);
+  });
+
   it('does not retry an ambiguous network failure or server failure', async () => {
     for (const failure of [new Error('timeout'), jsonResponse({}, 503)]) {
       let calls = 0;
@@ -84,6 +95,29 @@ describe('OpenRouter review budget', () => {
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, onUsage: (r) => seen.push(r) });
     await expect(p.complete(req)).rejects.toThrow('incomplete review');
     expect(seen[0]?.costUsd).toBe(0.01604);
+  });
+});
+
+describe('OpenRouter review timeouts', () => {
+  it('uses 5 minutes normally, 10 minutes for escalation, and preserves custom timeouts', async () => {
+    const seen: number[] = [];
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      seen.push(ms);
+      return new AbortController().signal;
+    });
+    try {
+      const complete = () => jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] });
+      const first = fakeFetch([complete(), complete()]);
+      const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: first.fetch });
+      await p.complete({ messages: [{ role: 'user', content: 'hi' }], reviewBudget: true, maxTokens: 1000, reviewStage: 'initial' });
+      await p.complete({ messages: [{ role: 'user', content: 'hi' }], reviewBudget: true, maxTokens: 1000, reviewStage: 'escalation' });
+      const custom = fakeFetch([complete()]);
+      const customProvider = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: custom.fetch, timeoutMs: 900_000 });
+      await customProvider.complete({ messages: [{ role: 'user', content: 'hi' }], reviewBudget: true, maxTokens: 1000, reviewStage: 'escalation' });
+      expect(seen).toEqual([300_000, 600_000, 900_000]);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 });
 

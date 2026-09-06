@@ -11,7 +11,7 @@ import type {
   HistoricalPullRequest,
 } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from '../../src/review/prompts.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
+import { reviewCostUpperBound, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_MAX_OUTPUT, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
@@ -1876,11 +1876,38 @@ describe('staged review', () => {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false });
       expect(escalationCalls).toHaveLength(1);
       expect(escalationCalls[0]!.reviewStage).toBe('escalation');
+      expect(escalationCalls[0]!.maxTokens).toBe(REVIEW_ESCALATION_MAX_OUTPUT);
       expect(escalationCalls[0]!.messages[0]!.content).toContain('request.token');
       expect(escalationCalls[0]!.messages[0]!.content).not.toContain('+newCall();');
       expect(result.findings.map((item) => item.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
       expect(result.summary).toBe('Two supported issues remain.');
       expect(result.verdict).toBe('comment');
+    } finally { testDb.close(); }
+  });
+
+  it('gives verification bounded current and removed evidence when the head file is oversized', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const largeDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -1 +1 @@\n-const value = oldValue();\n+const value = newValue();\n`;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Stale allegation.', verdict: 'request_changes', findings: [{ ...finding(1, 'Stale finding'), path: 'src/large.ts', evidence: { ...finding(1, 'Stale finding').evidence, path: 'src/large.ts' } }] });
+    } };
+    let verifierPayload: Record<string, unknown> | undefined;
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current added line uses newValue().' }], summary: 'No current issue.', verdict: 'approve' });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne,
+        github: fakeGithub(largeDiff, PR, { headFiles: { 'src/large.ts': `const value = newValue();\n${'x'.repeat(60_001)}` } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false });
+      expect(verifierPayload?.prBody).toBeUndefined();
+      const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
+      expect(verifierFile.currentEvidence).toEqual([{ line: 1, kind: 'added', content: 'const value = newValue();' }]);
+      expect(verifierFile.removedEvidence).toEqual([{ line: 1, kind: 'removed', content: 'const value = oldValue();' }]);
+      expect(result.findings).toEqual([]);
     } finally { testDb.close(); }
   });
 
