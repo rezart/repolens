@@ -170,7 +170,7 @@ describe('indexRepo', () => {
     const inputHash = createHash('sha256').update(`a.ts\n${FILE_A}`).digest('hex');
     db.raw
       .prepare(`insert into embedding_cache (model, input_hash, dimension, embedding) values (?, ?, ?, ?)`)
-      .run('unknown-dimension', inputHash, 2, JSON.stringify([1, 2]));
+      .run('unknown-dimension', inputHash, 2, Buffer.from(new Float32Array([1, 2]).buffer));
     const embeddings: EmbeddingProvider = {
       model: 'unknown-dimension',
       dimension: null,
@@ -180,6 +180,26 @@ describe('indexRepo', () => {
     await expect(indexRepo({ db, checkout, repoId: REPO_ID, embeddings })).rejects.toThrow(/dimensions differ/);
     expect(db.vectorDimension).toBeNull();
     expect(db.chunkIdsWithoutVectors(REPO_ID)).not.toEqual([]);
+  });
+
+  it('leaves chunks unvectored when cache persistence fails', async () => {
+    db.insertEmbeddingCache = () => { throw new Error('cache write failed'); };
+
+    await expect(indexRepo({ db, checkout, repoId: REPO_ID, embeddings: fakeEmbeddings('cache-failure') })).rejects.toThrow(/cache write failed/);
+    expect(db.chunkIdsWithoutVectors(REPO_ID)).not.toEqual([]);
+  });
+
+  it('rejects sparse provider vectors before writing cache or vectors', async () => {
+    const embeddings: EmbeddingProvider = {
+      model: 'sparse-vectors',
+      dimension: null,
+      async embed(texts) { return texts.map(() => new Array(4)); },
+    };
+
+    await expect(indexRepo({ db, checkout, repoId: REPO_ID, embeddings })).rejects.toThrow(/inconsistent/);
+    expect(db.vectorDimension).toBeNull();
+    expect(db.chunkIdsWithoutVectors(REPO_ID)).not.toEqual([]);
+    expect(db.raw.prepare(`select count(*) as n from embedding_cache`).get()).toEqual({ n: 0 });
   });
 
   it('re-chunks only the modified file', async () => {

@@ -74,6 +74,16 @@ describe('Db', () => {
     expect(() => db.ensureVecTable(8)).toThrow(/dimension/);
   });
 
+  it('stores embedding cache vectors as compact float32 blobs', () => {
+    const vector = Array.from({ length: 4096 }, (_, i) => i / 4096);
+    db.insertEmbeddingCache('model', [{ inputHash: 'hash', embedding: vector }]);
+    expect(db.raw.prepare(`select length(embedding) as bytes from embedding_cache where model=? and input_hash=?`).get('model', 'hash')).toEqual({ bytes: 16384 });
+    expect(db.getEmbeddingCache('model', ['hash']).get('hash')?.embedding).toEqual(vector);
+
+    db.raw.prepare(`update embedding_cache set embedding=? where model=? and input_hash=?`).run(Buffer.alloc(3), 'model', 'hash');
+    expect(db.getEmbeddingCache('model', ['hash'])).toEqual(new Map());
+  });
+
   it('tracks jobs and reviews', () => {
     seed(db);
     const job = db.createJob('index', 'github:o/n');
