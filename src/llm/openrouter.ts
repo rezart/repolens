@@ -2,7 +2,7 @@ import { IncompleteResponseError, NetworkProviderError, ProviderError } from './
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE, REVIEW_ESCALATION_INPUT_PRICE, REVIEW_ESCALATION_OUTPUT_PRICE } from '../review/budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE, REVIEW_ESCALATION_INPUT_PRICE, REVIEW_ESCALATION_OUTPUT_PRICE } from '../review/budget.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -121,8 +121,9 @@ export class OpenRouterProvider implements LLMProvider {
     if (streaming) body.stream = true;
     // Every model uses the same token bounds and routing price caps below.
     if (req.reviewBudget) {
+      const maxOutput = req.reviewStage === 'escalation' ? REVIEW_ESCALATION_MAX_OUTPUT : REVIEW_MAX_OUTPUT;
       if (streaming || !Number.isInteger(req.maxTokens) ||
-          req.maxTokens! <= 0 || req.maxTokens! > REVIEW_MAX_OUTPUT || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
+          req.maxTokens! <= 0 || req.maxTokens! > maxOutput || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
         throw new ProviderError('openrouter', 'Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
       }
       body.provider = {

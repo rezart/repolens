@@ -3,7 +3,7 @@ import { matchesGlob } from 'node:path';
 import { createHash } from 'node:crypto';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from './budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT } from './budget.js';
 import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
@@ -1302,7 +1302,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const call = await completeCall({
         system: ESCALATION_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
-        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'escalation',
+        json: true, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'escalation',
       }, escalationLlm);
       if (call.failed) throw call.error;
       const obj = extractJson(call.raw!) as Record<string, unknown>;

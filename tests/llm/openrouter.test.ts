@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { IncompleteResponseError, ProviderError } from '../../src/llm/types.js';
 import type { UsageRecord } from '../../src/usage/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from '../../src/review/budget.js';
+import { reviewCostUpperBound, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT } from '../../src/review/budget.js';
 
 interface Call {
   url: string;
@@ -54,6 +54,17 @@ describe('OpenRouter review budget', () => {
     await p.complete({ ...req, reviewStage: 'escalation' });
     const body = JSON.parse(String(f.calls[0]!.init.body));
     expect(body.provider.max_price).toEqual({ prompt: 1, completion: 4, request: 0 });
+  });
+
+  it('allows 16k output only for escalation and rejects larger or other-stage requests before fetch', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
+    await p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewStage: 'escalation' });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).max_tokens).toBe(16000);
+    await expect(p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT + 1, reviewStage: 'escalation' })).rejects.toThrow('$0.25');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'initial' })).rejects.toThrow('$0.25');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'verification' })).rejects.toThrow('$0.25');
+    expect(f.calls).toHaveLength(1);
   });
 
   it('does not retry an ambiguous network failure or server failure', async () => {
