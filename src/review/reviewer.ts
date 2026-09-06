@@ -259,7 +259,7 @@ async function retrieveTargetedChunks(
   if (!queries.length) queries.push(targeted.stem || path);
   const chunksById = new Map<number, RetrievedChunk>();
   for (const query of queries) {
-    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true })) chunksById.set(chunk.chunkId, chunk);
+    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths })) chunksById.set(chunk.chunkId, chunk);
   }
   const relevant = selectRelevantChunks([...chunksById.values()], [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
   const selected = relevant.slice(0, 8);

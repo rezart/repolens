@@ -424,6 +424,7 @@ describe('reviewPullRequest', () => {
     const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+${'n'.repeat(2000)}\n`).join('');
     const gh = fakeGithub(diff);
     const calls: CompleteRequest[] = [];
+    const lexicalOnlyRequests: (boolean | undefined)[] = [];
     const llm: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, concurrency: 4, async complete(req) {
       calls.push(req);
       return JSON.stringify({ reviewedPaths: paths, summary: 'Updates the files.', verdict: 'request_changes', findings: [
@@ -432,7 +433,7 @@ describe('reviewPullRequest', () => {
       ] });
     } };
     const retrieve: RetrieveFn = async (req) => {
-      expect(req.lexicalOnly).toBe(true);
+      lexicalOnlyRequests.push(req.lexicalOnly);
       expect(req.excludePaths).toEqual(paths);
       return [CHUNK, { ...CHUNK, chunkId: 2, content: '💸'.repeat(200000) }];
     };
@@ -445,6 +446,7 @@ describe('reviewPullRequest', () => {
     expect(result.findings).toHaveLength(2);
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
+    expect(lexicalOnlyRequests.every((value) => value === undefined)).toBe(true);
   });
 
   it('lists exactly the validator-allowed finding lines for normal, deleted and deletion-only files', async () => {
@@ -1089,14 +1091,15 @@ describe('reviewPullRequest', () => {
 
   it('builds the retrieval query from the path and added-line identifiers', async () => {
     const seen: string[] = [];
+    const lexicalOnlyRequests: (boolean | undefined)[] = [];
     const retrieve: RetrieveFn = async (req) => {
+      lexicalOnlyRequests.push(req.lexicalOnly);
       seen.push(req.query);
       // Every changed path, including the ones that are not reviewed: their index
       // chunks describe the base branch, not this PR.
       expect(req.excludePaths).toEqual(['src/app.ts', 'package-lock.json', 'assets/logo.png']);
       expect(req.limit).toBe(8);
       expect(req.repoIds).toEqual([REPO_ID]);
-      expect(req.lexicalOnly).toBe(true);
       return [];
     };
     const llm = fakeLlm();
@@ -1104,6 +1107,7 @@ describe('reviewPullRequest', () => {
     expect(seen).toContain('run');
     expect(seen.some((query) => query.includes('gone'))).toBe(true);
     expect(seen).not.toContain('number');
+    expect(lexicalOnlyRequests.every((value) => value === undefined)).toBe(true);
   });
 
   it.each([false, true])('includes test context keywords in %s batch mode queries', async (batch) => {
