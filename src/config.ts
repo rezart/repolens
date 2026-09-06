@@ -43,6 +43,9 @@ const envSchema = z.object({
     .pipe(z.array(z.string().regex(/^[^\s,]+$/))),
   /** Extra attempts for failed batch reviews, within the total review budget. */
   REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
+  /** Comma-separated repository-relative globs excluded from PR review. */
+  REVIEW_IGNORE_PATTERNS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((p) => p.trim()) : [])
+    .pipe(z.array(z.string().min(1).max(200).regex(/^[^,[\]]+$/))),
   /** Seconds a PR must go without a new push before an automatic review starts. 0 reviews immediately. */
   REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(300),
 });
@@ -72,7 +75,7 @@ export interface Config {
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
   chatModel: string;
-  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; fallbackModels?: string[] };
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; fallbackModels?: string[]; ignorePatterns?: string[] };
 }
 
 export class ConfigError extends Error {}
@@ -130,7 +133,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     chatProvider: e.CHAT_PROVIDER,
     chatModel: e.CHAT_MODEL,
-    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, fallbackModels: e.REVIEW_FALLBACK_MODELS },
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, fallbackModels: e.REVIEW_FALLBACK_MODELS, ignorePatterns: e.REVIEW_IGNORE_PATTERNS },
     github: {
       token: e.GITHUB_TOKEN,
       app: e.GITHUB_APP_ID ? { appId: e.GITHUB_APP_ID, installationId: e.GITHUB_APP_INSTALLATION_ID, privateKeyPath: e.GITHUB_APP_PRIVATE_KEY_PATH } : undefined,
