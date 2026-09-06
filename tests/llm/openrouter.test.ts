@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { IncompleteResponseError, ProviderError } from '../../src/llm/types.js';
 import type { UsageRecord } from '../../src/usage/types.js';
@@ -95,6 +95,29 @@ describe('OpenRouter review budget', () => {
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, onUsage: (r) => seen.push(r) });
     await expect(p.complete(req)).rejects.toThrow('incomplete review');
     expect(seen[0]?.costUsd).toBe(0.01604);
+  });
+});
+
+describe('OpenRouter review timeouts', () => {
+  it('uses 5 minutes normally, 10 minutes for escalation, and preserves custom timeouts', async () => {
+    const seen: number[] = [];
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      seen.push(ms);
+      return new AbortController().signal;
+    });
+    try {
+      const complete = () => jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] });
+      const first = fakeFetch([complete(), complete()]);
+      const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: first.fetch });
+      await p.complete({ messages: [{ role: 'user', content: 'hi' }], reviewBudget: true, maxTokens: 1000, reviewStage: 'initial' });
+      await p.complete({ messages: [{ role: 'user', content: 'hi' }], reviewBudget: true, maxTokens: 1000, reviewStage: 'escalation' });
+      const custom = fakeFetch([complete()]);
+      const customProvider = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: custom.fetch, timeoutMs: 900_000 });
+      await customProvider.complete({ messages: [{ role: 'user', content: 'hi' }], reviewBudget: true, maxTokens: 1000, reviewStage: 'escalation' });
+      expect(seen).toEqual([300_000, 600_000, 900_000]);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 });
 
