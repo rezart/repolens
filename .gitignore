@@ -4,4 +4,5 @@ data/
 *.db
 *.db-*
 dist/
+.worktrees/
 *.pem
