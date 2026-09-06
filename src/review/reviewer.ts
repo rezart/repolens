@@ -1342,6 +1342,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
         return hunks.length ? [{
           path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
+          currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
+            line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
+          }])),
+          removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
+            line: line.oldLine, kind: 'removed', content: line.content,
+          }])),
           headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), headContents, exportsByPath }),
           relevantContext: relevantContextByPath.get(path) ?? '',
         }] : [];
@@ -1349,7 +1355,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const call = await completeCall({
         system: VERIFIER_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
-          prTitle: pr.title, prBody: pr.body, rules, files: verifierFiles,
+          rules, files: verifierFiles,
           findings: findings.map((finding, id) => ({ id, finding })),
         }) }],
         json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',
