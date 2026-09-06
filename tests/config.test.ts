@@ -26,6 +26,12 @@ describe('loadConfig', () => {
       expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: value })).toThrow(ConfigError);
     }
   });
+  it('parses configured review ignore patterns', () => {
+    expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_IGNORE_PATTERNS: ' docs/**, generated/*.ts ' }).review.ignorePatterns)
+      .toEqual(['docs/**', 'generated/*.ts']);
+    expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_IGNORE_PATTERNS: 'docs/**,' })).toThrow(ConfigError);
+    expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_IGNORE_PATTERNS: '[' })).toThrow(ConfigError);
+  });
   it('requires an OpenRouter key for the openrouter provider', () => {
     expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'x' })).toThrow(ConfigError);
   });

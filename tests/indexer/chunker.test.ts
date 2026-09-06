@@ -60,6 +60,9 @@ describe('shouldIndex', () => {
     expect(shouldIndex('dist/bundle.js', 10)).toBe(false);
     expect(shouldIndex('src/app.min.js', 10)).toBe(false);
     expect(shouldIndex('src/app.js.map', 10)).toBe(false);
+    expect(shouldIndex('src/generated/client.ts', 10)).toBe(false);
+    expect(shouldIndex('src/schema.generated.ts', 10)).toBe(false);
+    expect(shouldIndex('src/events.pb.go', 10)).toBe(false);
     expect(shouldIndex('LICENSE', 10)).toBe(false);
   });
 });
