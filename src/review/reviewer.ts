@@ -1302,7 +1302,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const call = await completeCall({
         system: ESCALATION_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
-        json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'escalation',
+        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'escalation',
       }, escalationLlm);
       if (call.failed) throw call.error;
       const obj = extractJson(call.raw!) as Record<string, unknown>;

@@ -11,7 +11,7 @@ import type {
   HistoricalPullRequest,
 } from '../../src/review/github.js';
 import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from '../../src/review/prompts.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD } from '../../src/review/budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_OUTPUT, REVIEW_MAX_USD } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
@@ -1876,6 +1876,7 @@ describe('staged review', () => {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false });
       expect(escalationCalls).toHaveLength(1);
       expect(escalationCalls[0]!.reviewStage).toBe('escalation');
+      expect(escalationCalls[0]!.maxTokens).toBe(REVIEW_MAX_OUTPUT);
       expect(escalationCalls[0]!.messages[0]!.content).toContain('request.token');
       expect(escalationCalls[0]!.messages[0]!.content).not.toContain('+newCall();');
       expect(result.findings.map((item) => item.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
