@@ -188,9 +188,9 @@ export function defaultFormatContext(chunks: RetrievedChunk[]): string {
 }
 
 /** Keep only base-index chunks that can explain the changed identifiers. */
-export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: string[], changedPath: string): RetrievedChunk[] {
+export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: string[], changedPath: string, limit = 8): RetrievedChunk[] {
   const terms = [...new Set(identifiers.map((value) => value.toLowerCase()).filter((value) =>
-    value.length >= 1 && !CONTEXT_KEYWORDS.has(value)))];
+    value.length >= 2 && !CONTEXT_KEYWORDS.has(value)))];
   if (!terms.length) return [];
   const stem = changedPath.slice(changedPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '').toLowerCase();
   const matches = (text: string, term: string) => new RegExp(`(?:^|[^a-z0-9_$])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^a-z0-9_$])`, 'i').test(text);
@@ -200,7 +200,7 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
       (stem && matches(chunk.path, stem) ? 0.25 : 0);
     return { chunk, score, index };
   }).filter((item) => item.score > 0);
-  return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 8).map((item) => item.chunk);
+  return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map((item) => item.chunk);
 }
 
 function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
@@ -225,18 +225,18 @@ async function retrieveTargetedChunks(
   const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
   if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
   if (!queries.length) queries.push(targeted.stem || path);
-  const chunks: RetrievedChunk[] = [];
+  const chunksById = new Map<number, RetrievedChunk>();
   for (const query of queries) {
-    chunks.push(...await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true }));
+    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true })) chunksById.set(chunk.chunkId, chunk);
   }
-  const relevant = selectRelevantChunks(chunks, [...changedSymbols, targeted.stem], path);
-  const selected = [...relevant];
+  const relevant = selectRelevantChunks([...chunksById.values()], [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
+  const selected = relevant.slice(0, 8);
   const testChunk = relevant.find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
   if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
     selected.pop();
     selected.push(testChunk);
   }
-  return [...new Map(selected.map((chunk) => [chunk.chunkId, chunk])).values()].slice(0, 8);
+  return selected.slice(0, 8);
 }
 
 /** Root and ancestor rule files that can apply to the changed paths. */

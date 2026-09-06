@@ -1101,8 +1101,17 @@ describe('reviewPullRequest', () => {
       if (req.system === BATCH_REVIEW_SYSTEM_PROMPT) return JSON.stringify({ reviewedPaths: ['src/app.ts', 'tests/app.test.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
       return fake.provider.complete(req);
     } } : fake.provider;
-    await reviewPullRequest({ db, llm, retrieve: async (req) => { queries.push(req.query); return []; }, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    const matchingTest = { ...CHUNK, chunkId: 99, path: 'tests/app.test.ts', content: 'runThing() assertion' };
+    const noisySources = Array.from({ length: 8 }, (_, i) => ({ ...CHUNK, chunkId: 100 + i, path: `src/helper${i}.ts`, content: 'runThing() implementation' }));
+    await reviewPullRequest({ db, llm, retrieve: async (req) => {
+      queries.push(req.query);
+      return req.query.includes('test') ? [...noisySources, matchingTest] : [];
+    }, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(queries.some((query) => query.includes('test'))).toBe(true);
+    if (!batch) {
+      expect(fake.calls.some((call) => call.messages[0]!.content.includes('tests/app.test.ts:1-3'))).toBe(true);
+      expect(fake.calls.every((call) => !call.messages[0]!.content.includes('src/helper0.ts:1-3') || call.messages[0]!.content.includes('tests/app.test.ts:1-3'))).toBe(true);
+    }
   });
 
   it('fails closed on maxFiles overflow for every provider', async () => {
