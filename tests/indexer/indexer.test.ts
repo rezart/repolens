@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtempSync, rmSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
@@ -135,6 +136,50 @@ describe('indexRepo', () => {
     expect(second.inputs[0]).toEqual(['c.ts\nexport function gamma() { return 3; }\n']);
     expect(db.chunkIdsWithoutVectors(otherRepo)).toEqual([]);
     expect(db.vecSearch([otherRepo], [1, 1, 0, 0], 3)).toHaveLength(3);
+  });
+
+  it('looks up large indexes in embedding-cache batches', async () => {
+    const count = 1_024;
+    const entries = Array.from({ length: count }, (_, i) => ({
+      path: `src/file-${i}.ts`,
+      blobHash: i.toString(16).padStart(40, '0'),
+      size: 32,
+    }));
+    const largeCheckout = {
+      async headSha() { return 'a'.repeat(40); },
+      async listFiles() { return entries; },
+      async readFile(path: string) { return `export const value = '${path}';\n`; },
+      async readBlob() { throw new Error('unexpected blob read'); },
+    } as unknown as RepoCheckout;
+    const lookupSizes: number[] = [];
+    const lookup = db.getEmbeddingCache.bind(db);
+    db.getEmbeddingCache = (model, hashes) => {
+      lookupSizes.push(hashes.length);
+      return lookup(model, hashes);
+    };
+    db.upsertRepo({ id: 'github:large/n', remote: 'https://github.com/large/n', owner: 'large', name: 'n', branch: 'main' });
+
+    const res = await indexRepo({ db, checkout: largeCheckout, repoId: 'github:large/n', embeddings: fakeEmbeddings() });
+
+    expect(res.chunks).toBe(count);
+    expect(Math.max(...lookupSizes)).toBeLessThanOrEqual(64);
+    expect(lookupSizes).toHaveLength(Math.ceil(count / 64));
+  });
+
+  it('rejects inconsistent cached dimensions before creating the vector table', async () => {
+    const inputHash = createHash('sha256').update(`a.ts\n${FILE_A}`).digest('hex');
+    db.raw
+      .prepare(`insert into embedding_cache (model, input_hash, dimension, embedding) values (?, ?, ?, ?)`)
+      .run('unknown-dimension', inputHash, 2, JSON.stringify([1, 2]));
+    const embeddings: EmbeddingProvider = {
+      model: 'unknown-dimension',
+      dimension: null,
+      async embed(texts) { return texts.map(() => [1, 0, 0, 0]); },
+    };
+
+    await expect(indexRepo({ db, checkout, repoId: REPO_ID, embeddings })).rejects.toThrow(/dimensions differ/);
+    expect(db.vectorDimension).toBeNull();
+    expect(db.chunkIdsWithoutVectors(REPO_ID)).not.toEqual([]);
   });
 
   it('re-chunks only the modified file', async () => {
