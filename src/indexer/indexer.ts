@@ -208,8 +208,8 @@ async function embedPending(
       return { chunkId: batch[i].chunkId, repoId, embedding };
     });
     db.ensureVecTable(batchDim);
-    db.insertVectors(rows);
     db.insertEmbeddingCache(embeddings.model, cacheRows);
+    db.insertVectors(rows);
     completed += batch.length;
     progress(`Embedded ${completed}/${work.length} chunks`);
   }
@@ -219,6 +219,6 @@ function embeddingInputHash(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-function isValidVector(vector: number[], expectedDim: number | null): boolean {
-  return vector.length > 0 && (expectedDim === null || vector.length === expectedDim) && vector.every((n) => Number.isFinite(n));
+function isValidVector(vector: number[] | undefined, expectedDim: number | null): vector is number[] {
+  return vector !== undefined && vector.length > 0 && (expectedDim === null || vector.length === expectedDim) && Array.from(vector).every((n) => typeof n === 'number' && Number.isFinite(n));
 }
