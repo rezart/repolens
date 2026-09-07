@@ -572,10 +572,8 @@ describe('reviewPullRequest', () => {
     const next = queue.enqueue('review', REPO_ID, async () => 'still running');
     await queue.idle();
     expect(db.getJob(failed.id)?.status).toBe('error');
-    expect(db.getJob(failed.id)?.error).toContain('Last retry error: No JSON object found in model output');
-    expect(db.getJob(failed.id)?.error).toContain('used $0.000000, reserved $');
+    expect(db.getJob(failed.id)?.error).toContain('No JSON object found in model output');
     expect(db.getJob(failed.id)?.progress).toContain('commit status error');
-    expect(db.getJob(failed.id)?.error).toContain('next attempt $');
     expect(db.getJob(next.id)?.status).toBe('done');
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
@@ -590,15 +588,15 @@ describe('reviewPullRequest', () => {
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
 
-  it.each(['not JSON', JSON.stringify({ findings: [], summary: 'Fine', verdict: 'approve', reviewedPaths: [] })])('retries invalid batch responses and publishes only the valid fourth attempt: %s', async (invalid) => {
+  it.each(['not JSON', JSON.stringify({ findings: [], summary: 'Fine', verdict: 'approve', reviewedPaths: [] })])('uses one corrective retry for malformed batch responses: %s', async (invalid) => {
     const gh = fakeGithub();
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => {
       calls++;
-      return calls < 4 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
+      return calls === 1 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
     } };
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
-    expect(calls).toBe(4);
+    expect(calls).toBe(2);
     expect(result.posted).toBe(true);
     expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(gh.reviews).toHaveLength(1);
@@ -656,12 +654,12 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(1);
   });
 
-  it.each([undefined, 0, 1])('stops invalid response retries at the configured limit %s', async (maxRetries) => {
+  it.each([undefined, 0, 1])('stops malformed response retries after one correction %s', async (maxRetries) => {
     const gh = fakeGithub();
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => { calls++; return '{}'; } };
     await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
-    expect(calls).toBe((maxRetries ?? 3) + 1);
+    expect(calls).toBe(2);
     expect(gh.reviews).toHaveLength(0);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
@@ -703,7 +701,8 @@ describe('reviewPullRequest', () => {
     expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(calls).toHaveLength(2);
     const primaryContent = calls[0]!.messages[0]!.content;
-    expect(calls[1]!.messages[0]!.content).toBe(primaryContent);
+    expect(calls[1]!.messages[0]!.content).toContain('validationError');
+    expect(calls[1]!.messages[0]!.content).toContain('Historical description');
     expect(primaryContent).toContain('Historical description');
     const payload = JSON.parse(primaryContent.split('\n\n', 1)[0]!) as { files: Array<{ path: string; status: string; diff: string }> };
     const expected = parseUnifiedDiff(DIFF)
@@ -784,7 +783,7 @@ describe('reviewPullRequest', () => {
     expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(costUsd * 2);
   });
 
-  it.each([0, 1])('keeps maxRetries=%s when failed calls report zero cost', async (maxRetries) => {
+  it.each([0, 1])('uses one corrective retry when malformed calls report zero cost (maxRetries=%s)', async (maxRetries) => {
     const gh = fakeGithub();
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
@@ -794,7 +793,7 @@ describe('reviewPullRequest', () => {
       return '{}';
     } };
     await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
-    expect(calls).toBe(maxRetries + 1);
+    expect(calls).toBe(2);
   });
 
   it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.5, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
@@ -889,7 +888,11 @@ describe('reviewPullRequest', () => {
     const llm = Object.assign(new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder', fetch, onUsage: tracker.sinkFor('review') }), { reviewFallbacks: [fallback] });
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(sent.map((r) => r.model)).toEqual(['qwen/qwen3-coder', 'qwen/qwen3-coder-next']);
-    expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+    if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {
+      expect(JSON.stringify(sent[1]!.messages)).toContain('validationError');
+    } else {
+      expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+    }
     expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
     expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
@@ -2349,7 +2352,11 @@ describe('staged review', () => {
       const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
       expect(correction.validationError).toContain('JSON');
       expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1, 20] }]);
-      expect(result.trace?.stages.map((stage) => stage.stage)).toContain('initial');
+      const initialStage = result.trace!.stages.find((stage) => stage.stage === 'initial')!;
+      expect(initialStage.calls.map((call) => call.outcome)).toEqual(['validation_error', 'success']);
+      expect(initialStage.calls[0]!.failure).toContain('JSON');
+      expect(result.trace!.identity).toMatchObject({ repoId: REPO_ID, prNumber: 42, headSha: PR.headSha, model: 'cheap' });
+      expect(result.trace!.finalFindings).toEqual([]);
     } finally { testDb.close(); }
   });
 
@@ -2363,14 +2370,19 @@ describe('staged review', () => {
     const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
       requests.push(req);
       const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
-      return requests.length === 1 ? JSON.stringify({ reviewedPaths: [] }) : JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+      return requests.length === 1 ? JSON.stringify({ reviewedPaths: [] }) : JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'reject' })), findings: [] });
     } };
     try {
-      await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       expect(requests).toHaveLength(2);
       const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
       expect(correction.validationError).toContain('reviewedPaths');
       expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1] }]);
+      const escalationStage = result.trace!.stages.find((stage) => stage.stage === 'escalation')!;
+      expect(escalationStage.calls.map((call) => call.outcome)).toEqual(['validation_error', 'success']);
+      expect(escalationStage.decisions).toEqual([{ id: expect.any(String), decision: 'reject' }]);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'verification')).toBeUndefined();
+      expect(result.trace!.finalFindings).toEqual([]);
     } finally { testDb.close(); }
   });
 
@@ -2395,6 +2407,32 @@ describe('staged review', () => {
       expect(correction.validationError).toContain('verification');
       expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1, 2] }]);
       expect(result.findings).toHaveLength(1);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'verification')!.calls.map((call) => call.outcome)).toEqual(['validation_error', 'success']);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'verification')!.decisions).toEqual([{ id: 0, decision: 'supported' }]);
+    } finally { testDb.close(); }
+  });
+
+  it('traces verifier execution when escalation adds the only finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const added = finding(1, 'Escalated finding');
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'uncertain' })), findings: [added] });
+    } };
+    const verifier: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'Current evidence supports it.', evidence: { path: item.path, line: item.line } })) });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const stages = result.trace!.stages;
+      expect(stages.map((stage) => stage.stage)).toEqual(['initial', 'escalation', 'verification', 'final']);
+      expect(stages.find((stage) => stage.stage === 'verification')!.findings).toEqual([added]);
+      expect(stages.find((stage) => stage.stage === 'verification')!.decisions).toEqual([{ id: 0, decision: 'supported' }]);
     } finally { testDb.close(); }
   });
 });

@@ -149,8 +149,7 @@ export class OpenRouterProvider implements LLMProvider {
 
   async complete(req: CompleteRequest): Promise<string> {
     const timeoutMs = req.reviewStage === 'escalation' ? Math.max(this.timeoutMs, ESCALATION_TIMEOUT_MS) : this.timeoutMs;
-    const fallbackCount = (this as unknown as { reviewFallbacks?: readonly LLMProvider[] }).reviewFallbacks?.length ?? 0;
-    const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? (fallbackCount ? 1 : 2) : MAX_ATTEMPTS, timeoutMs, req.reviewBudget ? (status) => status === 429 : isRetryable, !req.reviewBudget));
+    const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs));
     if (req.reviewBudget && finishReason !== 'stop') {
       throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
     }
@@ -233,7 +232,7 @@ export class OpenRouterProvider implements LLMProvider {
   }
 
   /** POST with retries, returning the successful response. */
-  private async post(payload: string, maxAttempts = MAX_ATTEMPTS, timeoutMs = this.timeoutMs, retryStatus: (status: number) => boolean = isRetryable, retryNetwork = true): Promise<Response> {
+  private async post(payload: string, maxAttempts = MAX_ATTEMPTS, timeoutMs = this.timeoutMs): Promise<Response> {
     let lastError: ProviderError | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -253,7 +252,7 @@ export class OpenRouterProvider implements LLMProvider {
       } catch (err) {
         // DNS failures, resets and timeouts arrive as a thrown error, not a response.
         const netErr = new NetworkProviderError('openrouter', `request failed: ${err instanceof Error ? err.message : String(err)}`);
-        if (!retryNetwork || attempt === maxAttempts) throw netErr;
+        if (attempt === maxAttempts) throw netErr;
         lastError = netErr;
         await this.sleep(backoffMs(attempt));
         continue;
@@ -263,7 +262,7 @@ export class OpenRouterProvider implements LLMProvider {
 
       const detail = await safeText(res);
       const err = new ProviderError('openrouter', `HTTP ${res.status}`, res.status, detail);
-      if (!retryStatus(res.status) || attempt === maxAttempts) throw err;
+      if (!isRetryable(res.status) || attempt === maxAttempts) throw err;
       lastError = err;
       await this.sleep(backoffMs(attempt));
     }

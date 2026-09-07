@@ -155,7 +155,7 @@ export interface ReviewTrace {
     selectedPaths: string[];
     hunks: Array<{ path: string; lines: number[] }>;
     omittedContext: number;
-    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' }>;
+    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string }>;
     primaryFindings?: Finding[];
     decisions?: Array<{ id: string | number; decision: string }>;
     findings?: Finding[];
@@ -1031,11 +1031,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   let costUsd: number | null = 0;
   let reservedUsd = 0;
   let usedUsd = 0;
-  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' }> = [];
-  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
+  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string }> = [];
+  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
     const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error' } : undefined;
     if (traceCall) traceCalls.push(traceCall);
+    const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
     if (req.reviewBudget && reservedUsd + estimate > REVIEW_MAX_USD) {
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
@@ -1060,24 +1061,28 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
     if (req.reviewBudget && reservedUsd > REVIEW_MAX_USD) {
       if (traceCall) traceCall.outcome = 'error';
-      return { raw, error: new Error(`Review exceeds the $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null };
+      return { raw, error: new Error(`Review exceeds the $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null, traceIndex };
     }
     if (traceCall) {
       traceCall.costUsd = validCost ? call.costUsd : null;
       traceCall.outcome = threw ? 'error' : 'success';
     }
-    return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null };
+    return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null, traceIndex };
   };
-  const complete = async (req: CompleteRequest) => {
-    const result = await completeCall(req);
-    if (result.failed) throw result.error;
-    return result.raw!;
+  const markTraceValidation = (traceIndex: number | undefined, error: unknown) => {
+    if (traceIndex === undefined) return;
+    const trace = traceCalls[traceIndex];
+    if (trace) { trace.outcome = 'validation_error'; trace.failure = errMessage(error); }
   };
   const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>): Promise<T> => {
     const run = async (request: CompleteRequest) => {
       const call = await completeCall(request, provider);
-      if (call.failed) throw call.error;
-      return parse(call.raw!);
+      if (call.failed) {
+        if (call.error instanceof JsonExtractError || call.error instanceof IncompleteResponseError) markTraceValidation(call.traceIndex, call.error);
+        throw call.error;
+      }
+      try { return parse(call.raw!); }
+      catch (err) { markTraceValidation(call.traceIndex, err); throw err; }
     };
     try {
       return await run(req);
@@ -1275,6 +1280,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let escalationFindingsTrace: Finding[] | undefined;
     let verifierDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
     let verifierSelectedPaths = new Set<string>();
+    let verifierExecuted = false;
+    let verifierFindingsTrace: Finding[] = [];
     const maxRetries = deps.maxRetries ?? 3;
 
     const historyPathSet = new Set<string>();
@@ -1450,12 +1457,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       let providerIndex = 0;
       let lastRetryError: unknown;
       let attemptReq = req;
-      let correctiveRetryUsed = false;
+      let correctedAttempt = false;
       const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
       for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
+        let traceIndex: number | undefined;
         try {
           const call = await completeCall(attemptReq);
+          traceIndex = call.traceIndex;
           if (call.failed) throw call.error;
           const obj = extractJson(call.raw!) as Record<string, unknown>;
           if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
@@ -1474,8 +1483,22 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
           break;
         } catch (err) {
+          markTraceValidation(traceIndex, err);
+          const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
+          if (malformed) {
+            if (correctedAttempt) throw err;
+            correctedAttempt = true;
+            attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
+            const previous = activeLlm.model;
+            activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
+            const message = `${previous}: ${errMessage(err)}; corrective retry with ${activeLlm.model}`;
+            warnings.push(message);
+            log(`review: ${message}`);
+            continue;
+          }
           const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
             err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
+          if (correctedAttempt) throw err;
           if (!retryable || attempt >= maxRetries) {
             if (lastRetryError && /budget/i.test(errMessage(err))) {
               throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
@@ -1483,16 +1506,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             throw err;
           }
           lastRetryError = err;
-          const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
-          // Keep the configured fallback chain's retry prompt stable; a single
-          // provider can afford the bounded corrective payload without changing
-          // fallback semantics.
-          if (malformed && providers.length === 1 && !correctiveRetryUsed && attempt < maxRetries) {
-            correctiveRetryUsed = true;
-            attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
-          } else {
-            attemptReq = req;
-          }
+          attemptReq = req;
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
           const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
@@ -1521,7 +1535,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }
       await assertHeadUnchanged();
       try {
-        const raw = await complete({
+        const call = await completeCall({
           system: FILE_REVIEW_SYSTEM_PROMPT,
           messages: [
             {
@@ -1546,7 +1560,16 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           maxTokens: 2000,
           reviewStage: 'initial',
         });
-        return parseFindings(raw, file);
+        if (call.failed) {
+          if (call.error instanceof JsonExtractError || call.error instanceof IncompleteResponseError) markTraceValidation(call.traceIndex, call.error);
+          throw call.error;
+        }
+        try {
+          return parseFindings(call.raw!, file);
+        } catch (err) {
+          markTraceValidation(call.traceIndex, err);
+          throw err;
+        }
       } catch (err) {
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);
@@ -1752,6 +1775,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
         return { path: file.path, lines: [...lines].sort((a, b) => a - b) };
       });
+      verifierExecuted = true;
+      verifierFindingsTrace = findings.slice();
       const parseVerification = (raw: string) => {
         const obj = extractJson(raw) as Record<string, unknown>;
         const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
@@ -1789,7 +1814,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       stages: [
         traceStage('initial', files, initialOmittedContext, { primaryFindings: primaryTrace }),
         ...(escalationLlm && riskyFiles.length ? [traceStage('escalation', riskyFiles, escalationOmittedContext, { primaryFindings: primaryTrace.filter((finding) => riskyFiles.some((file) => (file.newPath ?? file.oldPath) === finding.path)), decisions: escalationDecisionsTrace, findings: escalationFindingsTrace })] : []),
-        ...(verifierLlm && primaryTrace.length ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace })] : []),
+        ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, findings: verifierFindingsTrace })] : []),
         traceStage('final', files, 0, { findings: findings.slice() }),
       ],
       finalFindings: findings.slice(),
