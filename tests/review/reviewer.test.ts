@@ -2334,6 +2334,69 @@ describe('staged review', () => {
       expect(testDb.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
     } finally { testDb.close(); }
   });
+
+  it('uses one corrective retry for malformed initial output with exact line guidance', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const requests: CompleteRequest[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      requests.push(req);
+      return requests.length === 1 ? 'not JSON' : JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(requests).toHaveLength(2);
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
+      expect(correction.validationError).toContain('JSON');
+      expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1, 20] }]);
+      expect(result.trace?.stages.map((stage) => stage.stage)).toContain('initial');
+    } finally { testDb.close(); }
+  });
+
+  it('uses one corrective retry for malformed escalation output with exact path lines', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const requests: CompleteRequest[] = [];
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      requests.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return requests.length === 1 ? JSON.stringify({ reviewedPaths: [] }) : JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    try {
+      await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(requests).toHaveLength(2);
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
+      expect(correction.validationError).toContain('reviewedPaths');
+      expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1] }]);
+    } finally { testDb.close(); }
+  });
+
+  it('uses one corrective retry for malformed verifier citations with exact evidence lines', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const requests: CompleteRequest[] = [];
+    const verifier: LLMProvider = { ...initial, async complete(req) {
+      requests.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return requests.length === 1
+        ? JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'bad citation', evidence: { path: 'src/mixed.ts', line: 999 } }] })
+        : JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'Current evidence supports it.', evidence: { path: item.path, line: item.line } })) });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(requests).toHaveLength(2);
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
+      expect(correction.validationError).toContain('verification');
+      expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1, 2] }]);
+      expect(result.findings).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
 });
 
 describe('isReviewablePath', () => {

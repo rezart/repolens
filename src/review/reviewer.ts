@@ -143,6 +143,24 @@ export interface ReviewResult {
   riskMetadata: Array<{ path: string; risk: ChangeRisk }>;
   /** The commit status reported on the PR head, when statuses are enabled. */
   status?: ReviewStatus;
+  /** Replayable, non-secret metadata for the staged review. */
+  trace?: ReviewTrace;
+}
+
+export interface ReviewTrace {
+  version: 1;
+  identity: { repoId: string; prNumber: number; headSha: string; baseSha: string; provider: string; model: string; config: { maxRetries: number; maxFiles: number } };
+  stages: Array<{
+    stage: 'initial' | 'escalation' | 'verification' | 'final';
+    selectedPaths: string[];
+    hunks: Array<{ path: string; lines: number[] }>;
+    omittedContext: number;
+    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' }>;
+    primaryFindings?: Finding[];
+    decisions?: Array<{ id: string | number; decision: string }>;
+    findings?: Finding[];
+  }>;
+  finalFindings: Finding[];
 }
 
 export interface ReviewDeps {
@@ -636,6 +654,27 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return results;
 }
 
+function traceHunks(files: DiffFile[]): Array<{ path: string; lines: number[] }> {
+  return files.map((file) => ({
+    path: file.newPath ?? file.oldPath ?? '',
+    lines: [...new Set(file.hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.newLine !== undefined ? [line.newLine] : line.oldLine !== undefined ? [line.oldLine] : [])))].sort((a, b) => a - b),
+  }));
+}
+
+function withCorrection(req: CompleteRequest, validationError: string, allowedPathsAndLines: Array<{ path: string; lines: number[] }>): CompleteRequest {
+  const content = req.messages[0]?.content ?? '';
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : { original: parsed };
+  } catch {
+    payload = { original: content };
+  }
+  payload.validationError = validationError;
+  payload.allowedPathsAndLines = allowedPathsAndLines;
+  return { ...req, messages: [{ ...req.messages[0]!, content: JSON.stringify(payload) }, ...req.messages.slice(1)] };
+}
+
 function allowedFindingLines(file: DiffFile): Set<number> {
   const added = changedNewLines(file);
   if (file.status !== 'deleted' && added.size > 0) return added;
@@ -992,8 +1031,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   let costUsd: number | null = 0;
   let reservedUsd = 0;
   let usedUsd = 0;
+  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' }> = [];
   const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
+    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error' } : undefined;
+    if (traceCall) traceCalls.push(traceCall);
     if (req.reviewBudget && reservedUsd + estimate > REVIEW_MAX_USD) {
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
@@ -1017,7 +1059,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       reservedUsd += call.costUsd! - estimate;
     }
     if (req.reviewBudget && reservedUsd > REVIEW_MAX_USD) {
+      if (traceCall) traceCall.outcome = 'error';
       return { raw, error: new Error(`Review exceeds the $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null };
+    }
+    if (traceCall) {
+      traceCall.costUsd = validCost ? call.costUsd : null;
+      traceCall.outcome = threw ? 'error' : 'success';
     }
     return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null };
   };
@@ -1025,6 +1072,19 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const result = await completeCall(req);
     if (result.failed) throw result.error;
     return result.raw!;
+  };
+  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>): Promise<T> => {
+    const run = async (request: CompleteRequest) => {
+      const call = await completeCall(request, provider);
+      if (call.failed) throw call.error;
+      return parse(call.raw!);
+    };
+    try {
+      return await run(req);
+    } catch (err) {
+      if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError)) throw err;
+      return run(withCorrection(req, errMessage(err), allowed));
+    }
   };
   const log = deps.log ?? (() => {});
   const identifiers = deps.identifiers ?? defaultIdentifiers;
@@ -1207,6 +1267,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
     }
     const files = reviewable;
+    let initialOmittedContext = 0;
+    let escalationOmittedContext = 0;
+    let verifierOmittedContext = 0;
+    let primaryTrace: Finding[] = [];
+    let escalationDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let escalationFindingsTrace: Finding[] | undefined;
+    let verifierDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let verifierSelectedPaths = new Set<string>();
+    const maxRetries = deps.maxRetries ?? 3;
 
     const historyPathSet = new Set<string>();
     for (const file of files) {
@@ -1330,7 +1399,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }) }],
         json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true, reviewStage: 'initial',
       };
-      const maxRetries = deps.maxRetries ?? 3;
       // Reject the core prompt before the retrieval loop or any inference call.
       const coreCost = reviewCostUpperBound(req);
       if (coreCost > REVIEW_MAX_USD) {
@@ -1376,14 +1444,18 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.50; all file diffs included.`);
+      initialOmittedContext = omitted;
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let providerIndex = 0;
       let lastRetryError: unknown;
+      let attemptReq = req;
+      let correctiveRetryUsed = false;
+      const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
       for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
         try {
-          const call = await completeCall(req);
+          const call = await completeCall(attemptReq);
           if (call.failed) throw call.error;
           const obj = extractJson(call.raw!) as Record<string, unknown>;
           if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
@@ -1411,6 +1483,16 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             throw err;
           }
           lastRetryError = err;
+          const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
+          // Keep the configured fallback chain's retry prompt stable; a single
+          // provider can afford the bounded corrective payload without changing
+          // fallback semantics.
+          if (malformed && providers.length === 1 && !correctiveRetryUsed && attempt < maxRetries) {
+            correctiveRetryUsed = true;
+            attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
+          } else {
+            attemptReq = req;
+          }
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
           const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
@@ -1462,6 +1544,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           ],
           json: true,
           maxTokens: 2000,
+          reviewStage: 'initial',
         });
         return parseFindings(raw, file);
       } catch (err) {
@@ -1473,6 +1556,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     });
 
     let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    primaryTrace = findings.slice();
     const riskyFiles = files.flatMap((file) => {
       const hunks = file.hunks.filter((_, index) => {
         const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });
@@ -1583,34 +1667,41 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         throw new Error(`Escalation core exceeds the remaining $0.50 review budget; reserved $${reservedUsd.toFixed(6)}, verifier reserve $${verifierReserve.toFixed(6)}, core $${escalationEstimate.toFixed(6)}; no review was published.`);
       }
       if (omitted) warnings.push(`Escalation omitted ${omitted} optional context block${omitted === 1 ? '' : 's'} to stay within the remaining review budget; risky diff hunks were preserved.`);
-      const call = await completeCall(req, escalationLlm);
-      if (call.failed) throw call.error;
-      const obj = extractJson(call.raw!) as Record<string, unknown>;
-      if (!obj || !hasExactReviewedPaths(obj.reviewedPaths, paths)) {
-        throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: reviewedPaths must contain exactly every selected path; no review was published.');
-      }
-      const decisions = Array.isArray(obj.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
-      const decisionIds = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
-      if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision) ||
-          Object.keys(decision).some((key) => key !== 'id' && key !== 'decision')) ||
-          decisions.length !== primaryIds.length || new Set(decisionIds).size !== primaryIds.length ||
-          decisionIds.some((id) => typeof id !== 'string' || !primaryById.has(id)) ||
-          decisions.some((decision) => !['retain', 'reject', 'uncertain'].includes(String(decision.decision)))) {
-        throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: decisions must contain exactly one retain, reject, or uncertain decision for every primary finding; no review was published.');
-      }
-      if (!Array.isArray(obj.findings) || obj.findings.some((finding: unknown) =>
-        !finding || typeof finding !== 'object' || Array.isArray(finding) ||
-        !paths.includes((finding as { path?: string }).path ?? ''))) {
-        throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: findings must be objects whose path is one of the selected paths; no review was published.');
-      }
-      let escalated: Finding[];
-      try {
-        escalated = riskyFiles.flatMap((file) => parseFindings(JSON.stringify({
-          findings: (obj.findings as Array<{ path?: string }>).filter((finding) => finding.path === (file.newPath ?? file.oldPath)),
-        }), file));
-      } catch (err) {
-        throw new IncompleteResponseError(escalationLlm.name, `Invalid escalation response: ${errMessage(err)}`);
-      }
+      escalationOmittedContext = omitted;
+      const parseEscalation = (raw: string) => {
+        const obj = extractJson(raw) as Record<string, unknown>;
+        if (!obj || !hasExactReviewedPaths(obj.reviewedPaths, paths)) {
+          throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: reviewedPaths must contain exactly every selected path; no review was published.');
+        }
+        const decisions = Array.isArray(obj.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
+        const decisionIds = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
+        if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision) ||
+            Object.keys(decision).some((key) => key !== 'id' && key !== 'decision')) ||
+            decisions.length !== primaryIds.length || new Set(decisionIds).size !== primaryIds.length ||
+            decisionIds.some((id) => typeof id !== 'string' || !primaryById.has(id)) ||
+            decisions.some((decision) => !['retain', 'reject', 'uncertain'].includes(String(decision.decision)))) {
+          throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: decisions must contain exactly one retain, reject, or uncertain decision for every primary finding; no review was published.');
+        }
+        if (!Array.isArray(obj.findings) || obj.findings.some((finding: unknown) =>
+          !finding || typeof finding !== 'object' || Array.isArray(finding) ||
+          !paths.includes((finding as { path?: string }).path ?? ''))) {
+          throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: findings must be objects whose path is one of the selected paths; no review was published.');
+        }
+        let escalated: Finding[];
+        try {
+          escalated = riskyFiles.flatMap((file) => parseFindings(JSON.stringify({
+            findings: (obj.findings as Array<{ path?: string }>).filter((finding) => finding.path === (file.newPath ?? file.oldPath)),
+          }), file));
+        } catch (err) {
+          throw new IncompleteResponseError(escalationLlm.name, `Invalid escalation response: ${errMessage(err)}`);
+        }
+        return { decisions, escalated };
+      };
+      const escalationResult = await completeStructured(req, escalationLlm, parseEscalation,
+        riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })));
+      const { decisions, escalated } = escalationResult;
+      escalationDecisionsTrace = decisions.map((decision) => ({ id: decision.id as string, decision: String(decision.decision) }));
+      escalationFindingsTrace = escalated.slice();
       const rejected = new Set(decisions.filter((decision) => decision.decision === 'reject').map((decision) => primaryById.get(decision.id as string)));
       findings = findings.filter((finding) => !rejected.has(finding));
       findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary &&
@@ -1646,21 +1737,37 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const fullVerifierReq = verifierRequest(findings);
       const verifierReq = !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd
         ? fullVerifierReq : verifierRequest(findings, true);
+      verifierOmittedContext = verifierReq === fullVerifierReq ? 0 : 1;
       const verifierPayload = JSON.parse(verifierReq.messages[0]!.content) as { files: VerifierContextFile[] };
       const verifierFiles = verifierPayload.files;
-      const call = await completeCall(verifierReq, verifierLlm);
-      if (call.failed) throw call.error;
-      const obj = extractJson(call.raw!) as Record<string, unknown>;
-      const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
-      const ids = decisions.map((decision) => decision.id);
-      if (decisions.length !== findings.length || new Set(ids).size !== findings.length ||
-          ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
-          decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
-            typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
-            decision.decision === 'supported' && !hasValidVerifierCitation(decision, verifierFiles))) {
-        throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
-      }
+      verifierSelectedPaths = new Set(verifierFiles.map((file) => file.path));
+      const allowedVerifierLines = verifierFiles.map((file) => {
+        const lines = new Set<number>((file.currentEvidence ?? []).flatMap((item) => Number.isInteger(item.line) && item.line! > 0 ? [item.line!] : []));
+        let currentPath = '';
+        for (const line of file.headContext?.split(/\r?\n/) ?? []) {
+          const heading = /^### (.+) \(content after this pull request/.exec(line);
+          if (heading) currentPath = heading[1]!;
+          const numbered = /^(\d+) \| /.exec(line);
+          if (numbered && currentPath === file.path) lines.add(Number(numbered[1]));
+        }
+        return { path: file.path, lines: [...lines].sort((a, b) => a - b) };
+      });
+      const parseVerification = (raw: string) => {
+        const obj = extractJson(raw) as Record<string, unknown>;
+        const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
+        const ids = decisions.map((decision) => decision.id);
+        if (decisions.length !== findings.length || new Set(ids).size !== findings.length ||
+            ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
+            decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
+              typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
+              decision.decision === 'supported' && !hasValidVerifierCitation(decision, verifierFiles))) {
+          throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
+        }
+        return decisions;
+      };
+      const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines);
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
+      verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
     }
     findings = selectPostedFindings(findings);
@@ -1668,6 +1775,25 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     await assertHeadUnchanged();
     const summary = buildFindingSummary(findings);
     const verdict = verdictForFindings(findings);
+    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; findings?: Finding[] } = {}) => ({
+      stage,
+      selectedPaths: selected.map((file) => file.newPath ?? file.oldPath ?? ''),
+      hunks: traceHunks(selected),
+      omittedContext,
+      calls: traceCalls.filter((call) => call.stage === stage),
+      ...extra,
+    });
+    const trace: ReviewTrace = {
+      version: 1,
+      identity: { repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha, provider: activeLlm.name, model: activeLlm.model, config: { maxRetries, maxFiles } },
+      stages: [
+        traceStage('initial', files, initialOmittedContext, { primaryFindings: primaryTrace }),
+        ...(escalationLlm && riskyFiles.length ? [traceStage('escalation', riskyFiles, escalationOmittedContext, { primaryFindings: primaryTrace.filter((finding) => riskyFiles.some((file) => (file.newPath ?? file.oldPath) === finding.path)), decisions: escalationDecisionsTrace, findings: escalationFindingsTrace })] : []),
+        ...(verifierLlm && primaryTrace.length ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace })] : []),
+        traceStage('final', files, 0, { findings: findings.slice() }),
+      ],
+      finalFindings: findings.slice(),
+    };
 
     if (!repo.last_commit) {
       warnings.push('Repository has not been indexed; review ran without codebase context.');
@@ -1699,6 +1825,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       skippedFiles,
       warnings,
       riskMetadata: files.map((file) => ({ path: file.newPath ?? file.oldPath!, risk: assessChange(file) })),
+      trace,
     };
 
     postCtx.llm = activeLlm;

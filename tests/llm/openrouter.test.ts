@@ -98,6 +98,15 @@ describe('OpenRouter review budget', () => {
     }
   });
 
+  it('allows one bounded 429 retry for a budgeted review', async () => {
+    const f = fakeFetch([jsonResponse({ error: 'slow down' }, 429), jsonResponse({ choices: [{ message: { content: '{}', }, finish_reason: 'stop' }] })]);
+    const slept: number[] = [];
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch, sleep: async (ms) => { slept.push(ms); } });
+    await expect(p.complete(req)).resolves.toBe('{}');
+    expect(f.calls).toHaveLength(2);
+    expect(slept).toHaveLength(1);
+  });
+
   it.each([401, 429, 503])('preserves an in-band error code %s even with HTTP 200', async (code) => {
     const f = fakeFetch([jsonResponse({ error: { code, message: 'backend error' } })]);
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'other/coder', fetch: f.fetch });
