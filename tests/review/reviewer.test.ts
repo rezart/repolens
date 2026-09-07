@@ -1944,7 +1944,7 @@ describe('staged review', () => {
       expect(escalationRequest.jsonSchema).toMatchObject({
         type: 'object',
         additionalProperties: false,
-        required: ['reviewedPaths', 'findings'],
+        required: ['reviewedPaths', 'decisions', 'findings'],
         properties: {
           reviewedPaths: { minItems: paths.length, maxItems: paths.length, items: { enum: paths } },
           findings: { items: { additionalProperties: false, properties: { path: { enum: paths } } } },
@@ -2022,7 +2022,8 @@ describe('staged review', () => {
     const escalationCalls: CompleteRequest[] = [];
     const escalationLlm: LLMProvider = { name: 'openrouter', model: 'moonshotai/kimi-k2.7-code', concurrency: 1, supportsBatchReview: true, async complete(req) {
       escalationCalls.push(req);
-      return JSON.stringify({ reviewedPaths: paths, findings: [finding(1, 'Strong risky finding')] });
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'reject' })), findings: [finding(1, 'Strong risky finding')] });
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       expect(req.reviewStage).toBe('verification');
@@ -2040,6 +2041,45 @@ describe('staged review', () => {
       expect(result.findings.map((item) => item.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
       expect(result.summary).toContain('The review found 2 actionable issues');
       expect(result.verdict).toBe('comment');
+    } finally { testDb.close(); }
+  });
+
+  it('requires explicit retain, reject, or uncertain decisions for every risky primary finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const primaries = ['Retain primary', 'Reject primary', 'Uncertain primary'].map((title) => finding(1, title));
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: primaries });
+    } };
+    let verifierTitles: string[] = [];
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Reject primary' ? 'reject' : item.title === 'Uncertain primary' ? 'uncertain' : 'retain' })), findings: [] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      verifierTitles = payload.findings.map(({ finding: item }) => item.title);
+      return JSON.stringify({ decisions: payload.findings.map(({ finding: item }, id) => ({ id, decision: 'supported', explanation: 'Current evidence supports the finding.', evidence: { path: item.path, line: item.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierTitles).toEqual(['Retain primary', 'Uncertain primary']);
+      expect(result.findings.map((item) => item.title)).toEqual(['Retain primary', 'Uncertain primary']);
+    } finally { testDb.close(); }
+  });
+
+  it('fails closed when escalation omits a primary decision', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete() {
+      return JSON.stringify({ reviewedPaths: paths, decisions: [], findings: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/escalation/i);
     } finally { testDb.close(); }
   });
 
@@ -2115,6 +2155,30 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('trims optional verifier context before reserving while keeping diff evidence', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let verifierRequest: CompleteRequest | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierRequest = req;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.' }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, content: 'context ' + 'x'.repeat(500_000) }],
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<Record<string, unknown>> };
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+      expect(payload.files[0]!.currentEvidence).toEqual(expect.arrayContaining([{ line: 1, kind: 'added', content: 'const token = request.token;' }]));
+      expect(reviewCostUpperBound(verifierRequest!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
+    } finally { testDb.close(); }
+  });
+
   it('anchors deletion-only hunks to post-change lines for head context', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -2172,8 +2236,9 @@ describe('staged review', () => {
         finding(1, 'Contradicted'), finding(20, 'Marginal', 'medium'),
       ] });
     } };
-    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete() {
-      return JSON.stringify({ reviewedPaths: paths, findings: [finding(1, 'Contradicted')] });
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete() {
       return JSON.stringify({

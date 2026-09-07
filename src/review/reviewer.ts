@@ -28,7 +28,7 @@ export type Verdict = 'approve' | 'comment' | 'request_changes';
 export type FindingCategory = 'correctness' | 'edge_case' | 'security' | 'test_gap' | 'repository_rule';
 export type FindingConfidence = 'high' | 'medium' | 'low';
 
-export function buildEscalationJsonSchema(paths: string[]): Record<string, unknown> {
+export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] = []): Record<string, unknown> {
   const stringEnum = (values: readonly string[]) => ({ type: 'string', enum: [...values] });
   const evidence = {
     type: 'object',
@@ -71,11 +71,18 @@ export function buildEscalationJsonSchema(paths: string[]): Record<string, unkno
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['reviewedPaths', 'findings'],
+    required: ['reviewedPaths', 'decisions', 'findings'],
     properties: {
       reviewedPaths: {
         type: 'array', minItems: paths.length, maxItems: paths.length,
         items: stringEnum(paths),
+      },
+      decisions: {
+        type: 'array', minItems: primaryIds.length, maxItems: primaryIds.length,
+        items: {
+          type: 'object', additionalProperties: false, required: ['id', 'decision'],
+          properties: { id: stringEnum(primaryIds), decision: stringEnum(['retain', 'reject', 'uncertain']) },
+        },
       },
       findings: { type: 'array', items: finding },
     },
@@ -651,6 +658,11 @@ function hunkContainsLine(file: DiffFile, hunkIndex: number, line: number): bool
   return hunk.lines.some((item) => item.newLine === line || item.oldLine === line);
 }
 
+/** Keep the first block: the reviewed file's bounded candidate windows come first. */
+function trimVerifierHeadContext(context: string): string {
+  return context.split(/\n\n(?=### )/, 2)[0] ?? context;
+}
+
 function headRelevantLines(file: DiffFile, hunks = file.hunks): number[] {
   return hunks.flatMap((hunk) => {
     const lines = hunk.lines.flatMap((line) => line.newLine === undefined ? [] : [line.newLine]);
@@ -793,6 +805,16 @@ export function buildFindingSummary(findings: Finding[]): string {
 function rootCauseMarker(finding: Finding): string {
   const cause = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title.trim()}`;
   return createHash('sha256').update(cause.replace(/\s+/g, ' ').toLowerCase()).digest('hex').slice(0, 16);
+}
+
+function primaryFindingIds(findings: Finding[]): string[] {
+  const counts = new Map<string, number>();
+  return findings.map((finding) => {
+    const base = `${rootCauseMarker(finding)}:${finding.path}:${findingLine(finding)}`;
+    const count = counts.get(base) ?? 0;
+    counts.set(base, count + 1);
+    return count ? `${base}:${count}` : base;
+  });
 }
 
 function verdictForFindings(findings: Finding[]): Verdict {
@@ -1458,6 +1480,35 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       });
       return hunks.length ? [{ ...file, hunks }] : [];
     });
+    const buildVerifierFiles = (candidateFindings: Finding[], trimOptionalContext: boolean) => files.flatMap((file) => {
+      const path = file.newPath ?? file.oldPath!;
+      const lines = candidateFindings.filter((finding) => finding.path === path).map(findingLine);
+      const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
+      if (!hunks.length) return [];
+      const headContext = buildHeadContext({
+        path, addedText: hunkText({ ...file, hunks }, Infinity),
+        relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents, exportsByPath,
+      });
+      return [{
+        path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
+        currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
+          line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
+        }])),
+        removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
+          line: line.oldLine, kind: 'removed', content: line.content,
+        }])),
+        headContext: trimOptionalContext ? trimVerifierHeadContext(headContext) : headContext,
+        ...(!trimOptionalContext && relevantContextByPath.get(path) ? { relevantContext: relevantContextByPath.get(path) } : {}),
+      }];
+    });
+    const verifierRequest = (candidateFindings: Finding[], trimOptionalContext = false): CompleteRequest => ({
+      system: VERIFIER_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: JSON.stringify({
+        rules, files: buildVerifierFiles(candidateFindings, trimOptionalContext),
+        findings: candidateFindings.map((finding, id) => ({ id, finding })),
+      }) }],
+      json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',
+    });
     if (escalationLlm && riskyFiles.length) {
       await assertHeadUnchanged();
       const paths = riskyFiles.map((file) => file.newPath ?? file.oldPath!);
@@ -1475,7 +1526,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           historical?: string;
         }>;
         rules?: string;
-        provisionalFindings: Finding[];
+        provisionalFindings: Array<{ id: string; finding: Finding }>;
       } = {
         prTitle: pr.title,
         prBody: pr.body,
@@ -1493,24 +1544,24 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           };
         }),
         ...(rules ? { rules } : {}),
-        provisionalFindings: findings.filter((finding) => riskyFiles.some((file) =>
-          (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding)))),
+        provisionalFindings: [],
       };
+      const primaryFindings = findings.filter((finding) => riskyFiles.some((file) =>
+        (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding))));
+      const primaryIds = primaryFindingIds(primaryFindings);
+      const primaryById = new Map(primaryIds.map((id, index) => [id, primaryFindings[index]!]));
+      escalationPayload.provisionalFindings = primaryFindings.map((finding, index) => ({ id: primaryIds[index]!, finding }));
       const escalationRequest = () => ({
         system: ESCALATION_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
-        json: true, jsonSchema: buildEscalationJsonSchema(paths), maxTokens: REVIEW_ESCALATION_MAX_OUTPUT,
+        json: true, jsonSchema: buildEscalationJsonSchema(paths, primaryIds), maxTokens: REVIEW_ESCALATION_MAX_OUTPUT,
         reviewBudget: budgeted, reviewStage: 'escalation',
       } satisfies CompleteRequest);
-      const verifierReserve = budgeted && verifierLlm ? reviewCostUpperBound({
-        system: VERIFIER_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify({
-          rules: escalationPayload.rules,
-          files: escalationPayload.files.map(({ path, status, diff, headContext, relevantContext }) => ({ path, status, diff, headContext, relevantContext })),
-          findings: escalationPayload.provisionalFindings.map((finding, id) => ({ id, finding })),
-        }) }],
-        json: true, maxTokens: 2000, reviewBudget: true, reviewStage: 'verification',
-      }) : 0;
+      const verifierReserve = budgeted && verifierLlm ? (() => {
+        const full = verifierRequest(primaryFindings);
+        const trimmed = verifierRequest(primaryFindings, true);
+        return reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? reviewCostUpperBound(full) : reviewCostUpperBound(trimmed);
+      })() : 0;
       const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
       const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
       let omitted = 0;
@@ -1533,6 +1584,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       if (!obj || !hasExactReviewedPaths(obj.reviewedPaths, paths)) {
         throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: reviewedPaths must contain exactly every selected path; no review was published.');
       }
+      const decisions = Array.isArray(obj.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
+      const decisionIds = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
+      if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision) ||
+          Object.keys(decision).some((key) => key !== 'id' && key !== 'decision')) ||
+          decisions.length !== primaryIds.length || new Set(decisionIds).size !== primaryIds.length ||
+          decisionIds.some((id) => typeof id !== 'string' || !primaryById.has(id)) ||
+          decisions.some((decision) => !['retain', 'reject', 'uncertain'].includes(String(decision.decision)))) {
+        throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: decisions must contain exactly one retain, reject, or uncertain decision for every primary finding; no review was published.');
+      }
       if (!Array.isArray(obj.findings) || obj.findings.some((finding: unknown) =>
         !finding || typeof finding !== 'object' || Array.isArray(finding) ||
         !paths.includes((finding as { path?: string }).path ?? ''))) {
@@ -1546,9 +1606,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       } catch (err) {
         throw new IncompleteResponseError(escalationLlm.name, `Invalid escalation response: ${errMessage(err)}`);
       }
-      findings = findings.filter((finding) => !riskyFiles.some((file) =>
-        (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding))));
-      findings.push(...escalated);
+      const rejected = new Set(decisions.filter((decision) => decision.decision === 'reject').map((decision) => primaryById.get(decision.id as string)));
+      findings = findings.filter((finding) => !rejected.has(finding));
+      findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary &&
+        primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
       findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     }
 
@@ -1577,30 +1638,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           warnings.push(`${path}: finding retrieval failed: ${errMessage(err)}`);
         }
       }
-      const verifierFiles = files.flatMap((file) => {
-        const path = file.newPath ?? file.oldPath!;
-        const lines = findings.filter((finding) => finding.path === path).map(findingLine);
-        const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
-        return hunks.length ? [{
-          path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
-          currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
-            line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
-          }])),
-          removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
-            line: line.oldLine, kind: 'removed', content: line.content,
-          }])),
-          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents, exportsByPath }),
-          relevantContext: relevantContextByPath.get(path) ?? '',
-        }] : [];
-      });
-      const call = await completeCall({
-        system: VERIFIER_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify({
-          rules, files: verifierFiles,
-          findings: findings.map((finding, id) => ({ id, finding })),
-        }) }],
-        json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',
-      }, verifierLlm);
+      const fullVerifierReq = verifierRequest(findings);
+      const verifierReq = !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd
+        ? fullVerifierReq : verifierRequest(findings, true);
+      const verifierPayload = JSON.parse(verifierReq.messages[0]!.content) as { files: VerifierContextFile[] };
+      const verifierFiles = verifierPayload.files;
+      const call = await completeCall(verifierReq, verifierLlm);
       if (call.failed) throw call.error;
       const obj = extractJson(call.raw!) as Record<string, unknown>;
       const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
