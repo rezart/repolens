@@ -128,6 +128,18 @@ describe('review context selection', () => {
     expect(context).toContain('80 | line-80');
     expect(context).toContain('320 | line-320');
     expect(context).not.toMatch(/(?:^|\n)1 \| line-1(?:\n|$)/);
+    expect(context.length).toBeLessThanOrEqual(12_000);
+  });
+
+  it('keeps endpoints when a relevant hunk spans many head lines', () => {
+    const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
+    const context = buildHeadContext({
+      path: 'src/large.ts', addedText: 'guard()',
+      headContents: new Map([['src/large.ts', lines.join('\n')]]),
+      relevantLines: Array.from({ length: 500 }, (_, index) => index + 100),
+    });
+    expect(context).toMatch(/(?:^|\n)100 \| line-100(?:\n|$)/);
+    expect(context).toMatch(/(?:^|\n)599 \| line-599(?:\n|$)/);
   });
 
   it('keeps matching definitions and callers while dropping unrelated chunks', () => {
@@ -1454,7 +1466,7 @@ describe('reviewPullRequest PR-head context', () => {
     expect(msg).toContain('export function helper(n: number) { return n + base; }');
   });
 
-  it('warns but completes when head content is oversized, missing or fails to fetch', async () => {
+  it('keeps oversized head content for bounded context, while warning only on fetch failures', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub(TWO_FILE_DIFF, PR, {
       headFiles: { 'src/a.ts': 'x'.repeat(60_001) },
@@ -1467,10 +1479,10 @@ describe('reviewPullRequest PR-head context', () => {
 
     expect(res.findings).toEqual([]);
     expect(llm.fileCalls()).toHaveLength(2);
-    expect(res.warnings.some((w) => w.includes('src/a.ts: post-change content skipped'))).toBe(true);
+    expect(res.warnings.some((w) => w.includes('src/a.ts: post-change content skipped'))).toBe(false);
     expect(res.warnings.some((w) => w.includes('src/b.ts: fetching post-change content failed: GitHub 502'))).toBe(true);
-    const msg = llm.fileCalls()[0]!.messages[0]!.content;
-    expect(msg).not.toContain('content after this pull request');
+    const msg = llm.fileCalls().find((call) => call.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
+    expect(msg).toContain('### src/a.ts (content after this pull request; bounded windows)');
   });
 
   it('logs, but does not warn, when a changed file has no content at the head sha', async () => {
@@ -1998,9 +2010,9 @@ describe('staged review', () => {
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       expect(req.reviewStage).toBe('verification');
-      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string } }> };
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string; path: string; line: number } }> };
       expect(payload.findings.map((item) => item.finding.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
-      return JSON.stringify({ decisions: payload.findings.map(({ id }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.' })), summary: 'Two supported issues remain.', verdict: 'approve' });
+      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: `The supplied code at ${item.path}:${item.line} demonstrates it.` })), summary: 'Two supported issues remain.', verdict: 'approve' });
     } };
     try {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false });
@@ -2026,6 +2038,7 @@ describe('staged review', () => {
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ relevantContext?: string }> };
       expect(payload.files[0]!.relevantContext).toContain('authorizeRequest');
+      expect(payload.files[0]!.relevantContext).toContain('caller invokes request');
       return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current guard rejects the input.' }], summary: 'No issue.', verdict: 'approve' });
     } };
     try {
@@ -2033,12 +2046,28 @@ describe('staged review', () => {
         db: testDb, llm: initial, verifierLlm,
         retrieve: async (request) => {
           queries.push(request.query);
-          return [{ ...CHUNK, path: 'src/auth.ts', content: 'authorizeRequest checks token' }];
+          return request.query.includes('authorizeRequest')
+            ? [{ ...CHUNK, chunkId: 2, path: 'src/auth.ts', content: 'authorizeRequest checks token' }]
+            : [{ ...CHUNK, chunkId: 3, path: 'src/caller.ts', content: 'caller invokes request' }];
         },
         github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       expect(queries).toContain('authorizeRequest');
       expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('rejects a supported verifier decision with an invented line citation', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Evidence at src/mixed.ts:999 proves it.' }], summary: 'Supported.', verdict: 'request_changes' });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('verification');
     } finally { testDb.close(); }
   });
 
@@ -2067,6 +2096,26 @@ describe('staged review', () => {
       expect(verifierFile.headContext).toContain('### src/large.ts (content after this pull request; bounded windows)');
       expect(verifierFile.headContext).toContain('35 | if (!request) return;');
       expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('anchors deletion-only hunks to post-change lines for head context', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const deletionDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -50 +49,0 @@\n-deletedGuard();\n`;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Initial.', verdict: 'request_changes', findings: [{ ...finding(50, 'Removed guard'), path: 'src/large.ts', evidence: { ...finding(50, 'Removed guard').evidence, path: 'src/large.ts' } }] });
+    } };
+    let verifierPayload: Record<string, unknown> | undefined;
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The deleted guard is no longer alleged.' }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    const head = Array.from({ length: 120 }, (_, index) => index === 48 ? 'afterGuard();' : `${'x'.repeat(120)}-${index + 1}`).join('\n');
+    try {
+      await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(deletionDiff, PR, { headFiles: { 'src/large.ts': head } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
+      expect(verifierFile.headContext).toContain('49 | afterGuard();');
     } finally { testDb.close(); }
   });
 
@@ -2114,7 +2163,7 @@ describe('staged review', () => {
       return JSON.stringify({
         decisions: [
           { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.' },
-          { id: 1, decision: 'supported', explanation: 'The code supports it, but confidence remains marginal.' },
+          { id: 1, decision: 'supported', explanation: 'The code at src/mixed.ts:20 supports it, but confidence remains marginal.' },
         ],
         summary: 'Two issues remain.', verdict: 'approve',
       });
@@ -2138,7 +2187,7 @@ describe('staged review', () => {
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
       return JSON.stringify({
-        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: 'Checked current evidence.' })),
+        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: item.title === 'Rejected finding' ? 'Checked current evidence.' : `Checked current evidence at ${item.path}:${item.line}.` })),
         summary: 'MODEL SUMMARY LEAK REJECTED finding and accepted finding.', verdict: 'request_changes',
       });
     } };

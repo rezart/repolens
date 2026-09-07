@@ -289,7 +289,7 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
 function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
   const pathTerms = stem.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
-  const symbols = [...new Set([...identifiers(changedText).slice(0, 3), ...pathTerms])]
+  const symbols = [...new Set([...identifiers(changedText).slice(0, 6), ...pathTerms])]
     .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
   return { stem, symbols };
 }
@@ -325,6 +325,18 @@ async function retrieveTargetedChunks(
   return selected.slice(0, 8);
 }
 
+function mergeRelevantChunks(original: RetrievedChunk[], focused: RetrievedChunk[], limit = 8): RetrievedChunk[] {
+  const unique = new Map<number, RetrievedChunk>();
+  for (const chunk of [...original.slice(0, Math.ceil(limit / 2)), ...focused]) unique.set(chunk.chunkId, chunk);
+  const selected = [...unique.values()].slice(0, limit);
+  const testChunk = [...original, ...focused].find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
+  if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
+    selected.pop();
+    selected.push(testChunk);
+  }
+  return selected;
+}
+
 /** Root and ancestor rule files that can apply to the changed paths. */
 export function repositoryRulePaths(changedPaths: string[]): string[] {
   const paths: string[] = [];
@@ -356,8 +368,6 @@ const CONTEXT_KEYWORDS = new Set([
 
 /** How many changed files RepoLens fetches the post-change content of. */
 const HEAD_FILES_MAX = 60;
-/** Files larger than this are not worth a prompt slot. */
-const HEAD_FILE_CHARS_MAX = 60_000;
 /** Concurrent `contents` requests. */
 const HEAD_FETCH_CONCURRENCY = 4;
 /** Per referenced file, inside the head-context section. */
@@ -367,7 +377,7 @@ const HEAD_CONTEXT_CHARS_MAX = 24_000;
 /** The reviewed file's own content is included in full only up to this size. */
 const OWN_HEAD_CHARS_MAX = 12_000;
 const OWN_HEAD_WINDOW_RADIUS = 20;
-const OWN_HEAD_WINDOW_LINES_MAX = 320;
+const OWN_HEAD_WINDOW_COUNT_MAX = 8;
 const OWN_HEAD_LINE_CHARS_MAX = 600;
 const RULE_FILES_MAX = 16;
 const RULE_REQUESTS_MAX = 128;
@@ -451,26 +461,43 @@ function headWindowBlock(path: string, content: string, relevantLines: number[])
   const points = [...new Set(relevantLines)].filter((line) => Number.isInteger(line) && line > 0 && line <= lines.length).sort((a, b) => a - b);
   if (!points.length) return headBlock(path, content, OWN_HEAD_CHARS_MAX);
 
-  const windows: Array<[number, number]> = [];
-  for (const line of points) {
-    const start = Math.max(1, line - OWN_HEAD_WINDOW_RADIUS);
-    const end = Math.min(lines.length, line + OWN_HEAD_WINDOW_RADIUS);
-    const previous = windows[windows.length - 1];
-    if (previous && start <= previous[1] + 1) previous[1] = Math.max(previous[1], end);
-    else windows.push([start, end]);
+  const anchors = points.length <= OWN_HEAD_WINDOW_COUNT_MAX
+    ? points
+    : Array.from({ length: OWN_HEAD_WINDOW_COUNT_MAX }, (_, index) => points[Math.round(index * (points.length - 1) / (OWN_HEAD_WINDOW_COUNT_MAX - 1))]!);
+  const windows: Array<{ start: number; end: number; anchor: number }> = [];
+  for (const line of anchors) {
+    windows.push({
+      start: Math.max(1, line - OWN_HEAD_WINDOW_RADIUS),
+      end: Math.min(lines.length, line + OWN_HEAD_WINDOW_RADIUS),
+      anchor: line,
+    });
   }
-  const perWindow = Math.max(1, Math.floor(OWN_HEAD_WINDOW_LINES_MAX / windows.length));
+  const overhead = `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n\`\`\``.length + (windows.length - 1) * 4;
+  const perWindowChars = Math.max(80, Math.floor((OWN_HEAD_CHARS_MAX - overhead) / windows.length));
   const rendered: string[] = [];
-  for (const [start, end] of windows) {
-    const center = Math.floor((start + end) / 2);
-    const radius = Math.min(OWN_HEAD_WINDOW_RADIUS, Math.floor((perWindow - 1) / 2));
-    const windowStart = Math.max(1, center - radius);
-    const windowEnd = Math.min(lines.length, windowStart + perWindow - 1);
-    if (rendered.length) rendered.push('...');
-    for (let line = windowStart; line <= windowEnd; line++) {
-      const text = lines[line - 1] ?? '';
-      rendered.push(`${line} | ${text.length > OWN_HEAD_LINE_CHARS_MAX ? `${text.slice(0, OWN_HEAD_LINE_CHARS_MAX)} ... (line truncated)` : text}`);
+  for (const window of windows) {
+    const nearby = [window.anchor];
+    for (let distance = 1; distance <= OWN_HEAD_WINDOW_RADIUS; distance++) {
+      if (window.anchor - distance >= window.start) nearby.push(window.anchor - distance);
+      if (window.anchor + distance <= window.end) nearby.push(window.anchor + distance);
     }
+    const selected = new Map<number, string>();
+    let used = 0;
+    for (const line of nearby) {
+      const prefix = `${line} | `;
+      const text = lines[line - 1] ?? '';
+      const room = perWindowChars - used - prefix.length - 1;
+      if (room < 0) break;
+      const value = text.length > Math.min(OWN_HEAD_LINE_CHARS_MAX, room)
+        ? `${text.slice(0, Math.min(OWN_HEAD_LINE_CHARS_MAX, room))} ... (line truncated)`
+        : text;
+      const output = `${prefix}${value}`;
+      if (used + output.length + 1 > perWindowChars) break;
+      selected.set(line, output);
+      used += output.length + 1;
+    }
+    if (rendered.length) rendered.push('...');
+    for (const line of [...selected.keys()].sort((a, b) => a - b)) rendered.push(selected.get(line)!);
   }
   return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n${rendered.join('\n')}\n\`\`\``;
 }
@@ -625,7 +652,48 @@ function hunkContainsLine(file: DiffFile, hunkIndex: number, line: number): bool
 }
 
 function headRelevantLines(file: DiffFile, hunks = file.hunks): number[] {
-  return hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.newLine === undefined ? [] : [line.newLine]));
+  return hunks.flatMap((hunk) => {
+    const lines = hunk.lines.flatMap((line) => line.newLine === undefined ? [] : [line.newLine]);
+    // A deletion-only hunk has no new-file lines; anchor it at the first
+    // post-change line so surrounding guards/exits remain inspectable.
+    if (!lines.length) return [Math.max(1, hunk.newStart)];
+    return lines[0] === lines[lines.length - 1] ? [lines[0]!] : [lines[0]!, lines[lines.length - 1]!];
+  });
+}
+
+type VerifierContextFile = {
+  path: string;
+  currentEvidence?: Array<{ line?: number }>;
+  headContext?: string;
+};
+
+/** Accept only citations that point at supplied post-change evidence. */
+export function hasValidVerifierCitation(decision: Record<string, unknown>, files: VerifierContextFile[]): boolean {
+  const cited = new Set<string>();
+  for (const file of files) {
+    for (const evidence of file.currentEvidence ?? []) {
+      if (Number.isInteger(evidence.line) && evidence.line! > 0) cited.add(`${file.path}:${evidence.line}`);
+    }
+    let currentPath = '';
+    for (const line of file.headContext?.split(/\r?\n/) ?? []) {
+      const heading = /^### ([^ ]+) \(content after this pull request/.exec(line);
+      if (heading) currentPath = heading[1]!;
+      const numbered = /^(\d+) \| /.exec(line);
+      if (numbered && currentPath === file.path) cited.add(`${file.path}:${Number(numbered[1])}`);
+    }
+  }
+  const evidence = decision.evidence;
+  const candidates = Array.isArray(evidence) ? evidence : evidence && typeof evidence === 'object' ? [evidence] : [];
+  for (const item of candidates) {
+    if (!item || typeof item !== 'object') continue;
+    const path = typeof (item as Record<string, unknown>).path === 'string' ? (item as Record<string, unknown>).path : '';
+    const line = typeof (item as Record<string, unknown>).line === 'number' ? (item as Record<string, unknown>).line : Number((item as Record<string, unknown>).line);
+    if (cited.has(`${path}:${line}`)) return true;
+  }
+  const explanation = typeof decision.explanation === 'string' ? decision.explanation : '';
+  const citation = /(?:^|[\s(`"'])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+):(\d+)(?=$|[\s)`"',.;])/g;
+  for (const match of explanation.matchAll(citation)) if (cited.has(`${match[1]}:${Number(match[2])}`)) return true;
+  return false;
 }
 
 export function parseFindings(raw: string, file: DiffFile): Finding[] {
@@ -1101,8 +1169,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
         if (content === null) {
           log(`review: ${path}: no post-change content at ${shortSha(pr.headSha)}`);
-        } else if (content.length > HEAD_FILE_CHARS_MAX) {
-          warnings.push(`${path}: post-change content skipped (${content.length} chars over the ${HEAD_FILE_CHARS_MAX} limit)`);
         } else {
           headContents.set(path, content);
         }
@@ -1206,10 +1272,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           log(`review: ${path}: no post-change content at ${shortSha(pr.headSha)}`);
           return;
         }
-        if (content.length > HEAD_FILE_CHARS_MAX) {
-          warnings.push(`${path}: post-change content skipped (${content.length} chars over the ${HEAD_FILE_CHARS_MAX} limit)`);
-          return;
-        }
         headContents.set(path, content);
       } catch (err) {
         const msg = `${path}: fetching post-change content failed: ${errMessage(err)}`;
@@ -1232,6 +1294,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     };
 
     const relevantContextByPath = new Map<string, string>();
+    const relevantChunksByPath = new Map<string, RetrievedChunk[]>();
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
@@ -1282,6 +1345,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
           const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
+          relevantChunksByPath.set(path, selected);
           relevantContextByPath.set(path, formatContext(selected));
           for (const chunk of selected) {
             if (seen.has(chunk.chunkId)) continue;
@@ -1347,7 +1411,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       try {
         // Excluding every changed path keeps pre-change chunks of this PR's files
         // out of the prompt; their post-change content is in `headContext` instead.
-        context = formatContext(await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths));
+        const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
+        relevantChunksByPath.set(path, selected);
+        context = formatContext(selected);
         relevantContextByPath.set(path, context);
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
@@ -1505,7 +1571,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         ].filter(Boolean).join(' ')).join('\n');
         try {
           const focused = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths, focusText);
-          if (focused.length) relevantContextByPath.set(path, formatContext(focused));
+          if (focused.length) {
+            const merged = mergeRelevantChunks(relevantChunksByPath.get(path) ?? [], focused);
+            relevantChunksByPath.set(path, merged);
+            relevantContextByPath.set(path, formatContext(merged));
+          }
         } catch (err) {
           warnings.push(`${path}: finding retrieval failed: ${errMessage(err)}`);
         }
@@ -1522,7 +1592,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
             line: line.oldLine, kind: 'removed', content: line.content,
           }])),
-          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), relevantLines: headRelevantLines(file, hunks), headContents, exportsByPath }),
+          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents, exportsByPath }),
           relevantContext: relevantContextByPath.get(path) ?? '',
         }] : [];
       });
@@ -1541,7 +1611,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       if (decisions.length !== findings.length || new Set(ids).size !== findings.length ||
           ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
           decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
-            typeof decision.explanation !== 'string' || !decision.explanation.trim())) {
+            typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
+            decision.decision === 'supported' && !hasValidVerifierCitation(decision, verifierFiles))) {
         throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
       }
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
