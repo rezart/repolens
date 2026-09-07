@@ -147,6 +147,12 @@ export interface ReviewResult {
   trace?: ReviewTrace;
 }
 
+export interface ReviewTraceFinding {
+  path: string;
+  line: number;
+  rootCauseMarker: string;
+}
+
 export interface ReviewTrace {
   version: 1;
   identity: { repoId: string; prNumber: number; headSha: string; baseSha: string; provider: string; model: string; config: { maxRetries: number; maxFiles: number } };
@@ -156,11 +162,12 @@ export interface ReviewTrace {
     hunks: Array<{ path: string; lines: number[] }>;
     omittedContext: number;
     calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string }>;
-    primaryFindings?: Finding[];
+    findingCount: number;
+    primaryFindings?: ReviewTraceFinding[];
     decisions?: Array<{ id: string | number; decision: string }>;
-    findings?: Finding[];
+    findings?: ReviewTraceFinding[];
   }>;
-  finalFindings: Finding[];
+  finalFindings: ReviewTraceFinding[];
 }
 
 export interface ReviewDeps {
@@ -660,6 +667,10 @@ function traceHunks(files: DiffFile[]): Array<{ path: string; lines: number[] }>
   }));
 }
 
+function traceFinding(finding: Finding): ReviewTraceFinding {
+  return { path: finding.path, line: findingLine(finding), rootCauseMarker: rootCauseMarker(finding) };
+}
+
 function withCorrection(req: CompleteRequest, validationError: string, allowedPathsAndLines: Array<{ path: string; lines: number[] }>): CompleteRequest {
   const content = req.messages[0]?.content ?? '';
   let payload: Record<string, unknown>;
@@ -1077,7 +1088,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const trace = traceCalls[traceIndex];
     if (trace) { trace.outcome = 'validation_error'; trace.failure = errMessage(error); }
   };
-  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>): Promise<T> => {
+  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean): Promise<T> => {
     const run = async (request: CompleteRequest) => {
       const call = await completeCall(request, provider);
       if (call.failed) {
@@ -1091,6 +1102,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       return await run(req);
     } catch (err) {
       if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError)) throw err;
+      if (!consumeRetryAllowance()) throw err;
       return run(withCorrection(req, errMessage(err), allowed));
     }
   };
@@ -1286,6 +1298,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let verifierExecuted = false;
     let verifierFindingsTrace: Finding[] = [];
     const maxRetries = deps.maxRetries ?? 3;
+    let retryAttemptsUsed = 0;
+    let correctiveRetryUsed = false;
+    const consumeRetryAllowance = (corrective = false): boolean => {
+      if (retryAttemptsUsed >= maxRetries || corrective && correctiveRetryUsed) return false;
+      retryAttemptsUsed++;
+      if (corrective) correctiveRetryUsed = true;
+      return true;
+    };
 
     const historyPathSet = new Set<string>();
     for (const file of files) {
@@ -1460,7 +1480,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       let providerIndex = 0;
       let lastRetryError: unknown;
       let attemptReq = req;
-      let correctedAttempt = false;
       const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
       for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
@@ -1489,8 +1508,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
           if (malformed) {
             markTraceValidation(traceIndex, err);
-            if (correctedAttempt || attempt >= maxRetries) throw err;
-            correctedAttempt = true;
+            if (!consumeRetryAllowance(true)) throw err;
             attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
             const previous = activeLlm.model;
             activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
@@ -1501,8 +1519,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           }
           const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
             err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
-          if (correctedAttempt) throw err;
-          if (!retryable || attempt >= maxRetries) {
+          if (correctiveRetryUsed) throw err;
+          if (!retryable || !consumeRetryAllowance()) {
             if (lastRetryError && /budget/i.test(errMessage(err))) {
               throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
             }
@@ -1512,7 +1530,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           attemptReq = req;
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
-          const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
+          const message = `${previous}: ${errMessage(err)}; retry ${retryAttemptsUsed}/${maxRetries} with ${activeLlm.model}`;
           warnings.push(message);
           log(`review: ${message}`);
         }
@@ -1724,7 +1742,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         return { decisions, escalated };
       };
       const escalationResult = await completeStructured(req, escalationLlm, parseEscalation,
-        riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })));
+        riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })),
+        () => consumeRetryAllowance(true));
       const { decisions, escalated } = escalationResult;
       escalationDecisionsTrace = decisions.map((decision) => ({ id: decision.id as string, decision: String(decision.decision) }));
       escalationFindingsTrace = escalated.slice();
@@ -1793,7 +1812,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
         return decisions;
       };
-      const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines);
+      const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines,
+        () => consumeRetryAllowance(true));
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
       verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
@@ -1809,7 +1829,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       hunks: traceHunks(selected),
       omittedContext,
       calls: traceCalls.filter((call) => call.stage === stage),
-      ...extra,
+      findingCount: extra.findings?.length ?? extra.primaryFindings?.length ?? 0,
+      ...(extra.primaryFindings ? { primaryFindings: extra.primaryFindings.map(traceFinding) } : {}),
+      ...(extra.decisions ? { decisions: extra.decisions } : {}),
+      ...(extra.findings ? { findings: extra.findings.map(traceFinding) } : {}),
     });
     const trace: ReviewTrace = {
       version: 1,
@@ -1820,7 +1843,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, findings: verifierFindingsTrace })] : []),
         traceStage('final', files, 0, { findings: findings.slice() }),
       ],
-      finalFindings: findings.slice(),
+      finalFindings: findings.map(traceFinding),
     };
 
     if (!repo.last_commit) {

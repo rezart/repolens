@@ -2450,6 +2450,49 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('does not correct malformed escalation output when retries are disabled', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let escalationCalls = 0;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      escalationCalls++;
+      return JSON.stringify({ reviewedPaths: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, maxRetries: 0, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('Invalid escalation response');
+      expect(escalationCalls).toBe(1);
+    } finally { testDb.close(); }
+  });
+
+  it('shares one corrective retry across escalation and verification', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    let escalationCalls = 0;
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      escalationCalls++;
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return escalationCalls === 1
+        ? JSON.stringify({ reviewedPaths: [] })
+        : JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    let verifierCalls = 0;
+    const verifier: LLMProvider = { ...initial, async complete() {
+      verifierCalls++;
+      return JSON.stringify({ decisions: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, verifierLlm: verifier, maxRetries: 1, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('Invalid verification response');
+      expect(escalationCalls).toBe(2);
+      expect(verifierCalls).toBe(1);
+    } finally { testDb.close(); }
+  });
+
   it('uses one corrective retry for malformed verifier citations with exact evidence lines', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -2495,8 +2538,15 @@ describe('staged review', () => {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       const stages = result.trace!.stages;
       expect(stages.map((stage) => stage.stage)).toEqual(['initial', 'escalation', 'verification', 'final']);
-      expect(stages.find((stage) => stage.stage === 'verification')!.findings).toEqual([added]);
+      expect(stages.find((stage) => stage.stage === 'verification')!.findings).toEqual([{ path: added.path, line: added.line, rootCauseMarker: expect.any(String) }]);
       expect(stages.find((stage) => stage.stage === 'verification')!.decisions).toEqual([{ id: 0, decision: 'supported' }]);
+      expect(stages.find((stage) => stage.stage === 'verification')!.findingCount).toBe(1);
+      const serialized = JSON.stringify(result.trace);
+      expect(serialized).toContain('rootCauseMarker');
+      expect(serialized).not.toContain(added.title);
+      expect(serialized).not.toContain(added.body);
+      expect(serialized).not.toContain(added.evidence!.trigger);
+      expect(serialized).not.toContain(added.evidence!.consequence);
     } finally { testDb.close(); }
   });
 });
