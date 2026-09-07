@@ -117,7 +117,14 @@ export class OpenRouterProvider implements LLMProvider {
     const body: Record<string, unknown> = { model: this.model, messages, usage: { include: true } };
     if (req.maxTokens !== undefined) body.max_tokens = req.maxTokens;
     if (req.temperature !== undefined) body.temperature = req.temperature;
-    if (req.json) body.response_format = { type: 'json_object' };
+    if (req.jsonSchema) {
+      body.response_format = {
+        type: 'json_schema',
+        json_schema: { name: 'repolens_escalation', strict: true, schema: req.jsonSchema },
+      };
+    } else if (req.json) {
+      body.response_format = { type: 'json_object' };
+    }
     if (this.effort) body.reasoning = { effort: this.effort };
     if (streaming) body.stream = true;
     // Every model uses the same token bounds and routing price caps below.
@@ -125,7 +132,7 @@ export class OpenRouterProvider implements LLMProvider {
       const maxOutput = req.reviewStage === 'escalation' ? REVIEW_ESCALATION_MAX_OUTPUT : REVIEW_MAX_OUTPUT;
       if (streaming || !Number.isInteger(req.maxTokens) ||
           req.maxTokens! <= 0 || req.maxTokens! > maxOutput || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
-        throw new ProviderError('openrouter', 'Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
+        throw new ProviderError('openrouter', 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       body.provider = {
         sort: 'price', require_parameters: true, allow_fallbacks: false,

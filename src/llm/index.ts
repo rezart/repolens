@@ -10,7 +10,7 @@ export { ClaudeCliProvider, flattenMessages, withJsonInstruction, JSON_INSTRUCTI
 export type { CliProviderOptions, ReasoningEffort } from './claude-cli.js';
 export { CodexCliProvider } from './codex-cli.js';
 export { ProviderError, completeStreaming } from './types.js';
-export type { ChatMessage, CompleteRequest, LLMProvider, OnDelta, Role } from './types.js';
+export type { ChatMessage, CompleteRequest, JsonSchema, LLMProvider, OnDelta, Role } from './types.js';
 export { extractJson, JsonExtractError } from './json.js';
 
 export interface CreateProviderOptions {

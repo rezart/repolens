@@ -43,8 +43,8 @@ const envSchema = z.object({
     .pipe(z.array(z.string().regex(/^[^\s,]+$/))),
   /** Extra attempts for failed batch reviews, within the total review budget. */
   REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
-  /** Strong model for high-risk hunk re-review; OpenRouter defaults to Kimi. */
-  REVIEW_ESCALATION_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('moonshotai/kimi-k2.7-code'),
+  /** Strong model for high-risk hunk re-review; OpenRouter defaults to GPT-5 Mini. */
+  REVIEW_ESCALATION_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('openai/gpt-5-mini'),
   /** Comma-separated repository-relative globs excluded from PR review. */
   REVIEW_IGNORE_PATTERNS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((p) => p.trim()) : [])
     .pipe(z.array(z.string().min(1).max(200).regex(/^[^,[\]]+$/))),

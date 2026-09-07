@@ -9,7 +9,7 @@ describe('loadConfig', () => {
     expect(c.embedding).toBeNull();
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
-    expect(c.review.escalationModel).toBe('moonshotai/kimi-k2.7-code');
+    expect(c.review.escalationModel).toBe('openai/gpt-5-mini');
   });
   it('trims the running image revision', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');

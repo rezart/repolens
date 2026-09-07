@@ -89,14 +89,14 @@ describe('OpenAIEmbeddings', () => {
     expect(JSON.parse(call.init.body as string)).toEqual({ model: 'text-embed', input: ['a', 'b'] });
   });
 
-  it('splits 150 texts into batches of 64/64/22 and concatenates in order', async () => {
+  it('splits 150 texts into batches of 32/32/32/32/22 and concatenates in order', async () => {
     const f = embeddingFetch();
     const e = new OpenAIEmbeddings({ baseUrl: 'http://x/v1', apiKey: 'k', model: 'm', fetch: f.fetch });
     const texts = Array.from({ length: 150 }, (_, i) => `t${i}`);
     const vectors = await e.embed(texts);
-    expect(f.calls).toHaveLength(3);
+    expect(f.calls).toHaveLength(5);
     const sizes = f.calls.map((c) => JSON.parse(c.init.body as string).input.length);
-    expect(sizes).toEqual([64, 64, 22]);
+    expect(sizes).toEqual([32, 32, 32, 32, 22]);
     expect(vectors).toHaveLength(150);
     // first component encodes the original index
     expect(vectors.map((v) => v[0])).toEqual(texts.map((_, i) => i));
@@ -210,8 +210,8 @@ describe('OpenAIEmbeddings', () => {
       onUsage: (r) => seen.push(r),
     });
     await e.embed(Array.from({ length: 130 }, (_, i) => `t${i}`));
-    expect(f.calls).toHaveLength(3);
-    expect(seen).toEqual([640, 640, 20].map((prompt) => ({
+    expect(f.calls).toHaveLength(5);
+    expect(seen).toEqual([320, 320, 320, 320, 20].map((prompt) => ({
       provider: 'embeddings',
       model: 'text-embed',
       inputTokens: prompt,

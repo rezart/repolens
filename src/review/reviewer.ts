@@ -31,6 +31,60 @@ export type Verdict = 'approve' | 'comment' | 'request_changes';
 export type FindingCategory = 'correctness' | 'edge_case' | 'security' | 'test_gap' | 'repository_rule';
 export type FindingConfidence = 'high' | 'medium' | 'low';
 
+export function buildEscalationJsonSchema(paths: string[]): Record<string, unknown> {
+  const stringEnum = (values: readonly string[]) => ({ type: 'string', enum: [...values] });
+  const evidence = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['path', 'line', 'trigger', 'consequence', 'rule'],
+    properties: {
+      path: stringEnum(paths),
+      line: { type: 'integer' },
+      trigger: { type: 'string' },
+      consequence: { type: 'string' },
+      rule: {
+        anyOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path', 'line', 'quote'],
+            properties: { path: { type: 'string' }, line: { type: 'integer' }, quote: { type: 'string' } },
+          },
+          { type: 'null' },
+        ],
+      },
+    },
+  };
+  const finding = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['path', 'line', 'severity', 'title', 'body', 'category', 'confidence', 'rootCause', 'evidence'],
+    properties: {
+      path: stringEnum(paths),
+      line: { type: 'integer' },
+      severity: stringEnum(['critical', 'warning', 'nit']),
+      title: { type: 'string' },
+      body: { type: 'string' },
+      category: stringEnum(['correctness', 'edge_case', 'security', 'test_gap', 'repository_rule']),
+      confidence: stringEnum(['high', 'medium', 'low']),
+      rootCause: { type: 'string' },
+      evidence,
+    },
+  };
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['reviewedPaths', 'findings'],
+    properties: {
+      reviewedPaths: {
+        type: 'array', minItems: paths.length, maxItems: paths.length,
+        items: stringEnum(paths),
+      },
+      findings: { type: 'array', items: finding },
+    },
+  };
+}
+
 export interface FindingEvidence {
   path: string;
   line: number;
@@ -259,7 +313,7 @@ async function retrieveTargetedChunks(
   if (!queries.length) queries.push(targeted.stem || path);
   const chunksById = new Map<number, RetrievedChunk>();
   for (const query of queries) {
-    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths, lexicalOnly: true })) chunksById.set(chunk.chunkId, chunk);
+    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths })) chunksById.set(chunk.chunkId, chunk);
   }
   const relevant = selectRelevantChunks([...chunksById.values()], [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
   const selected = relevant.slice(0, 8);
@@ -789,7 +843,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
     if (req.reviewBudget && reservedUsd + estimate > REVIEW_MAX_USD) {
-      throw new Error(`Review stage exceeds the remaining $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
+      throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
     reservedUsd += estimate;
     const call = { reported: false, costUsd: 0 as number | null };
@@ -811,7 +865,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       reservedUsd += call.costUsd! - estimate;
     }
     if (req.reviewBudget && reservedUsd > REVIEW_MAX_USD) {
-      return { raw, error: new Error(`Review exceeds the $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null };
+      return { raw, error: new Error(`Review exceeds the $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null };
     }
     return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null };
   };
@@ -1133,7 +1187,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       // Reject the core prompt before the retrieval loop or any inference call.
       const coreCost = reviewCostUpperBound(req);
       if (coreCost > REVIEW_MAX_USD) {
-        throw new Error('Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
+        throw new Error('Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       // Reserve half the ceiling for one retry while keeping the full core diff.
       const optionalContextBudget = maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
@@ -1173,7 +1227,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
         }
       }
-      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
+      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.50; all file diffs included.`);
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let providerIndex = 0;
@@ -1282,33 +1336,82 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (escalationLlm && riskyFiles.length) {
       await assertHeadUnchanged();
       const paths = riskyFiles.map((file) => file.newPath ?? file.oldPath!);
-      const escalationPayload = {
+      const escalationPayload: {
+        prTitle: string;
+        prBody: string;
+        files: Array<{
+          path: string;
+          status: string;
+          risk: ChangeRisk;
+          diff: string;
+          allowedFindingLines: number[];
+          headContext?: string;
+          relevantContext?: string;
+          historical?: string;
+        }>;
+        rules?: string;
+        provisionalFindings: Finding[];
+      } = {
         prTitle: pr.title,
         prBody: pr.body,
         files: riskyFiles.map((file) => {
           const path = file.newPath ?? file.oldPath!;
+          const headContext = buildHeadContext({ path, addedText: hunkText(file, Infinity), headContents, exportsByPath });
+          const relevantContext = relevantContextByPath.get(path) ?? '';
+          const historical = renderHistoricalContext(historyFor(file.oldPath, file.newPath));
           return {
             path, status: file.status, risk: assessChange(file), diff: hunkText(file, Infinity),
             allowedFindingLines: [...allowedFindingLines(file)].sort((a, b) => a - b),
-            headContext: buildHeadContext({ path, addedText: hunkText(file, Infinity), headContents, exportsByPath }),
-            relevantContext: relevantContextByPath.get(path) ?? '',
-            historical: renderHistoricalContext(historyFor(file.oldPath, file.newPath)),
+            ...(headContext ? { headContext } : {}),
+            ...(relevantContext ? { relevantContext } : {}),
+            ...(historical ? { historical } : {}),
           };
         }),
-        rules,
+        ...(rules ? { rules } : {}),
         provisionalFindings: findings.filter((finding) => riskyFiles.some((file) =>
           (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding)))),
       };
-      const call = await completeCall({
+      const escalationRequest = () => ({
         system: ESCALATION_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
-        json: true, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'escalation',
-      }, escalationLlm);
+        json: true, jsonSchema: buildEscalationJsonSchema(paths), maxTokens: REVIEW_ESCALATION_MAX_OUTPUT,
+        reviewBudget: budgeted, reviewStage: 'escalation',
+      } satisfies CompleteRequest);
+      const verifierReserve = budgeted && verifierLlm ? reviewCostUpperBound({
+        system: VERIFIER_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: JSON.stringify({
+          rules: escalationPayload.rules,
+          files: escalationPayload.files.map(({ path, status, diff, headContext, relevantContext }) => ({ path, status, diff, headContext, relevantContext })),
+          findings: escalationPayload.provisionalFindings.map((finding, id) => ({ id, finding })),
+        }) }],
+        json: true, maxTokens: 2000, reviewBudget: true, reviewStage: 'verification',
+      }) : 0;
+      const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
+      const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
+      let omitted = 0;
+      let req = escalationRequest();
+      while (reviewCostUpperBound(req) > remaining && optionalFields.length) {
+        const field = optionalFields.shift()!;
+        if (field === 'rules') delete escalationPayload.rules;
+        else for (const file of escalationPayload.files) delete file[field];
+        omitted++;
+        req = escalationRequest();
+      }
+      const escalationEstimate = reviewCostUpperBound(req);
+      if (escalationEstimate > remaining) {
+        throw new Error(`Escalation core exceeds the remaining $0.50 review budget; reserved $${reservedUsd.toFixed(6)}, verifier reserve $${verifierReserve.toFixed(6)}, core $${escalationEstimate.toFixed(6)}; no review was published.`);
+      }
+      if (omitted) warnings.push(`Escalation omitted ${omitted} optional context block${omitted === 1 ? '' : 's'} to stay within the remaining review budget; risky diff hunks were preserved.`);
+      const call = await completeCall(req, escalationLlm);
       if (call.failed) throw call.error;
       const obj = extractJson(call.raw!) as Record<string, unknown>;
-      if (!obj || !Array.isArray(obj.findings) || !hasExactReviewedPaths(obj.reviewedPaths, paths) ||
-          obj.findings.some((finding: unknown) => !finding || typeof finding !== 'object' || !paths.includes((finding as { path?: string }).path ?? ''))) {
-        throw new IncompleteResponseError(escalationLlm.name, 'Incomplete escalation response; no review was published.');
+      if (!obj || !hasExactReviewedPaths(obj.reviewedPaths, paths)) {
+        throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: reviewedPaths must contain exactly every selected path; no review was published.');
+      }
+      if (!Array.isArray(obj.findings) || obj.findings.some((finding: unknown) =>
+        !finding || typeof finding !== 'object' || Array.isArray(finding) ||
+        !paths.includes((finding as { path?: string }).path ?? ''))) {
+        throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: findings must be objects whose path is one of the selected paths; no review was published.');
       }
       let escalated: Finding[];
       try {

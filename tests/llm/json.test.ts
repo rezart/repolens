@@ -14,6 +14,10 @@ describe('extractJson', () => {
   it('skips a false opener and finds the real object', () => {
     expect(extractJson('notes { unbalanced\n{"ok":true}')).toEqual({ ok: true });
   });
+  it('prefers valid outer JSON when a finding body contains a fenced snippet', () => {
+    const response = JSON.stringify({ findings: [{ body: 'Example:\n```json\n[1,2]\n```' }] });
+    expect(extractJson(response)).toEqual(JSON.parse(response));
+  });
   it('throws when no json is present', () => {
     expect(() => extractJson('nothing here')).toThrow(JsonExtractError);
   });

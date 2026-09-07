@@ -5,11 +5,15 @@ export interface ChatMessage {
   content: string;
 }
 
+export type JsonSchema = Record<string, unknown>;
+
 export interface CompleteRequest {
   system?: string;
   messages: ChatMessage[];
   /** Ask the model for a single JSON object. Callers parse with extractJson(). */
   json?: boolean;
+  /** Optional strict JSON schema for providers that support structured output. */
+  jsonSchema?: JsonSchema;
   maxTokens?: number;
   temperature?: number;
   /** Single-attempt review budget; disables retries and caps routing prices. */

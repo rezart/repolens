@@ -479,10 +479,10 @@ describe('reviewPullRequest', () => {
 
   it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => { throw new Error('must not call'); } };
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(150000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(500000)));
     let retrievals = 0;
     const retrieve: RetrieveFn = async () => { retrievals++; return [CHUNK]; };
-    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.25');
+    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.50');
     expect(retrievals).toBe(0);
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
@@ -612,7 +612,7 @@ describe('reviewPullRequest', () => {
   });
 
   it('stops retries when the next attempt would exceed the total review budget', async () => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800000)));
     let reserved = 0;
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async (req: CompleteRequest) => {
@@ -688,7 +688,7 @@ describe('reviewPullRequest', () => {
     { name: 'Infinity', costs: [Number.POSITIVE_INFINITY, 0.02] },
     { name: 'aggregate overflow', costs: [Number.MAX_VALUE, Number.MAX_VALUE] },
   ])('keeps a full reservation for $name billing', async ({ costs }) => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
     const record = { provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 };
@@ -706,7 +706,7 @@ describe('reviewPullRequest', () => {
   });
 
   it.each([0, 0.02])('reconciles cheap invalid calls billed at %s across model fallback', async (costUsd) => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     const models: string[] = [];
     const provider = (model: string): LLMProvider => ({
@@ -742,8 +742,8 @@ describe('reviewPullRequest', () => {
     expect(calls).toBe(maxRetries + 1);
   });
 
-  it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.3, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+  it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.5, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
     const llm = { ...fakeLlm().provider, supportsBatchReview: true, async complete() {
@@ -897,7 +897,7 @@ describe('reviewPullRequest', () => {
   });
 
   it('reserves failed primary calls against the fallback budget', async () => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800000)));
     let calls = 0;
     const fetch: typeof globalThis.fetch = async () => { calls++; return new Response('unavailable', { status: 503 }); };
     const fallback = new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder-next', fetch });
@@ -1851,6 +1851,105 @@ describe('staged review', () => {
     rootCause: title, evidence: { path: 'src/mixed.ts', line, trigger: `${title} trigger`, consequence: `${title} consequence` },
   });
 
+  it('trims escalation context after an unknown-cost initial failure while keeping risky hunks', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const tracker = new UsageTracker({ db: testDb, pricing: null });
+    const initialResponse = JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    const calls: CompleteRequest[] = [];
+    const primary: LLMProvider = { name: 'openrouter', model: 'primary', concurrency: 1, supportsBatchReview: true, async complete() {
+      return 'not JSON';
+    } };
+    const fallback: LLMProvider = { name: 'openrouter', model: 'fallback', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'fallback', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+      calls.push(req);
+      return initialResponse;
+    } };
+    (primary as { reviewFallbacks?: readonly LLMProvider[] }).reviewFallbacks = [fallback];
+    const escalation: LLMProvider = { name: 'openrouter', model: 'strong', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'strong', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, findings: [] });
+    } };
+    const retrieve: RetrieveFn = async () => [{ ...CHUNK, content: `request token ${'x'.repeat(500_000)}` }];
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: primary, escalationLlm: escalation, retrieve,
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const escalationRequest = calls.find((call) => call.reviewStage === 'escalation')!;
+      const payload = JSON.parse(escalationRequest.messages[0]!.content) as { files: Array<Record<string, unknown>>; rules?: string };
+      expect(payload.files[0]).toMatchObject({ path: 'src/mixed.ts', status: 'modified', allowedFindingLines: [1] });
+      expect(payload.files[0]!.diff).toContain('request.token');
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+      expect(escalationRequest.jsonSchema).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        required: ['reviewedPaths', 'findings'],
+        properties: {
+          reviewedPaths: { minItems: paths.length, maxItems: paths.length, items: { enum: paths } },
+          findings: { items: { additionalProperties: false, properties: { path: { enum: paths } } } },
+        },
+      });
+      const schema = escalationRequest.jsonSchema as Record<string, any>;
+      const evidence = schema.properties.findings.items.properties.evidence;
+      expect(evidence).toMatchObject({ additionalProperties: false, required: ['path', 'line', 'trigger', 'consequence', 'rule'] });
+      expect(evidence.properties.path.enum).toEqual(paths);
+      expect(evidence.properties.rule.anyOf).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'null' }),
+        expect.objectContaining({ type: 'object', additionalProperties: false }),
+      ]));
+      expect(reviewCostUpperBound(escalationRequest) + 0.01).toBeLessThanOrEqual(REVIEW_MAX_USD);
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('reports reviewedPaths validation separately for an escalation response', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'initial', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      return JSON.stringify({ reviewedPaths: [], findings: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: async () => [], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/reviewedPaths/);
+    } finally { testDb.close(); }
+  });
+
+  it('reports finding path shape validation separately for an escalation response', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'initial', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [{}] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: async () => [], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/finding.*path|findings.*path/i);
+    } finally { testDb.close(); }
+  });
+
+  it('fails before escalation inference when its core hunks cannot fit the remaining budget', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const largeDiff = diff.replace('+const token = request.token;', `+const token = request.token;${'x'.repeat(400_000)}`);
+    const initial: LLMProvider = { name: 'openrouter', model: 'initial', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    } };
+    let escalationCalls = 0;
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      escalationCalls++;
+      return JSON.stringify({ reviewedPaths: paths, findings: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: async () => [], github: fakeGithub(largeDiff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/escalation.*budget|budget.*escalation/i);
+      expect(escalationCalls).toBe(0);
+    } finally { testDb.close(); }
+  });
+
   it('rechecks only risky hunks, replaces their findings, and verifies every provisional finding', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -1973,7 +2072,7 @@ describe('staged review', () => {
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     const tracker = new UsageTracker({ db: testDb, pricing: null });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.24 });
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.44 });
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
     } };
     let strongCalls = 0;

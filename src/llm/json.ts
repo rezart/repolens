@@ -10,6 +10,12 @@ export class JsonExtractError extends Error {
  * Tolerates markdown fences and surrounding prose.
  */
 export function extractJson(text: string): unknown {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed !== null && typeof parsed === 'object') return parsed;
+  } catch {
+    // Recover from markdown fences or surrounding prose below.
+  }
   const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
   const candidates = fenced ? [fenced[1], text] : [text];
   for (const c of candidates) {
