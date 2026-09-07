@@ -508,20 +508,21 @@ export function buildReviewBody(input: {
   skippedFiles?: string[];
   lineage?: Pick<Lineage, 'reviewNumber' | 'previous'>;
 }): string {
+  const findings = selectPostedFindings(input.findings);
   const counts = { critical: 0, warning: 0, nit: 0 };
-  for (const f of input.findings) counts[f.severity]++;
+  for (const f of findings) counts[f.severity]++;
   const parts: string[] = ['## RepoLens review', '', input.summary.trim(), ''];
   parts.push(
-    `**Verdict:** ${input.verdict} · **Findings:** ${input.findings.length} (${counts.critical} critical, ${counts.warning} warnings, ${counts.nit} nits)`,
+    `**Verdict:** ${input.verdict} · **Findings:** ${findings.length} (${counts.critical} critical, ${counts.warning} warnings, ${counts.nit} nits)`,
   );
-  if (input.findings.length) {
+  if (findings.length) {
     parts.push('');
     parts.push('| Severity | File | Title |');
     parts.push('| --- | --- | --- |');
-    for (const f of input.findings) {
+    for (const f of findings) {
       parts.push(`| ${f.severity} | ${f.path}:${f.line} | ${escapeCell(f.title)} |`);
     }
-    const bodyFindings = input.findings.filter((f) => f.line === 0);
+    const bodyFindings = findings.filter((f) => f.line === 0);
     if (bodyFindings.length) {
       parts.push('');
       parts.push('### Findings without an inline location');
@@ -643,26 +644,50 @@ export function parseFindings(raw: string, file: DiffFile): Finding[] {
   return out;
 }
 
-/** Select the comments to send to GitHub while retaining all findings for status and storage. */
-export function selectPostedFindings(findings: Finding[], limit = 3): Finding[] {
+function findingGroups(findings: Finding[]): Map<string, Finding[]> {
   const groups = new Map<string, Finding[]>();
-  for (const finding of findings) {
+  for (const finding of findings.filter((finding) => finding.category !== 'test_gap')) {
     const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
     const group = groups.get(key);
     if (group) group.push(finding);
     else groups.set(key, [finding]);
   }
+  return groups;
+}
+
+function canonicalFindings(findings: Finding[]): Finding[] {
+  const groups = findingGroups(findings);
   const rank = (f: Finding) => severityRank(f.severity);
   const representative = (group: Finding[]) => [...group].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.line - b.line || a.title.localeCompare(b.title))[0]!;
   return [...groups.entries()]
     .map(([key, group]) => ({ key, group, finding: representative(group) }))
     .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || a.key.localeCompare(b.key))
-    .slice(0, Math.max(0, limit))
-    .map(({ group, finding }) => {
-      const related = group.filter((other) => other !== finding && other.line > 0);
-      if (!related.length) return finding;
-      return { ...finding, body: `${finding.body}\n\nRelated locations: ${related.map((other) => `${other.path}:${other.line}`).join(', ')}` };
-    });
+    .map(({ finding }) => finding);
+}
+
+/** Select one deterministic, non-test-gap finding per root cause for publication. */
+export function selectPostedFindings(findings: Finding[]): Finding[] {
+  const groups = findingGroups(findings);
+  const canonical = canonicalFindings(findings);
+  return canonical.map((finding) => {
+    const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+    const group = groups.get(key) ?? [];
+    const related = group.filter((other) => other !== finding && other.line > 0);
+    if (!related.length) return finding;
+    return { ...finding, body: `${finding.body}\n\nRelated locations: ${related.map((other) => `${other.path}:${other.line}`).join(', ')}` };
+  });
+}
+
+const NO_FINDINGS_SUMMARY = 'The review found no actionable issues in the supplied changes.';
+
+export function buildFindingSummary(findings: Finding[]): string {
+  if (!findings.length) return NO_FINDINGS_SUMMARY;
+  const counts = { critical: 0, warning: 0, nit: 0 };
+  for (const finding of findings) counts[finding.severity]++;
+  const count = findings.length === 1 ? '1 actionable issue' : `${findings.length} actionable issues`;
+  const severity = Object.entries(counts).filter(([, n]) => n > 0).map(([name, n]) => `${n} ${name}`).join(', ');
+  const details = findings.map((finding) => `${finding.title} (${finding.path}:${finding.line || 'body'})`).join('; ');
+  return `The review found ${count} (${severity}): ${details}.`;
 }
 
 function rootCauseMarker(finding: Finding): string {
@@ -766,11 +791,12 @@ interface PostContext {
 async function postReview(ctx: PostContext, result: ReviewResult): Promise<void> {
   const { db, github, llm, repo, pr, log } = ctx;
   const warnings = result.warnings;
+  const publishedFindings = selectPostedFindings(result.findings);
 
   let body = buildReviewBody({
     summary: result.summary,
     verdict: result.verdict,
-    findings: result.findings,
+    findings: publishedFindings,
     providerName: llm.name,
     model: llm.model,
     skippedFiles: result.skippedFiles,
@@ -782,7 +808,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
   }
 
   // Drop findings that were already commented on an earlier run (e.g. a `synchronize` event).
-  let comments = result.findings;
+  let comments = publishedFindings;
   try {
     const existing = await github.listReviewComments(repo.owner, repo.name, result.prNumber);
     const existingMarkers = new Set(existing.flatMap((comment) => [...comment.body.matchAll(/repolens-root-cause:([a-f0-9]{16})/g)].map((match) => match[1]!)));
@@ -815,7 +841,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
       commitId: pr.headSha,
       body,
       event: result.verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT',
-      comments: selectPostedFindings(comments.filter((f) => f.line > 0)).map((f) => ({
+      comments: comments.filter((f) => f.line > 0).map((f) => ({
         path: f.path,
         line: f.line,
         body: postedFindingBody(f),
@@ -930,13 +956,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       } catch {
         findings = [];
       }
-      findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings);
+      findings = canonicalFindings(await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings));
       const cachedResult: ReviewResult = {
         reviewId: cached.id,
         prNumber: cached.pr_number,
         headSha: cached.head_sha,
-        summary: cached.summary ?? '',
-        verdict: toVerdict(cached.verdict) ?? 'comment',
+        summary: buildFindingSummary(findings),
+        verdict: findings.some((finding) => finding.severity === 'critical') ? 'request_changes' : findings.length ? 'comment' : 'approve',
         findings,
         posted: cached.posted === 1,
         skippedFiles: [],
@@ -1480,6 +1506,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       stagedSummary = findings.length ? summary : 'The review found no actionable issues in the supplied changes.';
       stagedVerdict = verdict;
     }
+    findings = canonicalFindings(findings);
     const hasCritical = findings.some((f) => f.severity === 'critical');
 
     await assertHeadUnchanged();
@@ -1522,7 +1549,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       log(`review: ${msg}`);
       throw new Error(`summary review failed: ${errMessage(err)}`);
     }
-    if (stagedSummary) verdict = hasCritical ? 'request_changes' : findings.length ? 'comment' : 'approve';
+    summary = buildFindingSummary(findings);
+    if (!findings.length) verdict = 'approve';
+    else if (stagedSummary) verdict = hasCritical ? 'request_changes' : 'comment';
     else if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
 
     if (!repo.last_commit) {

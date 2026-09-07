@@ -35,7 +35,7 @@ import {
 } from '../../src/review/reviewer.js';
 
 describe('review finding posting', () => {
-  it('keeps at most three root causes and folds related locations into the strongest comment', () => {
+  it('keeps one representative per root cause and folds related locations into the strongest comment', () => {
     const finding = (path: string, line: number, severity: Finding['severity'], rootCause: string): Finding => ({
       path, line, severity, title: `${rootCause} at ${path}`, body: 'Fix it.', rootCause,
       category: 'correctness', confidence: 'high', evidence: { path, line, trigger: 'input', consequence: 'failure' },
@@ -44,10 +44,20 @@ describe('review finding posting', () => {
       finding('a.ts', 1, 'warning', 'shared'), finding('b.ts', 2, 'critical', 'shared'),
       finding('c.ts', 3, 'warning', 'second'), finding('d.ts', 4, 'nit', 'third'), finding('e.ts', 5, 'warning', 'fourth'),
     ]);
-    expect(selected).toHaveLength(3);
+    expect(selected).toHaveLength(4);
     expect(selected[0]).toMatchObject({ path: 'b.ts', line: 2, rootCause: 'shared' });
     expect(selected[0]!.body).toContain('Related locations: a.ts:1');
-    expect(selected.map((f) => f.rootCause)).toEqual(['shared', 'second', 'fourth']);
+    expect(selected.map((f) => f.rootCause)).toEqual(['shared', 'second', 'fourth', 'third']);
+  });
+
+  it('suppresses test gaps but keeps real findings in test files', () => {
+    const finding = (category: Finding['category'], title: string): Finding => ({
+      path: 'tests/app.test.ts', line: 4, severity: 'warning', title, body: 'Details.', rootCause: title,
+      category, confidence: 'high', evidence: { path: 'tests/app.test.ts', line: 4, trigger: 'input', consequence: 'failure' },
+    });
+    expect(selectPostedFindings([
+      finding('test_gap', 'Missing coverage'), finding('correctness', 'Test crashes'),
+    ]).map((item) => item.title)).toEqual(['Test crashes']);
   });
 });
 
@@ -97,7 +107,7 @@ describe('fresh finding evidence validation', () => {
     const secondGithub = fakeGithub(DIFF, PR, { existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
     const second = await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: secondGithub.github }, { repoId: REPO_ID, prNumber: 42, force: true });
     expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
-    expect(second.warnings).toContain('Skipped 2 findings already commented');
+    expect(second.warnings).toContain('Skipped 1 findings already commented');
     ruleDb.close();
   });
 });
@@ -545,7 +555,7 @@ describe('reviewPullRequest', () => {
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
     expect(calls).toBe(4);
     expect(result.posted).toBe(true);
-    expect(result.summary).toBe('Reviewed all changes.');
+    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(gh.reviews).toHaveLength(1);
   });
 
@@ -645,7 +655,7 @@ describe('reviewPullRequest', () => {
       historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
     });
     const result = await reviewPullRequest({ db, llm: primary, retrieve: async () => [{ ...CHUNK, content: 'x'.repeat(300_000) }], github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(result.summary).toBe('Complete.');
+    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(calls).toHaveLength(2);
     const primaryContent = calls[0]!.messages[0]!.content;
     expect(calls[1]!.messages[0]!.content).toBe(primaryContent);
@@ -1514,7 +1524,7 @@ describe('reviewPullRequest lineage', () => {
     expect(calls[0]!.system).not.toContain('what the pull request changes');
     expect(calls[0]!.messages[0]!.content).not.toContain('Original PR overview.');
     expect(calls[0]!.messages[0]!.content).toContain('if (n === 0) return;');
-    expect(gh.reviews[0]!.input.body).toContain('Since the previous review, the condition now checks equality.');
+    expect(gh.reviews[0]!.input.body).toContain('The review found no actionable issues in the supplied changes.');
   });
 
   it('reads overview docs at the base sha and puts them in the file prompt', async () => {
@@ -1979,7 +1989,7 @@ describe('staged review', () => {
       expect(escalationCalls[0]!.messages[0]!.content).toContain('request.token');
       expect(escalationCalls[0]!.messages[0]!.content).not.toContain('+newCall();');
       expect(result.findings.map((item) => item.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
-      expect(result.summary).toBe('Two supported issues remain.');
+      expect(result.summary).toContain('The review found 2 actionable issues');
       expect(result.verdict).toBe('comment');
     } finally { testDb.close(); }
   });
@@ -2064,6 +2074,32 @@ describe('staged review', () => {
       expect(result.findings).toEqual([]);
       expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
       expect(result.verdict).toBe('approve');
+    } finally { testDb.close(); }
+  });
+
+  it('does not publish a verifier-rejected finding in the summary or review body', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial stale summary mentions REJECTED finding.', verdict: 'request_changes', findings: [
+        finding(1, 'Rejected finding'), finding(20, 'Accepted finding'),
+      ] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return JSON.stringify({
+        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: 'Checked current evidence.' })),
+        summary: 'MODEL SUMMARY LEAK REJECTED finding and accepted finding.', verdict: 'request_changes',
+      });
+    } };
+    const gh = fakeGithub(diff);
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+      expect(result.findings.map((item) => item.title)).toEqual(['Accepted finding']);
+      expect(result.summary).not.toContain('Rejected finding');
+      expect(result.summary).not.toContain('MODEL SUMMARY LEAK');
+      expect(gh.reviews[0]!.input.body).not.toContain('Rejected finding');
+      expect(gh.reviews[0]!.input.body).toContain('Accepted finding');
     } finally { testDb.close(); }
   });
 
