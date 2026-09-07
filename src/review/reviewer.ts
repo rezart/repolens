@@ -1558,9 +1558,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         reviewBudget: budgeted, reviewStage: 'escalation',
       } satisfies CompleteRequest);
       const verifierReserve = budgeted && verifierLlm ? (() => {
-        const full = verifierRequest(primaryFindings);
-        const trimmed = verifierRequest(primaryFindings, true);
-        return reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? reviewCostUpperBound(full) : reviewCostUpperBound(trimmed);
+        const full = verifierRequest(findings);
+        const trimmed = verifierRequest(findings, true);
+        const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
+        // ponytail: reserve four UTF-8 bytes per possible escalation output token;
+        // replace with provider tokenization if added-finding payloads need tighter packing.
+        reserve.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
+        return reviewCostUpperBound(reserve);
       })() : 0;
       const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
       const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];

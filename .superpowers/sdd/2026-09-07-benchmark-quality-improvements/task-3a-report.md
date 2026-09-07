@@ -23,3 +23,11 @@
 
 - Stable IDs are deterministic hashes of root cause/path/line, with an occurrence suffix for duplicate primary findings; they are scoped to a review response.
 - Optional verifier context is retained when it fits the remaining cap; under pressure, relevant retrieval context is dropped and the first head-context block (candidate windows) is preserved.
+
+## Follow-up review fixes
+
+- Verifier reservation now starts from all current findings, not only risky primary findings, and reserves a bounded allowance for the escalation response's possible added findings before permitting escalation.
+- Added explicit duplicate-ID and unknown-ID regression cases alongside the missing-ID case.
+- `npx vitest run tests/review/reviewer.test.ts -t 'primary decision ID' --reporter=verbose` — 3 tests passed.
+- `npx vitest run tests/review/reviewer.test.ts -t 'staged review' --reporter=dot` — 19 tests passed.
+- `npm run typecheck` and `git diff --check` — passed.

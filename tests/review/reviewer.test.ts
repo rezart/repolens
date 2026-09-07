@@ -2069,14 +2069,17 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
-  it('fails closed when escalation omits a primary decision', async () => {
+  it.each(['missing', 'duplicate', 'unknown'] as const)('fails closed when escalation has an %s primary decision ID', async (failure) => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
     } };
-    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete() {
-      return JSON.stringify({ reviewedPaths: paths, decisions: [], findings: [] });
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      const id = payload.provisionalFindings[0]!.id;
+      const decisions = failure === 'missing' ? [] : failure === 'duplicate' ? [{ id, decision: 'retain' }, { id, decision: 'retain' }] : [{ id: 'unknown', decision: 'retain' }];
+      return JSON.stringify({ reviewedPaths: paths, decisions, findings: [] });
     } };
     try {
       await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/escalation/i);
