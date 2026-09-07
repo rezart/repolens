@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { openDb, type Db } from '../../src/db.js';
-import type { CompleteRequest, LLMProvider } from '../../src/llm/types.js';
+import { ProviderError, type CompleteRequest, type LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrievedChunk } from '../../src/search/types.js';
 import type {
   PullRequest,
@@ -654,7 +654,7 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(1);
   });
 
-  it.each([undefined, 0, 1])('stops malformed response retries after one correction %s', async (maxRetries) => {
+  it.each([undefined, 1])('stops malformed response retries after one correction %s', async (maxRetries) => {
     const gh = fakeGithub();
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => { calls++; return '{}'; } };
@@ -662,6 +662,15 @@ describe('reviewPullRequest', () => {
     expect(calls).toBe(2);
     expect(gh.reviews).toHaveLength(0);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+  });
+
+  it('does not retry malformed output when maxRetries is zero', async () => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, supportsBatchReview: true, complete: async () => { calls++; return '{}'; } };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 0, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
+    expect(calls).toBe(1);
+    expect(gh.reviews).toHaveLength(0);
   });
 
   it('stops retries when the next attempt would exceed the total review budget', async () => {
@@ -783,7 +792,7 @@ describe('reviewPullRequest', () => {
     expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(costUsd * 2);
   });
 
-  it.each([0, 1])('uses one corrective retry when malformed calls report zero cost (maxRetries=%s)', async (maxRetries) => {
+  it.each([0, 1])('consumes the retry allowance for malformed zero-cost calls (maxRetries=%s)', async (maxRetries) => {
     const gh = fakeGithub();
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
@@ -793,7 +802,7 @@ describe('reviewPullRequest', () => {
       return '{}';
     } };
     await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
-    expect(calls).toBe(2);
+    expect(calls).toBe(maxRetries + 1);
   });
 
   it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.5, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
@@ -2357,6 +2366,23 @@ describe('staged review', () => {
       expect(initialStage.calls[0]!.failure).toContain('JSON');
       expect(result.trace!.identity).toMatchObject({ repoId: REPO_ID, prNumber: 42, headSha: PR.headSha, model: 'cheap' });
       expect(result.trace!.finalFindings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('keeps transient provider failures as provider errors in the trace', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let calls = 0;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      calls++;
+      if (calls === 1) throw new ProviderError('openrouter', 'HTTP 503', 503);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, maxRetries: 1, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const initialStage = result.trace!.stages.find((stage) => stage.stage === 'initial')!;
+      expect(initialStage.calls.map((call) => call.outcome)).toEqual(['error', 'success']);
+      expect(initialStage.calls[0]!.failure).toBeUndefined();
     } finally { testDb.close(); }
   });
 

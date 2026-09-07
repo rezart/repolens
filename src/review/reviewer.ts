@@ -1483,10 +1483,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
           break;
         } catch (err) {
-          markTraceValidation(traceIndex, err);
           const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
           if (malformed) {
-            if (correctedAttempt) throw err;
+            markTraceValidation(traceIndex, err);
+            if (correctedAttempt || attempt >= maxRetries) throw err;
             correctedAttempt = true;
             attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
             const previous = activeLlm.model;
