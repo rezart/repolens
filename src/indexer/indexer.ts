@@ -160,56 +160,84 @@ async function embedPending(
   }
   if (work.length === 0) return;
 
-  let completed = 0;
+  const remote: Array<{ chunkId: number; text: string; inputHash: string }> = [];
+  const deferredCacheHits: Array<Array<{ chunkId: number; inputHash: string }>> = [];
+  const expectedDim = embeddings.dimension ?? db.vectorDimension;
+  let cacheDim = expectedDim;
   for (let offset = 0; offset < work.length; offset += EMBED_BATCH) {
     const batch = work.slice(offset, offset + EMBED_BATCH);
     const hashes = batch.map((b) => embeddingInputHash(b.text));
-    const expectedDim = embeddings.dimension ?? db.vectorDimension;
     const cached = db.getEmbeddingCache(embeddings.model, hashes);
-    const resolved = new Array<number[] | undefined>(batch.length);
-    const missing: number[] = [];
-    let batchDim = expectedDim;
+    const hits: Array<{ chunkId: number; inputHash: string; embedding: number[] }> = [];
     for (let i = 0; i < batch.length; i++) {
       const entry = cached.get(hashes[i]);
-      if (entry && isValidVector(entry.embedding, batchDim)) {
-        batchDim ??= entry.embedding.length;
-        resolved[i] = entry.embedding;
+      if (entry && cacheDim === null) cacheDim = entry.embedding.length;
+      if (entry && isValidVector(entry.embedding, cacheDim)) {
+        hits.push({ chunkId: batch[i].chunkId, inputHash: hashes[i], embedding: entry.embedding });
       } else {
-        missing.push(i);
+        remote.push({ chunkId: batch[i].chunkId, text: batch[i].text, inputHash: hashes[i] });
       }
     }
+    if (hits.length > 0) {
+      if (expectedDim !== null) {
+        db.ensureVecTable(expectedDim);
+        db.insertVectors(hits.map(({ chunkId, embedding }) => ({ chunkId, repoId, embedding })));
+      } else {
+        deferredCacheHits.push(hits.map(({ chunkId, inputHash }) => ({ chunkId, inputHash })));
+      }
+    }
+  }
+  if (remote.length === 0) {
+    if (deferredCacheHits.length > 0) {
+      const dim = db.getEmbeddingCache(embeddings.model, deferredCacheHits[0].map((h) => h.inputHash)).values().next().value?.embedding.length;
+      if (!dim) throw new Error('Embedding provider returned empty vectors');
+      db.ensureVecTable(dim);
+      for (const refs of deferredCacheHits) {
+        const cached = db.getEmbeddingCache(embeddings.model, refs.map((h) => h.inputHash));
+        db.insertVectors(refs.map(({ chunkId, inputHash }) => ({ chunkId, repoId, embedding: cached.get(inputHash)!.embedding })));
+      }
+    }
+    progress(`Embedded ${work.length}/${work.length} chunks`);
+    return;
+  }
 
+  let completed = work.length - remote.length;
+  for (let offset = 0; offset < remote.length; offset += EMBED_BATCH) {
+    const batch = remote.slice(offset, offset + EMBED_BATCH);
+    const inputs = batch.map((b) => b.text);
+    let batchDim = embeddings.dimension ?? db.vectorDimension;
+    const vectors = await embeddings.embed(inputs);
+    if (vectors.length !== inputs.length) {
+      throw new Error(`Embedding provider returned ${vectors.length} vectors for ${inputs.length} inputs`);
+    }
+    const providerDim = vectors[0]?.length ?? 0;
+    if (!providerDim) throw new Error('Embedding provider returned empty vectors');
+    if (batchDim !== null && batchDim !== providerDim) {
+      throw new Error(`Embedding dimensions differ within a batch: cached ${batchDim}, provider ${providerDim}`);
+    }
+    batchDim ??= providerDim;
+    for (const vector of vectors) {
+      if (!isValidVector(vector, batchDim)) throw new Error('Embedding provider returned vectors with inconsistent dimensions');
+    }
     const cacheRows: Array<{ inputHash: string; embedding: number[] }> = [];
-    if (missing.length > 0) {
-      const inputs = missing.map((i) => batch[i].text);
-      const vectors = await embeddings.embed(inputs);
-      if (vectors.length !== inputs.length) {
-        throw new Error(`Embedding provider returned ${vectors.length} vectors for ${inputs.length} inputs`);
-      }
-      const providerDim = vectors[0]?.length ?? 0;
-      if (!providerDim) throw new Error('Embedding provider returned empty vectors');
-      if (batchDim !== null && batchDim !== providerDim) {
-        throw new Error(`Embedding dimensions differ within a batch: cached ${batchDim}, provider ${providerDim}`);
-      }
-      batchDim ??= providerDim;
-      for (let j = 0; j < vectors.length; j++) {
-        if (!isValidVector(vectors[j], batchDim)) {
-          throw new Error('Embedding provider returned vectors with inconsistent dimensions');
+    vectors.forEach((embedding, i) => cacheRows.push({ inputHash: batch[i].inputHash, embedding }));
+    for (const refs of deferredCacheHits) {
+      const cached = db.getEmbeddingCache(embeddings.model, refs.map((h) => h.inputHash));
+      for (const { inputHash } of refs) {
+        const embedding = cached.get(inputHash)?.embedding;
+        if (!isValidVector(embedding, batchDim)) {
+          throw new Error(`Embedding dimensions differ within a batch: cached ${cached.get(inputHash)?.dimension ?? 0}, provider ${batchDim}`);
         }
-        const index = missing[j];
-        resolved[index] = vectors[j];
-        cacheRows.push({ inputHash: hashes[index], embedding: vectors[j] });
       }
     }
-
-    if (!batchDim) throw new Error('Embedding provider returned empty vectors');
-    const rows = resolved.map((embedding, i) => {
-      if (!embedding || !isValidVector(embedding, batchDim)) throw new Error(`Missing or invalid embedding for chunk ${batch[i].chunkId}`);
-      return { chunkId: batch[i].chunkId, repoId, embedding };
-    });
     db.ensureVecTable(batchDim);
     db.insertEmbeddingCache(embeddings.model, cacheRows);
-    db.insertVectors(rows);
+    for (const refs of deferredCacheHits) {
+      const cached = db.getEmbeddingCache(embeddings.model, refs.map((h) => h.inputHash));
+      db.insertVectors(refs.map(({ chunkId, inputHash }) => ({ chunkId, repoId, embedding: cached.get(inputHash)!.embedding })));
+    }
+    db.insertVectors(batch.map((item, i) => ({ chunkId: item.chunkId, repoId, embedding: vectors[i] })));
+    deferredCacheHits.length = 0;
     completed += batch.length;
     progress(`Embedded ${completed}/${work.length} chunks`);
   }

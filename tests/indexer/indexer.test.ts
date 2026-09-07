@@ -166,6 +166,169 @@ describe('indexRepo', () => {
     expect(lookupSizes).toHaveLength(Math.ceil(count / 64));
   });
 
+  it('packs sparse cache misses across lookup windows and preserves vector mapping', async () => {
+    const count = 130;
+    const entries = Array.from({ length: count }, (_, i) => ({
+      path: `src/file-${i}.ts`,
+      blobHash: i.toString(16).padStart(40, '0'),
+      size: 32,
+    }));
+    const largeCheckout = {
+      async headSha() { return 'a'.repeat(40); },
+      async listFiles() { return entries; },
+      async readFile(path: string) { return `export const value = '${path}';\n`; },
+      async readBlob() { throw new Error('unexpected blob read'); },
+    } as unknown as RepoCheckout;
+    const embeddings = fakeEmbeddings();
+    embeddings.embed = async function (texts: string[]) {
+      this.calls++;
+      this.inputs.push(texts);
+      return texts.map((text) => {
+        const index = Number(text.match(/file-(\d+)/)?.[1]);
+        return [1000 + index, 0, 0, 0];
+      });
+    };
+    const missIndexes = new Set([1, 65, 129]);
+    for (let i = 0; i < count; i++) {
+      if (missIndexes.has(i)) continue;
+      const text = `src/file-${i}.ts\nexport const value = 'src/file-${i}.ts';\n`;
+      db.insertEmbeddingCache(embeddings.model, [{
+        inputHash: createHash('sha256').update(text).digest('hex'),
+        embedding: [100 + i, 1, 0, 0],
+      }]);
+    }
+    db.upsertRepo({ id: 'github:large/n', remote: 'https://github.com/large/n', owner: 'large', name: 'n', branch: 'main' });
+
+    await indexRepo({ db, checkout: largeCheckout, repoId: 'github:large/n', embeddings });
+
+    expect(embeddings.calls).toBe(1);
+    expect(embeddings.inputs[0]).toEqual([...missIndexes].map((i) => `src/file-${i}.ts\nexport const value = 'src/file-${i}.ts';\n`));
+    const chunks = db.getChunksForPath('github:large/n', 'src/file-0.ts');
+    expect(db.vecSearch(['github:large/n'], [100, 1, 0, 0], 1)[0]?.chunk.id).toBe(chunks[0].id);
+    for (const index of missIndexes) {
+      const expected = db.getChunksForPath('github:large/n', `src/file-${index}.ts`)[0];
+      expect(db.vecSearch(['github:large/n'], [1000 + index, 0, 0, 0], 1)[0]?.chunk.id).toBe(expected.id);
+    }
+    expect(db.chunkIdsWithoutVectors('github:large/n')).toEqual([]);
+  });
+
+  it('re-embeds incompatible all-hit cache entries without poisoning vector dimensions', async () => {
+    const textA = `a.ts\n${FILE_A}`;
+    const textB = `b.ts\n${FILE_B}`;
+    const embeddings: EmbeddingProvider & { calls: number; inputs: string[][] } = {
+      model: 'mixed-cache-dimensions',
+      dimension: null,
+      calls: 0,
+      inputs: [],
+      async embed(texts) {
+        this.calls++;
+        this.inputs.push(texts);
+        return texts.map(() => [1, 0, 0, 0]);
+      },
+    };
+    db.insertEmbeddingCache('mixed-cache-dimensions', [
+      { inputHash: createHash('sha256').update(textA).digest('hex'), embedding: [1, 0, 0, 0] },
+      { inputHash: createHash('sha256').update(textB).digest('hex'), embedding: [1, 0, 0] },
+    ]);
+
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings });
+
+    expect(embeddings.calls).toBe(1);
+    expect(embeddings.inputs[0]).toEqual([textB]);
+    expect(db.vectorDimension).toBe(4);
+    expect(db.chunkIdsWithoutVectors(REPO_ID)).toEqual([]);
+  });
+
+  it('reports embedding progress when every chunk is a cache hit', async () => {
+    const first = fakeEmbeddings();
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings: first });
+    db.raw.prepare('delete from chunk_vec').run();
+    const messages: string[] = [];
+
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings: fakeEmbeddings(), onProgress: (message) => messages.push(message) });
+
+    expect(messages).toContain(`Embedded ${db.countChunks(REPO_ID)}/${db.countChunks(REPO_ID)} chunks`);
+  });
+
+  it('sends 128-plus cache misses as 64, 64, and a tail', async () => {
+    const count = 192;
+    const missIndexes = new Set([
+      ...Array.from({ length: 43 }, (_, i) => i),
+      ...Array.from({ length: 43 }, (_, i) => 64 + i),
+      ...Array.from({ length: 44 }, (_, i) => 128 + i),
+    ]);
+    const entries = Array.from({ length: count }, (_, i) => ({
+      path: `src/file-${i}.ts`,
+      blobHash: i.toString(16).padStart(40, '0'),
+      size: 32,
+    }));
+    const largeCheckout = {
+      async headSha() { return 'a'.repeat(40); },
+      async listFiles() { return entries; },
+      async readFile(path: string) { return `export const value = '${path}';\n`; },
+      async readBlob() { throw new Error('unexpected blob read'); },
+    } as unknown as RepoCheckout;
+    const embeddings = fakeEmbeddings();
+    db.upsertRepo({ id: 'github:large/n', remote: 'https://github.com/large/n', owner: 'large', name: 'n', branch: 'main' });
+
+    for (let i = 0; i < count; i++) {
+      if (missIndexes.has(i)) continue;
+      const text = `src/file-${i}.ts\nexport const value = 'src/file-${i}.ts';\n`;
+      db.insertEmbeddingCache(embeddings.model, [{
+        inputHash: createHash('sha256').update(text).digest('hex'),
+        embedding: [100 + i, 1, 0, 0],
+      }]);
+    }
+    await indexRepo({ db, checkout: largeCheckout, repoId: 'github:large/n', embeddings });
+
+    expect(embeddings.inputs.map((inputs) => inputs.length)).toEqual([64, 64, 2]);
+  });
+
+  it('keeps completed packed groups on failure so retry embeds only remaining misses', async () => {
+    const count = 192;
+    const missIndexes = new Set([
+      ...Array.from({ length: 43 }, (_, i) => i),
+      ...Array.from({ length: 43 }, (_, i) => 64 + i),
+      ...Array.from({ length: 44 }, (_, i) => 128 + i),
+    ]);
+    const entries = Array.from({ length: count }, (_, i) => ({
+      path: `src/file-${i}.ts`,
+      blobHash: i.toString(16).padStart(40, '0'),
+      size: 32,
+    }));
+    const largeCheckout = {
+      async headSha() { return 'a'.repeat(40); },
+      async listFiles() { return entries; },
+      async readFile(path: string) { return `export const value = '${path}';\n`; },
+      async readBlob() { throw new Error('unexpected blob read'); },
+    } as unknown as RepoCheckout;
+    let failTail = true;
+    const embeddings = fakeEmbeddings();
+    embeddings.embed = async function (texts: string[]) {
+      this.calls++;
+      this.inputs.push(texts);
+      if (failTail && this.calls === 3) throw new Error('tail failed');
+      return texts.map((t) => [t.length % 7, 1, 0, 0]);
+    };
+    for (let i = 0; i < count; i++) {
+      if (missIndexes.has(i)) continue;
+      const text = `src/file-${i}.ts\nexport const value = 'src/file-${i}.ts';\n`;
+      db.insertEmbeddingCache(embeddings.model, [{
+        inputHash: createHash('sha256').update(text).digest('hex'),
+        embedding: [100 + i, 1, 0, 0],
+      }]);
+    }
+    db.upsertRepo({ id: 'github:large/n', remote: 'https://github.com/large/n', owner: 'large', name: 'n', branch: 'main' });
+
+    await expect(indexRepo({ db, checkout: largeCheckout, repoId: 'github:large/n', embeddings })).rejects.toThrow('tail failed');
+    expect(db.chunkIdsWithoutVectors('github:large/n')).toHaveLength(2);
+    failTail = false;
+    await indexRepo({ db, checkout: largeCheckout, repoId: 'github:large/n', embeddings });
+
+    expect(embeddings.inputs.map((inputs) => inputs.length)).toEqual([64, 64, 2, 2]);
+    expect(db.chunkIdsWithoutVectors('github:large/n')).toEqual([]);
+  });
+
   it('rejects inconsistent cached dimensions before creating the vector table', async () => {
     const inputHash = createHash('sha256').update(`a.ts\n${FILE_A}`).digest('hex');
     db.raw
