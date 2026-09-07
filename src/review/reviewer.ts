@@ -301,9 +301,12 @@ async function retrieveTargetedChunks(
   changedText: string,
   identifiers: (text: string) => string[],
   excludePaths: string[],
+  focusText?: string,
 ): Promise<RetrievedChunk[]> {
-  const targeted = contextQuery(path, changedText, identifiers);
-  const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 3);
+  const targeted = focusText?.trim()
+    ? contextQuery(path, focusText, identifiers)
+    : contextQuery(path, changedText, identifiers);
+  const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 6);
   const queries = [...changedSymbols];
   const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
   if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
@@ -363,6 +366,9 @@ const HEAD_SNIPPET_CHARS_MAX = 8_000;
 const HEAD_CONTEXT_CHARS_MAX = 24_000;
 /** The reviewed file's own content is included in full only up to this size. */
 const OWN_HEAD_CHARS_MAX = 12_000;
+const OWN_HEAD_WINDOW_RADIUS = 20;
+const OWN_HEAD_WINDOW_LINES_MAX = 320;
+const OWN_HEAD_LINE_CHARS_MAX = 600;
 const RULE_FILES_MAX = 16;
 const RULE_REQUESTS_MAX = 128;
 const RULE_CHARS_MAX = 12_000;
@@ -439,6 +445,36 @@ function headBlock(path: string, content: string, max: number): string {
   return `### ${path} (content after this pull request)\n\`\`\`\n${clipContent(content, max)}\n\`\`\``;
 }
 
+/** Render bounded head windows with source line numbers that match the PR head. */
+function headWindowBlock(path: string, content: string, relevantLines: number[]): string {
+  const lines = content.split(/\r?\n/);
+  const points = [...new Set(relevantLines)].filter((line) => Number.isInteger(line) && line > 0 && line <= lines.length).sort((a, b) => a - b);
+  if (!points.length) return headBlock(path, content, OWN_HEAD_CHARS_MAX);
+
+  const windows: Array<[number, number]> = [];
+  for (const line of points) {
+    const start = Math.max(1, line - OWN_HEAD_WINDOW_RADIUS);
+    const end = Math.min(lines.length, line + OWN_HEAD_WINDOW_RADIUS);
+    const previous = windows[windows.length - 1];
+    if (previous && start <= previous[1] + 1) previous[1] = Math.max(previous[1], end);
+    else windows.push([start, end]);
+  }
+  const perWindow = Math.max(1, Math.floor(OWN_HEAD_WINDOW_LINES_MAX / windows.length));
+  const rendered: string[] = [];
+  for (const [start, end] of windows) {
+    const center = Math.floor((start + end) / 2);
+    const radius = Math.min(OWN_HEAD_WINDOW_RADIUS, Math.floor((perWindow - 1) / 2));
+    const windowStart = Math.max(1, center - radius);
+    const windowEnd = Math.min(lines.length, windowStart + perWindow - 1);
+    if (rendered.length) rendered.push('...');
+    for (let line = windowStart; line <= windowEnd; line++) {
+      const text = lines[line - 1] ?? '';
+      rendered.push(`${line} | ${text.length > OWN_HEAD_LINE_CHARS_MAX ? `${text.slice(0, OWN_HEAD_LINE_CHARS_MAX)} ... (line truncated)` : text}`);
+    }
+  }
+  return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n${rendered.join('\n')}\n\`\`\``;
+}
+
 /**
  * The post-change content the model needs to judge `path`: its own new content plus
  * the new content of the changed files it references — the ones a stale index would
@@ -448,6 +484,8 @@ export function buildHeadContext(input: {
   path: string;
   addedText: string;
   headContents: Map<string, string>;
+  /** New-file lines whose surrounding head code is relevant to this review. */
+  relevantLines?: number[];
   /** Precomputed `exportedNames` per path; recomputed here when absent. */
   exportsByPath?: Map<string, Set<string>>;
 }): string {
@@ -490,8 +528,10 @@ export function buildHeadContext(input: {
   }
 
   // The diff alone hides the code around the hunks, so lead with the whole file.
-  if (own !== undefined && own.length <= OWN_HEAD_CHARS_MAX) {
-    blocks.unshift(headBlock(path, own, OWN_HEAD_CHARS_MAX));
+  if (own !== undefined) {
+    const relevantLines = input.relevantLines ?? [];
+    if (own.length <= OWN_HEAD_CHARS_MAX || !relevantLines.length) blocks.unshift(headBlock(path, own, OWN_HEAD_CHARS_MAX));
+    else blocks.unshift(headWindowBlock(path, own, relevantLines));
   }
   return blocks.join('\n\n');
 }
@@ -582,6 +622,10 @@ function hunkContainsLine(file: DiffFile, hunkIndex: number, line: number): bool
   const hunk = file.hunks[hunkIndex];
   if (!hunk) return false;
   return hunk.lines.some((item) => item.newLine === line || item.oldLine === line);
+}
+
+function headRelevantLines(file: DiffFile, hunks = file.hunks): number[] {
+  return hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.newLine === undefined ? [] : [line.newLine]));
 }
 
 export function parseFindings(raw: string, file: DiffFile): Finding[] {
@@ -1226,7 +1270,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       for (const file of files) {
         const path = file.newPath ?? file.oldPath!;
         const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
-        const headContext = buildHeadContext({ path, addedText: added, headContents, exportsByPath });
+        const headContext = buildHeadContext({ path, addedText: added, relevantLines: headRelevantLines(file), headContents, exportsByPath });
         if (headContext) addContext(`Relevant post-change context for ${path} (authoritative):\n${headContext}`);
       }
       if (rules) addContext(rules);
@@ -1298,7 +1342,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const changedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content))
         .join('\n');
-      const headContext = buildHeadContext({ path, addedText: changedText, headContents, exportsByPath });
+      const headContext = buildHeadContext({ path, addedText: changedText, relevantLines: headRelevantLines(file), headContents, exportsByPath });
       let context = '';
       try {
         // Excluding every changed path keeps pre-change chunks of this PR's files
@@ -1374,7 +1418,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         prBody: pr.body,
         files: riskyFiles.map((file) => {
           const path = file.newPath ?? file.oldPath!;
-          const headContext = buildHeadContext({ path, addedText: hunkText(file, Infinity), headContents, exportsByPath });
+          const headContext = buildHeadContext({ path, addedText: hunkText(file, Infinity), relevantLines: headRelevantLines(file), headContents, exportsByPath });
           const relevantContext = relevantContextByPath.get(path) ?? '';
           const historical = renderHistoricalContext(historyFor(file.oldPath, file.newPath));
           return {
@@ -1448,6 +1492,24 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
     if (verifierLlm && findings.length) {
       await assertHeadUnchanged();
+      // The initial retrieval only knows the diff. Refresh each finding's
+      // context with its implicated identifiers/callees before verification.
+      for (const path of new Set(findings.map((finding) => finding.path))) {
+        const file = files.find((candidate) => (candidate.newPath ?? candidate.oldPath) === path);
+        if (!file) continue;
+        const changedText = file.hunks.flatMap((hunk) => hunk.lines
+          .filter((line) => line.type === 'add' || line.type === 'del')
+          .map((line) => line.content)).join('\n');
+        const focusText = findings.filter((finding) => finding.path === path).map((finding) => [
+          finding.title, finding.body, finding.rootCause, finding.evidence?.trigger, finding.evidence?.consequence,
+        ].filter(Boolean).join(' ')).join('\n');
+        try {
+          const focused = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths, focusText);
+          if (focused.length) relevantContextByPath.set(path, formatContext(focused));
+        } catch (err) {
+          warnings.push(`${path}: finding retrieval failed: ${errMessage(err)}`);
+        }
+      }
       const verifierFiles = files.flatMap((file) => {
         const path = file.newPath ?? file.oldPath!;
         const lines = findings.filter((finding) => finding.path === path).map(findingLine);
@@ -1460,7 +1522,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
             line: line.oldLine, kind: 'removed', content: line.content,
           }])),
-          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), headContents, exportsByPath }),
+          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), relevantLines: headRelevantLines(file, hunks), headContents, exportsByPath }),
           relevantContext: relevantContextByPath.get(path) ?? '',
         }] : [];
       });

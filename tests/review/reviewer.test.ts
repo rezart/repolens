@@ -24,6 +24,7 @@ import {
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
+  buildHeadContext,
   selectRelevantChunks,
   repositoryRulePaths,
   renderRepositoryRules,
@@ -114,6 +115,21 @@ describe('fresh finding evidence validation', () => {
 });
 
 describe('review context selection', () => {
+  it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
+    const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
+    const context = buildHeadContext({
+      path: 'src/large.ts', addedText: 'guard()',
+      headContents: new Map([['src/large.ts', lines.join('\n')]]),
+      relevantLines: [100, 300],
+    });
+    expect(context).toContain('### src/large.ts (content after this pull request; bounded windows)');
+    expect(context).toContain('100 | line-100');
+    expect(context).toContain('300 | line-300');
+    expect(context).toContain('80 | line-80');
+    expect(context).toContain('320 | line-320');
+    expect(context).not.toMatch(/(?:^|\n)1 \| line-1(?:\n|$)/);
+  });
+
   it('keeps matching definitions and callers while dropping unrelated chunks', () => {
     const chunks: RetrievedChunk[] = [
       { ...CHUNK, chunkId: 1, path: 'src/helper.ts', content: 'export function helper() {}' },
@@ -1999,13 +2015,40 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('refreshes verifier retrieval with identifiers implicated by provisional findings', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const queries: string[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'authorizeRequest accepts an invalid token')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ relevantContext?: string }> };
+      expect(payload.files[0]!.relevantContext).toContain('authorizeRequest');
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current guard rejects the input.' }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async (request) => {
+          queries.push(request.query);
+          return [{ ...CHUNK, path: 'src/auth.ts', content: 'authorizeRequest checks token' }];
+        },
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(queries).toContain('authorizeRequest');
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
   it('gives verification bounded current and removed evidence when the head file is oversized', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
-    const largeDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -1 +1 @@\n-const value = oldValue();\n+const value = newValue();\n`;
+    const largeDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -50 +50 @@\n-const value = oldValue();\n+const value = newValue();\n`;
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Stale allegation.', verdict: 'request_changes', findings: [{ ...finding(1, 'Stale finding'), path: 'src/large.ts', evidence: { ...finding(1, 'Stale finding').evidence, path: 'src/large.ts' } }] });
+      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Stale allegation.', verdict: 'request_changes', findings: [{ ...finding(50, 'Stale finding'), path: 'src/large.ts', evidence: { ...finding(50, 'Stale finding').evidence, path: 'src/large.ts' } }] });
     } };
     let verifierPayload: Record<string, unknown> | undefined;
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
@@ -2015,12 +2058,14 @@ describe('staged review', () => {
     try {
       const result = await reviewPullRequest({
         db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne,
-        github: fakeGithub(largeDiff, PR, { headFiles: { 'src/large.ts': `const value = newValue();\n${'x'.repeat(60_001)}` } }).github,
+        github: fakeGithub(largeDiff, PR, { headFiles: { 'src/large.ts': Array.from({ length: 120 }, (_, index) => index === 34 ? 'if (!request) return;' : index === 49 ? 'const value = newValue();' : `${'x'.repeat(120)}-${index + 1}`).join('\n') } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false });
       expect(verifierPayload?.prBody).toBeUndefined();
       const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
-      expect(verifierFile.currentEvidence).toEqual([{ line: 1, kind: 'added', content: 'const value = newValue();' }]);
-      expect(verifierFile.removedEvidence).toEqual([{ line: 1, kind: 'removed', content: 'const value = oldValue();' }]);
+      expect(verifierFile.currentEvidence).toEqual([{ line: 50, kind: 'added', content: 'const value = newValue();' }]);
+      expect(verifierFile.removedEvidence).toEqual([{ line: 50, kind: 'removed', content: 'const value = oldValue();' }]);
+      expect(verifierFile.headContext).toContain('### src/large.ts (content after this pull request; bounded windows)');
+      expect(verifierFile.headContext).toContain('35 | if (!request) return;');
       expect(result.findings).toEqual([]);
     } finally { testDb.close(); }
   });
