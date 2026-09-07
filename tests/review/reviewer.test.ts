@@ -25,6 +25,7 @@ import {
   defaultIdentifiers,
   defaultFormatContext,
   buildHeadContext,
+  hasValidVerifierCitation,
   selectRelevantChunks,
   repositoryRulePaths,
   renderRepositoryRules,
@@ -182,6 +183,21 @@ describe('review context selection', () => {
     const paths = repositoryRulePaths(['a/b/c/d/e/f/g/h/file.ts']);
     expect(paths.slice(0, 2)).toEqual(['AGENTS.md', 'CLAUDE.md']);
     expect(paths.slice(2, 6)).toEqual(['a/b/c/d/e/f/g/h/AGENTS.md', 'a/b/c/d/e/f/g/h/CLAUDE.md', 'a/b/c/d/e/f/g/AGENTS.md', 'a/b/c/d/e/f/g/CLAUDE.md']);
+  });
+});
+
+describe('verifier decision citations', () => {
+  it('accepts only structured citations for paths containing spaces', () => {
+    const files = [{
+      path: 'src/my file.ts',
+      currentEvidence: [{ line: 7 }],
+      headContext: '### src/my file.ts (content after this pull request; bounded windows)\n```\n7 | return value;\n```',
+    }];
+    expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: 7 }, explanation: 'Supported.' }, files)).toBe(true);
+    expect(hasValidVerifierCitation({ explanation: 'Supported at src/my file.ts:7.' }, files)).toBe(false);
+    expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: 8 } }, files)).toBe(false);
+    expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: '7' } }, files)).toBe(false);
+    expect(VERIFIER_SYSTEM_PROMPT).toContain('A supported decision must include evidence:{path:string,line:number}');
   });
 });
 
@@ -2012,7 +2028,7 @@ describe('staged review', () => {
       expect(req.reviewStage).toBe('verification');
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string; path: string; line: number } }> };
       expect(payload.findings.map((item) => item.finding.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
-      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: `The supplied code at ${item.path}:${item.line} demonstrates it.` })), summary: 'Two supported issues remain.', verdict: 'approve' });
+      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.', evidence: { path: item.path, line: item.line } })), summary: 'Two supported issues remain.', verdict: 'approve' });
     } };
     try {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false });
@@ -2057,7 +2073,7 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
-  it('rejects a supported verifier decision with an invented line citation', async () => {
+  it('rejects a supported verifier decision without structured evidence', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
@@ -2163,7 +2179,7 @@ describe('staged review', () => {
       return JSON.stringify({
         decisions: [
           { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.' },
-          { id: 1, decision: 'supported', explanation: 'The code at src/mixed.ts:20 supports it, but confidence remains marginal.' },
+          { id: 1, decision: 'supported', explanation: 'The code supports it, but confidence remains marginal.', evidence: { path: 'src/mixed.ts', line: 20 } },
         ],
         summary: 'Two issues remain.', verdict: 'approve',
       });
@@ -2187,7 +2203,7 @@ describe('staged review', () => {
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
       return JSON.stringify({
-        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: item.title === 'Rejected finding' ? 'Checked current evidence.' : `Checked current evidence at ${item.path}:${item.line}.` })),
+        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: 'Checked current evidence.', ...(item.title === 'Rejected finding' ? {} : { evidence: { path: item.path, line: item.line } }) })),
         summary: 'MODEL SUMMARY LEAK REJECTED finding and accepted finding.', verdict: 'request_changes',
       });
     } };

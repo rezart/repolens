@@ -676,7 +676,7 @@ export function hasValidVerifierCitation(decision: Record<string, unknown>, file
     }
     let currentPath = '';
     for (const line of file.headContext?.split(/\r?\n/) ?? []) {
-      const heading = /^### ([^ ]+) \(content after this pull request/.exec(line);
+      const heading = /^### (.+) \(content after this pull request/.exec(line);
       if (heading) currentPath = heading[1]!;
       const numbered = /^(\d+) \| /.exec(line);
       if (numbered && currentPath === file.path) cited.add(`${file.path}:${Number(numbered[1])}`);
@@ -687,12 +687,9 @@ export function hasValidVerifierCitation(decision: Record<string, unknown>, file
   for (const item of candidates) {
     if (!item || typeof item !== 'object') continue;
     const path = typeof (item as Record<string, unknown>).path === 'string' ? (item as Record<string, unknown>).path : '';
-    const line = typeof (item as Record<string, unknown>).line === 'number' ? (item as Record<string, unknown>).line : Number((item as Record<string, unknown>).line);
-    if (cited.has(`${path}:${line}`)) return true;
+    const line = (item as Record<string, unknown>).line;
+    if (typeof line === 'number' && Number.isInteger(line) && line > 0 && cited.has(`${path}:${line}`)) return true;
   }
-  const explanation = typeof decision.explanation === 'string' ? decision.explanation : '';
-  const citation = /(?:^|[\s(`"'])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+):(\d+)(?=$|[\s)`"',.;])/g;
-  for (const match of explanation.matchAll(citation)) if (cited.has(`${match[1]}:${Number(match[2])}`)) return true;
   return false;
 }
 
