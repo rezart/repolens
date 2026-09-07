@@ -104,6 +104,7 @@ describe('fresh finding evidence validation', () => {
     const firstGithub = fakeGithub();
     await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: firstGithub.github }, { repoId: REPO_ID, prNumber: 42 });
     const firstComment = firstGithub.reviews[0]!.input.comments[0]!;
+    expect(firstComment.body).toContain('Related locations:');
     const secondGithub = fakeGithub(DIFF, PR, { existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
     const second = await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: secondGithub.github }, { repoId: REPO_ID, prNumber: 42, force: true });
     expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
@@ -388,12 +389,12 @@ describe('reviewPullRequest', () => {
   afterEach(() => db.close());
 
   it.each([
-    { costs: [0.012, 0.003, 0.004], expected: 0.019 },
+    { costs: [0.012, 0.003], expected: 0.015 },
     { costs: [0, 0, 0], expected: 0 },
-    { costs: [0.012, null, 0.004], expected: null },
-    { costs: [0.012, undefined, 0.004], expected: null },
-    { costs: [[0.01, 0.002], 0.003, 0.004], expected: 0.019 },
-    { costs: [[0.01, 0.002], undefined, 0.004], expected: null },
+    { costs: [0.012, null], expected: null },
+    { costs: [0.012, undefined], expected: null },
+    { costs: [[0.01, 0.002], 0.003], expected: 0.015 },
+    { costs: [[0.01, 0.002], undefined], expected: null },
   ])('stores the review cost for $costs and preserves it on cache hits', async ({ costs, expected }) => {
     const tracker = new UsageTracker({ db, pricing: null });
     const fake = fakeLlm();
@@ -408,10 +409,10 @@ describe('reviewPullRequest', () => {
     } };
     const deps = makeDeps(db, { llm });
     const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(fake.calls).toHaveLength(3); // modified file, deleted file, summary
+    expect(fake.calls).toHaveLength(2); // modified file, deleted file
     expect(db.getReview(result.reviewId)?.cost_usd).toEqual(expected);
     await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(fake.calls).toHaveLength(3);
+    expect(fake.calls).toHaveLength(2);
     expect(db.listReviews(REPO_ID)[0]?.cost_usd).toEqual(expected);
   });
 
@@ -426,7 +427,7 @@ describe('reviewPullRequest', () => {
       } };
       return reviewPullRequest(makeDeps(db, { llm }), { repoId: REPO_ID, prNumber: 42 + i, post: false });
     }));
-    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.03, 0.06]);
+    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.02, 0.04]);
   });
 
   it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
@@ -975,7 +976,7 @@ describe('reviewPullRequest', () => {
     const { owner, repo, number, input } = gh.reviews[0]!;
     expect({ owner, repo, number }).toEqual({ owner: 'o', repo: 'r', number: 42 });
     expect(input.commitId).toBe('head-sha-1');
-    expect(input.event).toBe('COMMENT');
+    expect(input.event).toBe('REQUEST_CHANGES');
     expect(input.comments).toHaveLength(1);
     expect(input.comments[0]).toMatchObject({ path: 'src/app.ts', line: 4, body: expect.stringContaining('**[critical] Assignment**\n\nUse `===`.') });
     expect(input.comments[0]!.body).toMatch(/repolens-root-cause:[a-f0-9]{16}/);
@@ -1052,6 +1053,19 @@ describe('reviewPullRequest', () => {
     expect(second.verdict).toBe(first.verdict);
   });
 
+  it('derives the cached verdict from the accepted findings', async () => {
+    const llm = fakeLlm({
+      file: JSON.stringify({ findings: [{ line: 4, severity: 'critical', title: 'Critical issue', body: 'Fix it.' }] }),
+      summary: JSON.stringify({ summary: 'Approve this.', verdict: 'approve' }),
+    });
+    const deps = { db, llm: llm.provider, retrieve: retrieveOne, github: fakeGithub().github };
+    const first = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(first.verdict).toBe('request_changes');
+    db.raw.prepare('update reviews set verdict=? where id=?').run('approve', first.reviewId);
+    const second = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(second.verdict).toBe('request_changes');
+  });
+
   it('re-reviews when force is set', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub();
@@ -1072,16 +1086,18 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(0);
   });
 
-  it('fails closed when the summary call fails', async () => {
+  it('uses a deterministic summary without a non-batch summary call', async () => {
     const llm = fakeLlm({
       file: JSON.stringify({ findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }] }),
       summary: 'not json',
     });
     const gh = fakeGithub();
-    await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+    const result = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
       repoId: REPO_ID,
       prNumber: 42,
-    })).rejects.toThrow('summary review failed');
+    });
+    expect(result.summary).toContain('The review found 1 actionable issue');
+    expect(llm.calls.every((call) => call.system !== SUMMARY_SYSTEM_PROMPT && call.system !== FOLLOWUP_SUMMARY_SYSTEM_PROMPT)).toBe(true);
   });
 
   it('passes repo instructions and retrieved context to the file prompt', async () => {
@@ -1496,15 +1512,7 @@ describe('reviewPullRequest lineage', () => {
     expect(file).toContain('- [critical] src/app.ts:5 — Assignment in condition');
     expect(file).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(file).toContain('- head-sh fix: compare');
-    const summaryRequest = llm.calls.find((c) => c.system === FOLLOWUP_SUMMARY_SYSTEM_PROMPT)!;
-    expect(summaryRequest.system).not.toContain('what the pull request changes');
-    const summary = summaryRequest.messages[0]!.content;
-    expect(summary).not.toContain('First pass.');
-    expect(summary).not.toContain(PR.body);
-    expect(summary).not.toContain('feat: run');
-    expect(summary).toContain('1 commit since that review');
-    expect(summary).toContain('Changes since the previous review');
-    expect(summary).toMatch(/\+\s+if \(n === 0\) return;/);
+    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
     expect(result.warnings).toEqual([]);
   });
@@ -1586,7 +1594,7 @@ describe('reviewPullRequest lineage', () => {
     expect(content.match(/Relevant merged pull requests/g)).toHaveLength(1);
   });
 
-  it('merges rename history into the new-file prompt and ordinary summary', async () => {
+  it('merges rename history into the new-file prompt', async () => {
     const renameDiff = [
       'diff --git a/src/old.ts b/src/new.ts', 'similarity index 80%', 'rename from src/old.ts', 'rename to src/new.ts',
       '--- a/src/old.ts', '+++ b/src/new.ts', '@@ -1,1 +1,2 @@', ' export const value = 1;', '+export const next = 2;', '',
@@ -1609,11 +1617,8 @@ describe('reviewPullRequest lineage', () => {
     });
     await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42, post: false });
     const file = llm.fileCalls()[0]!.messages[0]!.content;
-    const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content;
     expect(file).toContain('Old path finding');
     expect(file).toContain('New path finding');
-    expect(summary).toContain('Old path finding');
-    expect(summary).toContain('New path finding');
   });
 
   it('keeps both paths\' historical findings in the Qwen batch context', async () => {

@@ -16,13 +16,10 @@ import { assessChange, selectReviewCandidates, type ChangeRisk } from './selecti
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
-  SUMMARY_SYSTEM_PROMPT,
   FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT,
-  FOLLOWUP_SUMMARY_SYSTEM_PROMPT,
   ESCALATION_SYSTEM_PROMPT,
   VERIFIER_SYSTEM_PROMPT,
   buildFileReviewMessage,
-  buildSummaryMessage,
   renderHistoricalContext,
 } from './prompts.js';
 
@@ -655,21 +652,15 @@ function findingGroups(findings: Finding[]): Map<string, Finding[]> {
   return groups;
 }
 
-function canonicalFindings(findings: Finding[]): Finding[] {
-  const groups = findingGroups(findings);
-  const rank = (f: Finding) => severityRank(f.severity);
-  const representative = (group: Finding[]) => [...group].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.line - b.line || a.title.localeCompare(b.title))[0]!;
-  return [...groups.entries()]
-    .map(([key, group]) => ({ key, group, finding: representative(group) }))
-    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || a.key.localeCompare(b.key))
-    .map(({ finding }) => finding);
-}
-
 /** Select one deterministic, non-test-gap finding per root cause for publication. */
 export function selectPostedFindings(findings: Finding[]): Finding[] {
   const groups = findingGroups(findings);
-  const canonical = canonicalFindings(findings);
-  return canonical.map((finding) => {
+  const rank = (f: Finding) => severityRank(f.severity);
+  const representative = (group: Finding[]) => [...group].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.line - b.line || a.title.localeCompare(b.title))[0]!;
+  const canonical = [...groups.entries()]
+    .map(([key, group]) => ({ key, group, finding: representative(group) }))
+    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || a.key.localeCompare(b.key));
+  return canonical.map(({ finding }) => {
     const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
     const group = groups.get(key) ?? [];
     const related = group.filter((other) => other !== finding && other.line > 0);
@@ -693,6 +684,10 @@ export function buildFindingSummary(findings: Finding[]): string {
 function rootCauseMarker(finding: Finding): string {
   const cause = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title.trim()}`;
   return createHash('sha256').update(cause.replace(/\s+/g, ' ').toLowerCase()).digest('hex').slice(0, 16);
+}
+
+function verdictForFindings(findings: Finding[]): Verdict {
+  return findings.some((finding) => finding.severity === 'critical') ? 'request_changes' : findings.length ? 'comment' : 'approve';
 }
 
 function postedFindingBody(finding: Finding): string {
@@ -956,13 +951,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       } catch {
         findings = [];
       }
-      findings = canonicalFindings(await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings));
+      findings = selectPostedFindings(await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings));
       const cachedResult: ReviewResult = {
         reviewId: cached.id,
         prNumber: cached.pr_number,
         headSha: cached.head_sha,
         summary: buildFindingSummary(findings),
-        verdict: findings.some((finding) => finding.severity === 'critical') ? 'request_changes' : findings.length ? 'comment' : 'approve',
+        verdict: verdictForFindings(findings),
         findings,
         posted: cached.posted === 1,
         skippedFiles: [],
@@ -1349,9 +1344,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     });
 
     let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-    let stagedSummary: string | undefined;
-    let stagedVerdict: Verdict | undefined;
-
     const riskyFiles = files.flatMap((file) => {
       const hunks = file.hunks.filter((_, index) => {
         const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });
@@ -1451,18 +1443,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding))));
       findings.push(...escalated);
       findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-      if (!findings.length) {
-        stagedSummary = 'The review found no actionable issues in the supplied changes.';
-        stagedVerdict = 'approve';
-      }
     }
 
-    const findingsBeforeRuleValidation = findings.length;
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
-    if (findingsBeforeRuleValidation && !findings.length) {
-      stagedSummary = 'The review found no actionable issues in the supplied changes.';
-      stagedVerdict = 'approve';
-    }
     if (verifierLlm && findings.length) {
       await assertHeadUnchanged();
       const verifierFiles = files.flatMap((file) => {
@@ -1491,11 +1474,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }, verifierLlm);
       if (call.failed) throw call.error;
       const obj = extractJson(call.raw!) as Record<string, unknown>;
-      const verdict = toVerdict(obj?.verdict);
-      const summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
       const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
       const ids = decisions.map((decision) => decision.id);
-      if (!summary || !verdict || decisions.length !== findings.length || new Set(ids).size !== findings.length ||
+      if (decisions.length !== findings.length || new Set(ids).size !== findings.length ||
           ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
           decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
             typeof decision.explanation !== 'string' || !decision.explanation.trim())) {
@@ -1503,56 +1484,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       }
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
-      stagedSummary = findings.length ? summary : 'The review found no actionable issues in the supplied changes.';
-      stagedVerdict = verdict;
     }
-    findings = canonicalFindings(findings);
-    const hasCritical = findings.some((f) => f.severity === 'critical');
+    findings = selectPostedFindings(findings);
 
     await assertHeadUnchanged();
-    let summary = '';
-    let verdict: Verdict = 'comment';
-    try {
-      if (stagedSummary) {
-        summary = stagedSummary;
-        verdict = stagedVerdict ?? 'comment';
-      } else if (batch) {
-        summary = batch.summary;
-        verdict = batch.verdict;
-      } else {
-        const raw = await complete({
-          system: lineage.previous ? FOLLOWUP_SUMMARY_SYSTEM_PROMPT : SUMMARY_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: 'user',
-              content: buildSummaryMessage({
-                prTitle: pr.title,
-                prBody: pr.body,
-                files: files.map((f) => ({ path: f.newPath ?? f.oldPath!, status: f.status })),
-                findings,
-                lineage,
-                historical: historyFor(...historyPaths),
-              }),
-            },
-          ],
-          json: true,
-          maxTokens: 800,
-        });
-        const obj = extractJson(raw) as Record<string, unknown>;
-        summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
-        verdict = toVerdict(obj?.verdict) ?? 'comment';
-        if (!summary) throw new Error('summary missing from model output');
-      }
-    } catch (err) {
-      const msg = `summary: ${errMessage(err)}`;
-      warnings.push(msg);
-      log(`review: ${msg}`);
-      throw new Error(`summary review failed: ${errMessage(err)}`);
-    }
-    summary = buildFindingSummary(findings);
-    if (!findings.length) verdict = 'approve';
-    else if (stagedSummary) verdict = hasCritical ? 'request_changes' : 'comment';
-    else if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
+    const summary = buildFindingSummary(findings);
+    const verdict = verdictForFindings(findings);
 
     if (!repo.last_commit) {
       warnings.push('Repository has not been indexed; review ran without codebase context.');
