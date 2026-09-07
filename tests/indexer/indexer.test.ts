@@ -180,6 +180,14 @@ describe('indexRepo', () => {
       async readBlob() { throw new Error('unexpected blob read'); },
     } as unknown as RepoCheckout;
     const embeddings = fakeEmbeddings();
+    embeddings.embed = async function (texts: string[]) {
+      this.calls++;
+      this.inputs.push(texts);
+      return texts.map((text) => {
+        const index = Number(text.match(/file-(\d+)/)?.[1]);
+        return [1000 + index, 0, 0, 0];
+      });
+    };
     const missIndexes = new Set([1, 65, 129]);
     for (let i = 0; i < count; i++) {
       if (missIndexes.has(i)) continue;
@@ -197,7 +205,49 @@ describe('indexRepo', () => {
     expect(embeddings.inputs[0]).toEqual([...missIndexes].map((i) => `src/file-${i}.ts\nexport const value = 'src/file-${i}.ts';\n`));
     const chunks = db.getChunksForPath('github:large/n', 'src/file-0.ts');
     expect(db.vecSearch(['github:large/n'], [100, 1, 0, 0], 1)[0]?.chunk.id).toBe(chunks[0].id);
+    for (const index of missIndexes) {
+      const expected = db.getChunksForPath('github:large/n', `src/file-${index}.ts`)[0];
+      expect(db.vecSearch(['github:large/n'], [1000 + index, 0, 0, 0], 1)[0]?.chunk.id).toBe(expected.id);
+    }
     expect(db.chunkIdsWithoutVectors('github:large/n')).toEqual([]);
+  });
+
+  it('re-embeds incompatible all-hit cache entries without poisoning vector dimensions', async () => {
+    const textA = `a.ts\n${FILE_A}`;
+    const textB = `b.ts\n${FILE_B}`;
+    const embeddings: EmbeddingProvider & { calls: number; inputs: string[][] } = {
+      model: 'mixed-cache-dimensions',
+      dimension: null,
+      calls: 0,
+      inputs: [],
+      async embed(texts) {
+        this.calls++;
+        this.inputs.push(texts);
+        return texts.map(() => [1, 0, 0, 0]);
+      },
+    };
+    db.insertEmbeddingCache('mixed-cache-dimensions', [
+      { inputHash: createHash('sha256').update(textA).digest('hex'), embedding: [1, 0, 0, 0] },
+      { inputHash: createHash('sha256').update(textB).digest('hex'), embedding: [1, 0, 0] },
+    ]);
+
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings });
+
+    expect(embeddings.calls).toBe(1);
+    expect(embeddings.inputs[0]).toEqual([textB]);
+    expect(db.vectorDimension).toBe(4);
+    expect(db.chunkIdsWithoutVectors(REPO_ID)).toEqual([]);
+  });
+
+  it('reports embedding progress when every chunk is a cache hit', async () => {
+    const first = fakeEmbeddings();
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings: first });
+    db.raw.prepare('delete from chunk_vec').run();
+    const messages: string[] = [];
+
+    await indexRepo({ db, checkout, repoId: REPO_ID, embeddings: fakeEmbeddings(), onProgress: (message) => messages.push(message) });
+
+    expect(messages).toContain(`Embedded ${db.countChunks(REPO_ID)}/${db.countChunks(REPO_ID)} chunks`);
   });
 
   it('sends 128-plus cache misses as 64, 64, and a tail', async () => {

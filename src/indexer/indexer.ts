@@ -163,6 +163,7 @@ async function embedPending(
   const remote: Array<{ chunkId: number; text: string; inputHash: string }> = [];
   const deferredCacheHits: Array<Array<{ chunkId: number; inputHash: string }>> = [];
   const expectedDim = embeddings.dimension ?? db.vectorDimension;
+  let cacheDim = expectedDim;
   for (let offset = 0; offset < work.length; offset += EMBED_BATCH) {
     const batch = work.slice(offset, offset + EMBED_BATCH);
     const hashes = batch.map((b) => embeddingInputHash(b.text));
@@ -170,7 +171,8 @@ async function embedPending(
     const hits: Array<{ chunkId: number; inputHash: string; embedding: number[] }> = [];
     for (let i = 0; i < batch.length; i++) {
       const entry = cached.get(hashes[i]);
-      if (entry && isValidVector(entry.embedding, expectedDim)) {
+      if (entry && cacheDim === null) cacheDim = entry.embedding.length;
+      if (entry && isValidVector(entry.embedding, cacheDim)) {
         hits.push({ chunkId: batch[i].chunkId, inputHash: hashes[i], embedding: entry.embedding });
       } else {
         remote.push({ chunkId: batch[i].chunkId, text: batch[i].text, inputHash: hashes[i] });
@@ -195,6 +197,7 @@ async function embedPending(
         db.insertVectors(refs.map(({ chunkId, inputHash }) => ({ chunkId, repoId, embedding: cached.get(inputHash)!.embedding })));
       }
     }
+    progress(`Embedded ${work.length}/${work.length} chunks`);
     return;
   }
 
