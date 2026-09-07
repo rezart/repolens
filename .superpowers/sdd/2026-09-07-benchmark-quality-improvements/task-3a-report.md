@@ -31,3 +31,9 @@
 - `npx vitest run tests/review/reviewer.test.ts -t 'primary decision ID' --reporter=verbose` — 3 tests passed.
 - `npx vitest run tests/review/reviewer.test.ts -t 'staged review' --reporter=dot` — 19 tests passed.
 - `npm run typecheck` and `git diff --check` — passed.
+
+## Follow-up review fix 2
+
+- The possible escalation-output allowance is now included in both full and trimmed verifier reserve candidates before choosing which context variant fits.
+- Added a near-cap regression where only the trimmed candidate leaves room for escalation and verifier work. The pre-fix test failed with the escalation budget guard; it now passes.
+- `npx vitest run tests/review/reviewer.test.ts -t 'chooses trimmed verifier' --reporter=dot` — passed.

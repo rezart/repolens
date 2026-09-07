@@ -2182,6 +2182,38 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('chooses trimmed verifier context before reserving escalation output allowance', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const tracker = new UsageTracker({ db: testDb, pricing: null });
+    let escalationCalls = 0;
+    let verifierRequest: CompleteRequest | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.37 });
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      escalationCalls++;
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'strong', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierRequest = req;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.' }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, escalationLlm, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, content: 'request token context ' + 'x'.repeat(290_000) }],
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<Record<string, unknown>> };
+      expect(escalationCalls).toBe(1);
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+    } finally { testDb.close(); }
+  });
+
   it('anchors deletion-only hunks to post-change lines for head context', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });

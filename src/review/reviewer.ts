@@ -1560,10 +1560,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const verifierReserve = budgeted && verifierLlm ? (() => {
         const full = verifierRequest(findings);
         const trimmed = verifierRequest(findings, true);
-        const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
         // ponytail: reserve four UTF-8 bytes per possible escalation output token;
         // replace with provider tokenization if added-finding payloads need tighter packing.
-        reserve.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
+        full.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
+        trimmed.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
+        const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
         return reviewCostUpperBound(reserve);
       })() : 0;
       const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
