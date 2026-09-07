@@ -484,9 +484,9 @@ function headBlock(path: string, content: string, max: number): string {
 function headWindowBlock(path: string, content: string, relevantLines: number[]): string {
   const lines = content.split(/\r?\n/);
   const points = [...new Set(relevantLines)].filter((line) => Number.isInteger(line) && line > 0 && line <= lines.length).sort((a, b) => a - b);
-  if (!points.length) return headBlock(path, content, OWN_HEAD_CHARS_MAX);
+  if (!content) return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n\`\`\``;
 
-  const anchors = points.length <= OWN_HEAD_WINDOW_COUNT_MAX
+  const anchors = !points.length ? [1] : points.length <= OWN_HEAD_WINDOW_COUNT_MAX
     ? points
     : Array.from({ length: OWN_HEAD_WINDOW_COUNT_MAX }, (_, index) => points[Math.round(index * (points.length - 1) / (OWN_HEAD_WINDOW_COUNT_MAX - 1))]!);
   const windows: Array<{ start: number; end: number; anchor: number }> = [];
@@ -582,8 +582,7 @@ export function buildHeadContext(input: {
   // The diff alone hides the code around the hunks, so lead with the whole file.
   if (own !== undefined) {
     const relevantLines = input.relevantLines ?? [];
-    if (own.length <= OWN_HEAD_CHARS_MAX || !relevantLines.length) blocks.unshift(headBlock(path, own, OWN_HEAD_CHARS_MAX));
-    else blocks.unshift(headWindowBlock(path, own, relevantLines));
+    blocks.unshift(headWindowBlock(path, own, relevantLines));
   }
   return blocks.join('\n\n');
 }
@@ -804,7 +803,7 @@ export function parseFindings(raw: string, file: DiffFile): Finding[] {
 function findingGroups(findings: Finding[]): Map<string, Finding[]> {
   const groups = new Map<string, Finding[]>();
   for (const finding of findings.filter((finding) => finding.category !== 'test_gap')) {
-    const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+    const key = rootCauseMarker(finding);
     const group = groups.get(key);
     if (group) group.push(finding);
     else groups.set(key, [finding]);
@@ -819,9 +818,9 @@ export function selectPostedFindings(findings: Finding[]): Finding[] {
   const representative = (group: Finding[]) => [...group].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.line - b.line || a.title.localeCompare(b.title))[0]!;
   const canonical = [...groups.entries()]
     .map(([key, group]) => ({ key, group, finding: representative(group) }))
-    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || a.key.localeCompare(b.key));
+    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || normalizedRootCause(a.finding).localeCompare(normalizedRootCause(b.finding)));
   return canonical.map(({ finding }) => {
-    const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+    const key = rootCauseMarker(finding);
     const group = groups.get(key) ?? [];
     const related = group.filter((other) => other !== finding && other.line > 0);
     if (!related.length) return finding;
@@ -841,9 +840,13 @@ export function buildFindingSummary(findings: Finding[]): string {
   return `The review found ${count} (${severity}): ${details}.`;
 }
 
-function rootCauseMarker(finding: Finding): string {
+function normalizedRootCause(finding: Finding): string {
   const cause = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title.trim()}`;
-  return createHash('sha256').update(cause.replace(/\s+/g, ' ').toLowerCase()).digest('hex').slice(0, 16);
+  return cause.replace(/\s+/g, ' ').toLowerCase();
+}
+
+function rootCauseMarker(finding: Finding): string {
+  return createHash('sha256').update(normalizedRootCause(finding)).digest('hex').slice(0, 16);
 }
 
 function primaryFindingIds(findings: Finding[]): string[] {
@@ -956,7 +959,7 @@ interface PostContext {
 async function postReview(ctx: PostContext, result: ReviewResult): Promise<void> {
   const { db, github, llm, repo, pr, log } = ctx;
   const warnings = result.warnings;
-  const publishedFindings = selectPostedFindings(result.findings);
+  const publishedFindings = result.findings;
 
   let body = buildReviewBody({
     summary: result.summary,
@@ -979,7 +982,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
     const existingMarkers = new Set(existing.flatMap((comment) => [...comment.body.matchAll(/repolens-root-cause:([a-f0-9]{16})/g)].map((match) => match[1]!)));
     const groups = new Map<string, Finding[]>();
     for (const finding of comments) {
-      const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+      const key = rootCauseMarker(finding);
       const group = groups.get(key);
       if (group) group.push(finding); else groups.set(key, [finding]);
     }
@@ -1785,7 +1788,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
             decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
               typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
-              decision.decision === 'supported' && !hasValidVerifierCitation(decision, verifierFiles))) {
+              (decision.decision === 'supported' || decision.decision === 'contradicted') && !hasValidVerifierCitation(decision, verifierFiles))) {
           throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
         }
         return decisions;

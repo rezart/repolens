@@ -61,6 +61,19 @@ describe('review finding posting', () => {
       finding('test_gap', 'Missing coverage'), finding('correctness', 'Test crashes'),
     ]).map((item) => item.title)).toEqual(['Test crashes']);
   });
+
+  it('groups root causes using the same normalized marker as reruns', () => {
+    const finding = (line: number, severity: Finding['severity'], rootCause: string): Finding => ({
+      path: `src/${line}.ts`, line, severity, title: `Issue ${line}`, body: 'Fix it.', rootCause,
+      category: 'correctness', confidence: 'high', evidence: { path: `src/${line}.ts`, line, trigger: 'input', consequence: 'failure' },
+    });
+    const selected = selectPostedFindings([
+      finding(1, 'warning', 'Shared  cause'), finding(2, 'critical', ' shared cause '),
+    ]);
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toMatchObject({ line: 2, rootCause: ' shared cause ' });
+    expect(selected[0]!.body).toContain('Related locations: src/1.ts:1');
+  });
 });
 
 describe('fresh finding evidence validation', () => {
@@ -143,6 +156,17 @@ describe('review context selection', () => {
     expect(context).toMatch(/(?:^|\n)599 \| line-599(?:\n|$)/);
   });
 
+  it('numbers small own head files so nearby guards can be cited', () => {
+    const context = buildHeadContext({
+      path: 'src/small.ts', addedText: 'return value;',
+      headContents: new Map([['src/small.ts', 'function run(input: string) {\n  if (!input) return;\n  return value;\n}']]),
+      relevantLines: [3],
+    });
+    expect(context).toContain('### src/small.ts (content after this pull request; bounded windows)');
+    expect(context).toContain('2 |   if (!input) return;');
+    expect(context).toContain('3 |   return value;');
+  });
+
   it('keeps matching definitions and callers while dropping unrelated chunks', () => {
     const chunks: RetrievedChunk[] = [
       { ...CHUNK, chunkId: 1, path: 'src/helper.ts', content: 'export function helper() {}' },
@@ -197,7 +221,7 @@ describe('verifier decision citations', () => {
     expect(hasValidVerifierCitation({ explanation: 'Supported at src/my file.ts:7.' }, files)).toBe(false);
     expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: 8 } }, files)).toBe(false);
     expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: '7' } }, files)).toBe(false);
-    expect(VERIFIER_SYSTEM_PROMPT).toContain('A supported decision must include evidence:{path:string,line:number}');
+    expect(VERIFIER_SYSTEM_PROMPT).toContain('Supported and contradicted decisions must include evidence:{path:string,line:number}');
   });
 });
 
@@ -1459,7 +1483,7 @@ describe('reviewPullRequest PR-head context', () => {
     expect(msg.indexOf(AUTHORITATIVE)).toBeLessThan(msg.indexOf('### src/b.ts (content after this pull request)'));
     expect(msg).not.toContain(INDEXED);
     // The reviewed file's own new content is there too, so the model sees past the hunk.
-    expect(msg).toContain('### src/a.ts (content after this pull request)');
+    expect(msg).toContain('### src/a.ts (content after this pull request; bounded windows)');
 
     // Every changed path is excluded from retrieval, so no stale chunk survives.
     for (const paths of excludes) expect(paths).toEqual(['src/a.ts', 'src/b.ts']);
@@ -1525,7 +1549,7 @@ describe('reviewPullRequest PR-head context', () => {
     expect(logs.some((l) => l.includes('src/b.ts: no post-change content at head-sh'))).toBe(true);
     // a.ts still gets its own content; b.ts is simply not quoted.
     const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
-    expect(msg).toContain('### src/a.ts (content after this pull request)');
+    expect(msg).toContain('### src/a.ts (content after this pull request; bounded windows)');
     expect(msg).not.toContain('### src/b.ts');
   });
 });
@@ -2110,7 +2134,7 @@ describe('staged review', () => {
       const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ relevantContext?: string }> };
       expect(payload.files[0]!.relevantContext).toContain('authorizeRequest');
       expect(payload.files[0]!.relevantContext).toContain('caller invokes request');
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current guard rejects the input.' }], summary: 'No issue.', verdict: 'approve' });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current guard rejects the input.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
     } };
     try {
       const result = await reviewPullRequest({
@@ -2142,6 +2166,20 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('rejects a contradicted verifier decision without structured evidence', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The guard prevents the alleged behavior.' }], summary: 'Contradicted.', verdict: 'approve' });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('verification');
+    } finally { testDb.close(); }
+  });
+
   it('gives verification bounded current and removed evidence when the head file is oversized', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -2153,7 +2191,7 @@ describe('staged review', () => {
     let verifierPayload: Record<string, unknown> | undefined;
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current added line uses newValue().' }], summary: 'No current issue.', verdict: 'approve' });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The guard prevents the alleged behavior.', evidence: { path: 'src/large.ts', line: 35 } }], summary: 'No current issue.', verdict: 'approve' });
     } };
     try {
       const result = await reviewPullRequest({
@@ -2179,7 +2217,7 @@ describe('staged review', () => {
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierRequest = req;
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.' }], summary: 'No issue.', verdict: 'approve' });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
     } };
     try {
       await reviewPullRequest({
@@ -2212,7 +2250,7 @@ describe('staged review', () => {
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierRequest = req;
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.' }], summary: 'No issue.', verdict: 'approve' });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
     } };
     try {
       await reviewPullRequest({
@@ -2236,7 +2274,7 @@ describe('staged review', () => {
     let verifierPayload: Record<string, unknown> | undefined;
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The deleted guard is no longer alleged.' }], summary: 'No issue.', verdict: 'approve' });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The deleted guard is no longer alleged.', evidence: { path: 'src/large.ts', line: 49 } }], summary: 'No issue.', verdict: 'approve' });
     } };
     const head = Array.from({ length: 120 }, (_, index) => index === 48 ? 'afterGuard();' : `${'x'.repeat(120)}-${index + 1}`).join('\n');
     try {
@@ -2290,7 +2328,7 @@ describe('staged review', () => {
     const verifierLlm: LLMProvider = { ...initial, async complete() {
       return JSON.stringify({
         decisions: [
-          { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.' },
+          { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.', evidence: { path: 'src/mixed.ts', line: 1 } },
           { id: 1, decision: 'supported', explanation: 'The code supports it, but confidence remains marginal.', evidence: { path: 'src/mixed.ts', line: 20 } },
         ],
         summary: 'Two issues remain.', verdict: 'approve',
@@ -2315,7 +2353,7 @@ describe('staged review', () => {
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
       return JSON.stringify({
-        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: 'Checked current evidence.', ...(item.title === 'Rejected finding' ? {} : { evidence: { path: item.path, line: item.line } }) })),
+        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: 'Checked current evidence.', evidence: { path: item.path, line: item.line } })),
         summary: 'MODEL SUMMARY LEAK REJECTED finding and accepted finding.', verdict: 'request_changes',
       });
     } };
