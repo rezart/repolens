@@ -172,6 +172,17 @@ describe('review context selection', () => {
     expect(query.symbols.slice(0, 6).filter((symbol) => ['save?', 'publish'].includes(symbol))).toHaveLength(2);
   });
 
+  it('recognizes parenthesis-free Ruby declarations within the retrieval budget', () => {
+    const query = contextQuery('lib/website.rb', [
+      'def include_website_name',
+      '  implementation_value = record',
+      'end',
+      'implementation_value = implementation_value.strip',
+    ].join('\n'), () => ['implementation_value', 'implementation_value', 'record']);
+    expect(query.symbols.slice(0, 6)).toContain('include_website_name');
+    expect(query.symbols.slice(0, 2)[0]).toBe('include_website_name');
+  });
+
   it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
     const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
     const context = buildHeadContext({
