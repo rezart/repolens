@@ -814,4 +814,13 @@ describe('buildDeps', () => {
       deps.db.close();
     }
   });
+
+  it('retains the primary provider as verifier for Claude CLI reviews', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'claude-cli', LLM_MODEL: 'sonnet',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try { expect(deps.verifierLlm).toBe(deps.llm); } finally { deps.db.close(); }
+  });
 });

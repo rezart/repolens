@@ -27,7 +27,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
   const verifierLlm = config.llm.provider === 'openrouter' && config.review.verifierModel
     ? createProvider(config, { model: config.review.verifierModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
-    : undefined;
+    : config.llm.provider === 'claude-cli' ? llm : undefined;
   const escalationLlm = config.llm.provider === 'openrouter' && config.review.escalationModel && config.review.escalationModel !== llm.model
     ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
     : undefined;

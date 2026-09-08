@@ -2069,6 +2069,16 @@ describe('reviewPullRequest commit statuses', () => {
     expect(res.status).toBeUndefined();
   });
 
+  it('does not publish statuses for a fresh dry-run', async () => {
+    const llm = fakeLlm();
+    const gh = fakeGithub();
+    const res = await reviewPullRequest(deps(gh, llm), {
+      repoId: REPO_ID, prNumber: 42, fresh: true, post: false,
+    });
+    expect(gh.statuses).toEqual([]);
+    expect(res.status).toBeUndefined();
+  });
+
   it('falls back to the dashboard url when the PR has no html url', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub(DIFF, { ...PR, htmlUrl: '' }, { createReviewError: () => new Error('nope') });
@@ -2210,6 +2220,26 @@ describe('staged review', () => {
     try {
       await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       expect(calls.filter((req) => req.reviewStage === 'initial')).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
+
+  it('deduplicates duplicate B0 candidates before verification', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const item = candidate('src/mixed.ts', 1, 'duplicate candidate');
+    let verifierCount = 0;
+    const primary: LLMProvider = { name: 'openrouter', model: 'qwen', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: ['src/mixed.ts'], summary: 'Initial.', verdict: 'comment', findings: [item, item] });
+    } };
+    const verifier: LLMProvider = { ...primary, model: 'gpt-5-mini', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      verifierCount = payload.findings.length;
+      return JSON.stringify({ decisions: payload.findings.map(({ finding }, id) => ({ id, decision: 'supported', explanation: 'Evidence supports it.', evidence: { path: finding.path, line: finding.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(candidateDiff(['src/mixed.ts']), PR).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierCount).toBe(1);
     } finally { testDb.close(); }
   });
 

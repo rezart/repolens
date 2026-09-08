@@ -85,6 +85,15 @@ describe('collectStaticEvidence', () => {
     expect(facts.some((fact) => fact.kind === 'local-api-arity')).toBe(false);
   });
 
+  it('does not report arity mismatches for qualified receiver calls', () => {
+    const facts = collectStaticEvidence('src/api.ts', [
+      'function fetchUser(id: string, mode: string) { return id; }',
+      'client.fetchUser(userId);',
+      'client?.fetchUser(userId);',
+    ].join('\n'));
+    expect(facts.some((fact) => fact.kind === 'local-api-arity')).toBe(false);
+  });
+
   it('does not report arity mismatches for optional, default, rest, or trailing parameters', () => {
     const facts = collectStaticEvidence('src/api.ts', [
       'function optional(required: string, maybe?: string) { return required; }',

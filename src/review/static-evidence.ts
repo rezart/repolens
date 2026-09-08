@@ -246,11 +246,11 @@ export function collectStaticEvidence(path: string, source: string): StaticEvide
         add(index + 1, 'response-property', match[0]);
       }
     }
-    for (const match of line.matchAll(/\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(([^()]*)\)/g)) {
+    for (const match of line.matchAll(/(?<![.$?\]])\b([A-Za-z_$][\w$]*)\s*\(([^()]*)\)/g)) {
       const name = match[1]!;
       const simpleName = name.slice(name.lastIndexOf('.') + 1);
       const before = line.slice(0, match.index).trimEnd();
-      if (CALL_KEYWORDS.has(simpleName) || /\bfunction\s*$/.test(before) || /\b(?:if|for|while|switch|catch)\s*$/.test(before)) continue;
+      if (CALL_KEYWORDS.has(simpleName) || /[.$?\[\]]\s*$/.test(before) || /\bfunction\s*$/.test(before) || /\b(?:if|for|while|switch|catch)\s*$/.test(before)) continue;
       const awaited = /\bawait\s*$/.test(before);
       const text = `${name}(${match[2]!.trim()})`;
       calls.push({ name: simpleName, args: match[2]!, line: index + 1, text, awaited });

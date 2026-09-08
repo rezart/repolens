@@ -1247,7 +1247,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const postCtx: PostContext = { db, github, llm, repo, pr, log, fresh: opts.fresh };
 
   // Commit statuses need a GitHub repository and a head commit to attach to.
-  const statusEnabled = Boolean(statusContext) && opts.repoId.startsWith('github:') && Boolean(repo.owner && repo.name && pr.headSha);
+  const statusEnabled = Boolean(statusContext) && (!opts.fresh || post) && opts.repoId.startsWith('github:') && Boolean(repo.owner && repo.name && pr.headSha);
   const dashboardUrl = deps.publicUrl ? `${deps.publicUrl.replace(/\/+$/, '')}/#/reviews/${opts.repoId}` : undefined;
   /** Reporting a status must never fail a review: failures become warnings. */
   const setStatus = async (status: ReviewStatus, targetUrl: string | undefined, warnings: string[]): Promise<void> => {
@@ -1668,7 +1668,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         catch (err) { markTraceValidation(localCall.traceIndex, err); throw err; }
         try { contract = parseBatchResponse(contractCall.raw!, llm.name); }
         catch (err) { markTraceValidation(contractCall.traceIndex, err); throw err; }
-        const findings = deduplicateProvisionalCandidates([...local.findings, ...contract.findings])
+        const findings = [...local.findings, ...contract.findings]
           .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
         batch = { findings };
       } else for (let attempt = 0; ; attempt++) {
@@ -1948,10 +1948,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       findings = findings.filter((finding) => !rejected.has(finding));
       findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary &&
         primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
-      findings = deduplicateProvisionalCandidates(findings);
-      findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     }
 
+    findings = deduplicateProvisionalCandidates(findings);
+    findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
     if (verifierLlm && findings.length) {
       await assertHeadUnchanged();
