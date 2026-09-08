@@ -135,7 +135,8 @@ export class OpenRouterProvider implements LLMProvider {
         throw new ProviderError('openrouter', 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       body.provider = {
-        sort: 'price', require_parameters: true, allow_fallbacks: false,
+        order: ['DeepInfra', 'Google', 'Venice', 'Novita'],
+        require_parameters: true, allow_fallbacks: true,
         max_price: {
           prompt: req.reviewStage === 'escalation' ? REVIEW_ESCALATION_INPUT_PRICE : REVIEW_INPUT_PRICE,
           completion: req.reviewStage === 'escalation' ? REVIEW_ESCALATION_OUTPUT_PRICE : REVIEW_OUTPUT_PRICE,

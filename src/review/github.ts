@@ -256,7 +256,7 @@ export class GitHubClient {
       event: input.event,
       comments: input.comments.map((c) => ({ path: c.path, line: c.line, side: 'RIGHT' as const, body: c.body })),
     };
-    const allow = input.comments.length > 0 ? [422] : [];
+    const allow = input.comments.length > 0 || input.event === 'REQUEST_CHANGES' ? [422] : [];
     const res = await this.request(path, { method: 'POST', body: payload, allow });
     if (res.status === 422) {
       // Two likely causes: REQUEST_CHANGES was rejected because the token owns the PR,
@@ -283,6 +283,7 @@ export class GitHubClient {
         throw failed(errText(err));
       }
       if (retry.status === 422) {
+        if (!input.comments.length) throw failed(retry.text.slice(0, 300));
         // The inline comments themselves are the problem: drop them into the body.
         const second = retry.text;
         try {

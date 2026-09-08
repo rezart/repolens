@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { openDb, type Db } from '../../src/db.js';
-import { ProviderError, type CompleteRequest, type LLMProvider } from '../../src/llm/types.js';
+import { NetworkProviderError, ProviderError, type CompleteRequest, type LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrievedChunk } from '../../src/search/types.js';
 import type {
   PullRequest,
@@ -816,6 +816,56 @@ describe('reviewPullRequest', () => {
     expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(costUsd * 2);
   });
 
+  it('releases unbilled transient reservations before retrying near the cap', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const delays: number[] = [];
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        if (calls < 3) throw new ProviderError('openrouter', 'HTTP 429', 429);
+        tracker.sinkFor('review')({ provider: 'openrouter', model: 'qwen/qwen3-coder-next', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+        return JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
+      },
+    };
+    const result = await reviewPullRequest({ db, llm, maxRetries: 3, sleep: async (ms) => { delays.push(ms); }, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+    expect(calls).toBe(3);
+    expect(delays).toEqual([15_000, 30_000]);
+    expect(result.posted).toBe(true);
+  });
+
+  it('keeps the reservation after an unreported network failure', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
+    let calls = 0;
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        throw new NetworkProviderError('openrouter', 'timeout');
+      },
+    };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 1, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
+    expect(calls).toBe(1);
+  });
+
+  it('keeps a reservation when a transient failure reports unknown-cost usage', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        tracker.sinkFor('review')({ provider: 'openrouter', model: 'qwen/qwen3-coder-next', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: null });
+        throw new ProviderError('openrouter', 'HTTP 429', 429);
+      },
+    };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 1, sleep: async () => {}, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
+    expect(calls).toBe(1);
+  });
+
   it.each([0, 1])('consumes the retry allowance for malformed zero-cost calls (maxRetries=%s)', async (maxRetries) => {
     const gh = fakeGithub();
     const tracker = new UsageTracker({ db, pricing: null });
@@ -919,7 +969,7 @@ describe('reviewPullRequest', () => {
     };
     const fallback = new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder-next', fetch, onUsage: tracker.sinkFor('review') });
     const llm = Object.assign(new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder', fetch, onUsage: tracker.sinkFor('review') }), { reviewFallbacks: [fallback] });
-    const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    const result = await reviewPullRequest({ db, llm, sleep: async () => {}, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(sent.map((r) => r.model)).toEqual(['qwen/qwen3-coder', 'qwen/qwen3-coder-next']);
     if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {
       expect(JSON.stringify(sent[1]!.messages)).toContain('validationError');
@@ -927,7 +977,7 @@ describe('reviewPullRequest', () => {
       expect(sent[1]!.messages).toEqual(sent[0]!.messages);
     }
     expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
-    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
+    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === true)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
     expect(db.getReview(result.reviewId)?.model).toBe('qwen/qwen3-coder-next');
     if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {
@@ -985,17 +1035,6 @@ describe('reviewPullRequest', () => {
     await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, force: true, post: false });
     expect(models).toEqual(['first/coder', 'second/coder', 'first/coder']);
     expect(llm.model).toBe('first/coder');
-  });
-
-  it('reserves failed primary calls against the fallback budget', async () => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800000)));
-    let calls = 0;
-    const fetch: typeof globalThis.fetch = async () => { calls++; return new Response('unavailable', { status: 503 }); };
-    const fallback = new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder-next', fetch });
-    const llm = Object.assign(new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder', fetch }), { reviewFallbacks: [fallback] });
-    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
-    expect(calls).toBe(1);
-    expect(gh.reviews).toHaveLength(0);
   });
 
   it('abandons the review without posting when the PR head moves mid-review', async () => {
@@ -2063,6 +2102,7 @@ describe('staged review', () => {
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       expect(req.reviewStage).toBe('verification');
+      expect(req.maxTokens).toBe(4000);
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string; path: string; line: number } }> };
       expect(payload.findings.map((item) => item.finding.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
       return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.', evidence: { path: item.path, line: item.line } })), summary: 'Two supported issues remain.', verdict: 'approve' });
@@ -2493,7 +2533,10 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
-  it('uses one corrective retry for malformed verifier citations with exact evidence lines', async () => {
+  it.each([
+    { failure: 'malformed verifier citations', decisions: [{ id: 0, decision: 'supported', explanation: 'bad citation', evidence: { path: 'src/mixed.ts', line: 999 } }] },
+    { failure: 'null verifier decisions', decisions: [null] },
+  ])('uses one corrective retry for $failure with exact evidence lines', async ({ decisions }) => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
@@ -2504,7 +2547,7 @@ describe('staged review', () => {
       requests.push(req);
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
       return requests.length === 1
-        ? JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'bad citation', evidence: { path: 'src/mixed.ts', line: 999 } }] })
+        ? JSON.stringify({ decisions })
         : JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'Current evidence supports it.', evidence: { path: item.path, line: item.line } })) });
     } };
     try {

@@ -170,6 +170,30 @@ describe('GitHubClient.createReview', () => {
     expect(retry.body).not.toContain('- **src/a.ts:12** — boom');
   });
 
+  it('downgrades a rejected request-changes review even without new inline comments', async () => {
+    const { f, gh } = client([
+      jsonResponse({ message: 'Can not request changes on your own pull request' }, 422),
+      jsonResponse({ id: 100, html_url: 'https://x/100' }),
+    ]);
+    const res = await gh.createReview('o', 'r', 1, {
+      commitId: 'abc123', body: 'summary here', event: 'REQUEST_CHANGES', comments: [],
+    });
+    expect(res.id).toBe(100);
+    expect(f.calls).toHaveLength(2);
+    expect(f.calls[1]!.body).toMatchObject({ event: 'COMMENT', comments: [] });
+  });
+
+  it('stops after a rejected comment retry when there are no inline comments to drop', async () => {
+    const { f, gh } = client([
+      jsonResponse({ message: 'request changes rejected' }, 422),
+      jsonResponse({ message: 'comment rejected' }, 422),
+    ]);
+    await expect(gh.createReview('o', 'r', 1, {
+      commitId: 'abc123', body: 'summary here', event: 'REQUEST_CHANGES', comments: [],
+    })).rejects.toThrow('retry as a plain comment failed');
+    expect(f.calls).toHaveLength(2);
+  });
+
   it('drops the inline comments into the body only when the second attempt 422s too', async () => {
     const { f, gh } = client([
       jsonResponse({ message: 'line must be part of the diff' }, 422),

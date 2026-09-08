@@ -20,7 +20,7 @@ export interface OpenAIEmbeddingsOptions {
   onUsage?: UsageSink;
 }
 
-const DEFAULT_BATCH_SIZE = 32;
+const DEFAULT_BATCH_SIZE = 16;
 const MAX_ATTEMPTS = 2; // one retry
 
 const defaultSleep: Sleep = (ms) => new Promise((res) => setTimeout(res, ms));

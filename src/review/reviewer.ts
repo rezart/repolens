@@ -198,6 +198,8 @@ export interface ReviewDeps {
   maxFiles?: number;
   /** Extra attempts for failed batch reviews; default 3, within the total budget. */
   maxRetries?: number;
+  /** Injectable for tests; production waits between rate-limit retries. */
+  sleep?: (ms: number) => Promise<void>;
   /** Commit status context reported on the PR head; blank/undefined disables statuses. */
   statusContext?: string;
   /** Which findings turn the commit status red (default `critical`). */
@@ -1072,6 +1074,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (req.reviewBudget && validCost) {
       usedUsd += call.costUsd!;
       reservedUsd += call.costUsd! - estimate;
+    } else if (req.reviewBudget && threw && !call.reported && error instanceof ProviderError && error.status === 429) {
+      reservedUsd -= estimate;
     }
     if (req.reviewBudget && reservedUsd > REVIEW_MAX_USD) {
       if (traceCall) traceCall.outcome = 'error';
@@ -1533,6 +1537,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           const message = `${previous}: ${errMessage(err)}; retry ${retryAttemptsUsed}/${maxRetries} with ${activeLlm.model}`;
           warnings.push(message);
           log(`review: ${message}`);
+          if (err instanceof ProviderError && err.status === 429) {
+            await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(
+              Math.min(60_000, 15_000 * 2 ** (retryAttemptsUsed - 1)),
+            );
+          }
         }
       }
     }
@@ -1635,7 +1644,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         rules, files: buildVerifierFiles(candidateFindings, trimOptionalContext),
         findings: candidateFindings.map((finding, id) => ({ id, finding })),
       }) }],
-      json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',
+      json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'verification',
     });
     if (escalationLlm && riskyFiles.length) {
       await assertHeadUnchanged();
@@ -1802,8 +1811,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const parseVerification = (raw: string) => {
         const obj = extractJson(raw) as Record<string, unknown>;
         const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
-        const ids = decisions.map((decision) => decision.id);
-        if (decisions.length !== findings.length || new Set(ids).size !== findings.length ||
+        const ids = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
+        if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision)) ||
+            decisions.length !== findings.length || new Set(ids).size !== findings.length ||
             ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
             decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
               typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
