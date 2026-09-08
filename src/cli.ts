@@ -5,7 +5,7 @@ import { enqueueIndex, enqueueReview, normalizeRepoId } from './app.js';
 import { parseRemote, repoIdOf } from './indexer/git.js';
 import { answerQuestion } from './query/answer.js';
 import { listPullStatuses, reviewPulls } from './review/pulls.js';
-import { reviewPullRequest } from './review/reviewer.js';
+import { reviewPullRequest, ReviewExecutionError, type ReviewTrace } from './review/reviewer.js';
 import { identifiersFromCode } from './search/tokenize.js';
 import { formatContext } from './search/retrieve.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -74,26 +74,55 @@ function printTable(headers: string[], rows: string[][]) {
   for (const row of rows) console.log(line(row));
 }
 
-async function runFreshReview(deps: FreshReviewDeps, repoId: string, prNumber: number, post: boolean, force: boolean) {
-  const started = Date.now();
-  const result = await reviewPullRequest(freshReviewDeps(deps), { repoId, prNumber, post, force, fresh: true });
-  const row = deps.db.getReview(result.reviewId);
-  const stageModels = Object.fromEntries((result.trace?.stages ?? []).map((stage) => [
+function stageModelsForTrace(trace: ReviewTrace | null | undefined) {
+  return Object.fromEntries((trace?.stages ?? []).map((stage) => [
     stage.stage, [...new Set(stage.calls.map((call) => call.model))],
   ]));
+}
+
+export function freshReviewFailureRecord(repoId: string, error: unknown, latencyMs: number) {
+  const telemetry = error instanceof ReviewExecutionError ? error.telemetry : undefined;
+  const trace = telemetry?.trace ?? null;
+  const message = error instanceof Error ? error.message : String(error);
   return {
     fixture: repoId,
     arm: 'fresh',
-    headSha: result.headSha,
-    stageModels,
-    findings: result.findings,
-    cost: row?.cost_usd ?? null,
-    latencyMs: Date.now() - started,
-    warnings: result.warnings,
-    trace: result.trace,
-    reviewId: result.reviewId,
-    posted: result.posted,
+    headSha: telemetry?.headSha ?? null,
+    stageModels: stageModelsForTrace(trace),
+    findings: [],
+    cost: telemetry?.costUsd ?? null,
+    latencyMs,
+    warnings: [message],
+    trace,
+    reviewId: null,
+    posted: false,
+    error: message,
   };
+}
+
+async function runFreshReview(deps: FreshReviewDeps, repoId: string, prNumber: number, post: boolean, force: boolean) {
+  const started = Date.now();
+  try {
+    const result = await reviewPullRequest(freshReviewDeps(deps), { repoId, prNumber, post, force, fresh: true });
+    const row = deps.db.getReview(result.reviewId);
+    return {
+      fixture: repoId,
+      arm: 'fresh',
+      headSha: result.headSha,
+      stageModels: stageModelsForTrace(result.trace),
+      findings: result.findings,
+      cost: row?.cost_usd ?? null,
+      latencyMs: Date.now() - started,
+      warnings: result.warnings,
+      trace: result.trace,
+      reviewId: result.reviewId,
+      posted: result.posted,
+    };
+  } catch (error) {
+    // Keep the existing nonzero exit and stderr error while giving harnesses one JSON record to retain.
+    console.log(JSON.stringify(freshReviewFailureRecord(repoId, error, Date.now() - started)));
+    throw error;
+  }
 }
 
 async function main() {

@@ -18,6 +18,7 @@ import { JobQueue } from '../../src/jobs.js';
 import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
 import {
   reviewPullRequest as runReviewPullRequest,
+  ReviewExecutionError,
   ReviewSupersededError,
   isReviewablePath,
   hasGeneratedHeader,
@@ -1431,6 +1432,24 @@ describe('reviewPullRequest', () => {
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
     expect(gh.reviews).toEqual([]);
+  });
+
+  it('carries partial cost and trace telemetry on terminal provider failures', async () => {
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen', concurrency: 1, supportsBatchReview: true,
+      async complete() { throw new ProviderError('openrouter', 'fatal', 400); },
+    };
+    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: fakeGithub().github }, {
+      repoId: REPO_ID, prNumber: 42, fresh: true, post: false,
+    })).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(ReviewExecutionError);
+      const telemetry = (error as ReviewExecutionError).telemetry;
+      expect(telemetry.headSha).toBe(PR.headSha);
+      expect(telemetry.costUsd).toBeNull();
+      expect(telemetry.trace?.identity).toMatchObject({ repoId: REPO_ID, prNumber: 42, headSha: PR.headSha });
+      expect(telemetry.trace?.stages[0]?.calls[0]).toMatchObject({ stage: 'initial', outcome: 'error', model: 'qwen' });
+      return true;
+    });
   });
 
   it('reviews deleted source files in Qwen batch mode and blocks on body findings', async () => {

@@ -130,6 +130,20 @@ export class ReviewSupersededError extends Error {
   }
 }
 
+export interface ReviewFailureTelemetry {
+  headSha: string;
+  costUsd: number | null;
+  trace?: ReviewTrace;
+}
+
+/** Terminal review failures retain the billing and staged-call metadata known so far. */
+export class ReviewExecutionError extends Error {
+  constructor(message: string, public readonly telemetry: ReviewFailureTelemetry) {
+    super(message);
+    this.name = 'ReviewExecutionError';
+  }
+}
+
 export interface ReviewResult {
   reviewId: number;
   prNumber: number;
@@ -1246,6 +1260,19 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const pr = await github.getPull(repo.owner, repo.name, opts.prNumber);
   const postCtx: PostContext = { db, github, llm, repo, pr, log, fresh: opts.fresh };
 
+  const failureTrace = (): ReviewTrace | undefined => {
+    if (!traceCalls.length) return undefined;
+    const stages = (['initial', 'escalation', 'verification'] as const)
+      .map((stage) => ({ stage, selectedPaths: [], hunks: [], omittedContext: 0, calls: traceCalls.filter((call) => call.stage === stage), findingCount: 0 }))
+      .filter((stage) => stage.calls.length);
+    return {
+      version: 1,
+      identity: { repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha, provider: activeLlm.name, model: activeLlm.model, config: { maxRetries: deps.maxRetries ?? 3, maxFiles: deps.maxFiles ?? 40 } },
+      stages,
+      finalFindings: [],
+    };
+  };
+
   // Commit statuses need a GitHub repository and a head commit to attach to.
   const statusEnabled = Boolean(statusContext) && (!opts.fresh || post) && opts.repoId.startsWith('github:') && Boolean(repo.owner && repo.name && pr.headSha);
   const dashboardUrl = deps.publicUrl ? `${deps.publicUrl.replace(/\/+$/, '')}/#/reviews/${opts.repoId}` : undefined;
@@ -1320,15 +1347,28 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     // A superseded review is not a failure; the stale sha's status is left as is
     // (nobody merges it) and the new head is reviewed by the trigger that moved it.
     if (err instanceof ReviewSupersededError) throw err;
+    if (!(err instanceof Error)) {
+      await setStatus(
+        { state: 'error', description: truncateDescription(`RepoLens review failed: ${errMessage(err)}`) },
+        pr.htmlUrl,
+        statusWarnings,
+      );
+      throw err;
+    }
+    const failure = err instanceof ReviewExecutionError ? err : new ReviewExecutionError(errMessage(err), {
+      headSha: pr.headSha,
+      costUsd,
+      trace: failureTrace(),
+    });
     // The check must not stay pending forever when the review itself blows up.
     // Descriptions are capped at 140 characters, so a long message would make the
     // status call fail too and leave the check pending.
     await setStatus(
-      { state: 'error', description: truncateDescription(`RepoLens review failed: ${errMessage(err)}`) },
+      { state: 'error', description: truncateDescription(`RepoLens review failed: ${failure.message}`) },
       pr.htmlUrl,
       statusWarnings,
     );
-    throw err;
+    throw failure;
   }
 
   async function runReview(): Promise<ReviewResult> {
