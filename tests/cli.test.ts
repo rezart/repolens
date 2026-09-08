@@ -18,4 +18,11 @@ describe('review CLI options', () => {
     } as never);
     expect(wired.verifierLlm).toBe(verifier);
   });
+
+  it('passes dual discovery through fresh review wiring', () => {
+    const wired = freshReviewDeps({
+      llm: { name: 'qwen' }, config: { review: { statusContext: '', failOn: 'critical', maxRetries: 3, dualDiscovery: true, ignorePatterns: [] } },
+    } as never);
+    expect(wired.dualDiscovery).toBe(true);
+  });
 });

@@ -73,6 +73,13 @@ Respond ONLY with a JSON object containing ALL four fields, even when there are 
 {"reviewedPaths":["exact/path/of/every/reviewed/file.ts"],"findings":[{"path":"exact/path.ts","line":123,"severity":"critical","category":"correctness","confidence":"high","rootCause":"short shared cause","evidence":{"path":"exact/path.ts","line":123,"trigger":"concrete input or state","consequence":"observable failure"},"title":"short title","body":"explanation and concrete fix"}],"summary":"concise summary","verdict":"request_changes"}
 Include every reviewed path in reviewedPaths, including files with no findings. Use an empty findings array when no issues were found.`;
 
+/** Independent second view: code/evidence only, never the local review's allegations. */
+export const CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT = `${REVIEW_SYSTEM_PROMPT}
+
+You are an independent contract and concurrency discovery reviewer. Inspect only the supplied post-change code, diff, repository evidence, and rules; do not receive or infer any other reviewer's allegations. Look for concrete failures involving changed APIs and callers, response shapes, normalization, data writes, lifecycle and cleanup, missing awaits or unhandled rejections, locks and races, and invalid state transitions. Report only actionable issues demonstrated by the supplied evidence, and use an empty findings array when none are demonstrated.
+
+Use the same strict JSON contract as the local discovery pass: include every supplied path in reviewedPaths, cite only allowed changed lines, and include validated severity, category, confidence, rootCause, evidence, title, and body fields for each finding. Return only {"reviewedPaths":["exact/path.ts"],"findings":[...],"summary":"...","verdict":"approve|comment|request_changes"}; never include primary or provisional finding prose.`;
+
 export const SUMMARY_SYSTEM_PROMPT = `You are RepoLens, summarising a pull request review.
 
 ${SUMMARY_GUIDANCE}

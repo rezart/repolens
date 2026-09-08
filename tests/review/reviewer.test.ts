@@ -2058,6 +2058,79 @@ describe('staged review', () => {
     expect(verifierFindings).toEqual([item]);
   });
 
+  it('runs local and contract discovery concurrently, unions validated findings, and verifies once', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const local = candidate('src/mixed.ts', 1, 'local execution');
+    const contract = candidate('src/mixed.ts', 1, 'caller contract');
+    const calls: CompleteRequest[] = [];
+    let active = 0;
+    let maxActive = 0;
+    const primary: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      const isContract = req.system?.includes('contract and concurrency');
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Discovery.', verdict: 'request_changes', findings: [isContract ? contract : local] });
+    } };
+    const verifier: LLMProvider = { ...primary, model: 'gpt-5-mini', async complete(req) {
+      calls.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      expect(payload.findings.map(({ finding }) => finding.rootCause)).toEqual(['local execution', 'caller contract']);
+      return JSON.stringify({ decisions: payload.findings.map(({ finding }, id) => ({ id, decision: 'supported', explanation: 'Evidence supports the issue.', evidence: { path: finding.path, line: finding.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, dualDiscovery: true, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(maxActive).toBe(2);
+      expect(calls.filter((req) => req.reviewStage === 'initial')).toHaveLength(2);
+      expect(calls.filter((req) => req.reviewStage === 'verification')).toHaveLength(1);
+      const contractRequest = calls.find((req) => req.system?.includes('contract and concurrency'))!;
+      expect(contractRequest.messages[0]!.content).not.toContain('local execution');
+      expect(contractRequest.messages[0]!.content).not.toContain('local execution body');
+      expect(result.findings.map(({ rootCause }) => rootCause)).toEqual(['caller contract', 'local execution']);
+    } finally { testDb.close(); }
+  });
+
+  it('fails closed on malformed complementary discovery without spending a serial retry', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const calls: CompleteRequest[] = [];
+    const primary: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return req.system?.includes('contract and concurrency') ? 'not JSON' : JSON.stringify({ reviewedPaths: paths, summary: 'Discovery.', verdict: 'approve', findings: [] });
+    } };
+    const verifier: LLMProvider = { ...primary, model: 'gpt-5-mini', async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ decisions: [], summary: 'Checked.', verdict: 'approve' });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, dualDiscovery: true, retrieve: retrieveOne, github: fakeGithub(diff, PR).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/No JSON object found/);
+      expect(calls).toHaveLength(2);
+    } finally { testDb.close(); }
+  });
+
+  it('keeps Qwen plus verifier on one discovery pass when dual discovery is disabled', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const item = candidate('src/mixed.ts', 1, 'local only');
+    const calls: CompleteRequest[] = [];
+    const primary: LLMProvider = { name: 'openrouter', model: 'qwen/qwen3-coder', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Discovery.', verdict: 'request_changes', findings: [item] });
+    } };
+    const verifier: LLMProvider = { ...primary, model: 'gpt-5-mini', async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Evidence supports it.', evidence: { path: item.path, line: item.line } }], summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(calls.filter((req) => req.reviewStage === 'initial')).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
+
   it('keeps distinct causes at one line and one cause at distinct files and locations', async () => {
     const verifierFindings = await runCandidateReview(candidateDiff(['src/keycloak.ts', 'src/other.ts']), [
       candidate('src/keycloak.ts', 1, 'cause one'),

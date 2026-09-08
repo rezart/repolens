@@ -33,6 +33,8 @@ export interface AppDeps {
   escalationLlm?: LLMProvider;
   /** Independent backend for finding verification, when configured. */
   verifierLlm?: LLMProvider;
+  /** Enables the independent complementary discovery pass. */
+  dualDiscovery?: boolean;
   /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
   chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
@@ -170,6 +172,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           llm: deps.llm,
           escalationLlm: deps.escalationLlm,
           verifierLlm: deps.verifierLlm,
+          dualDiscovery: deps.dualDiscovery,
           retrieve: deps.retrieve,
           github: deps.github,
           identifiers: identifiersFromCode,

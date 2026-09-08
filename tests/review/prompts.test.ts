@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import type { Lineage } from '../../src/review/lineage.js';
 import type { HistoricalPr } from '../../src/review/history.js';
 
@@ -100,6 +100,13 @@ describe('buildSummaryMessage lineage', () => {
 });
 
 describe('system prompts', () => {
+  it('defines a complementary contract discovery pass without primary allegations', () => {
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).toMatch(/API|caller|contract/i);
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).toMatch(/response|normalization|await|lock|state/i);
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).toMatch(/findings/);
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).not.toMatch(/provisionalFindings|primary finding prose/i);
+  });
+
   it('tell the model how to treat the previous review', () => {
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/previous RepoLens review/i);
     expect(FOLLOWUP_SUMMARY_SYSTEM_PROMPT).toMatch(/previous review/i);

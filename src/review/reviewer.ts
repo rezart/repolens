@@ -16,6 +16,7 @@ import { assessChange, selectReviewCandidates, type ChangeRisk } from './selecti
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
+  CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT,
   FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT,
   ESCALATION_SYSTEM_PROMPT,
   VERIFIER_SYSTEM_PROMPT,
@@ -177,6 +178,8 @@ export interface ReviewDeps {
   escalationLlm?: LLMProvider;
   /** Optional cheap backend used to verify provisional findings. */
   verifierLlm?: LLMProvider;
+  /** Run the independent contract/concurrency discovery view when true. */
+  dualDiscovery?: boolean;
   retrieve: RetrieveFn;
   github: Pick<
     GitHubClient,
@@ -1133,15 +1136,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   let reservedUsd = 0;
   let usedUsd = 0;
   const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string }> = [];
-  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
+  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
     const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error' } : undefined;
     if (traceCall) traceCalls.push(traceCall);
     const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
-    if (req.reviewBudget && reservedUsd + estimate > REVIEW_MAX_USD) {
+    if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > REVIEW_MAX_USD) {
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
-    reservedUsd += estimate;
+    if (req.reviewBudget && !alreadyReserved) reservedUsd += estimate;
     const call = { reported: false, costUsd: 0 as number | null };
     let raw: string | undefined;
     let error: unknown;
@@ -1506,6 +1509,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const referencedHeadContentsByVerifierPath = new Map<string, Map<string, string>>();
     const referencedHeadLinesByVerifierPath = new Map<string, Map<string, number[]>>();
     const referencedHeadFetched = new Set<string>();
+    // The precision/recall arm uses two independent Qwen views and the
+    // independent verifier; keep older staged/non-Qwen callers unchanged.
+    const complementaryDiscovery = Boolean(deps.dualDiscovery) && budgeted && Boolean(verifierLlm) && !escalationLlm && /qwen/i.test(llm.model);
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
@@ -1528,7 +1534,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         throw new Error('Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       // Reserve half the ceiling for one retry while keeping the full core diff.
-      const optionalContextBudget = maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
+      // The complementary system prompt is longer, so account for that fixed
+      // overhead before splitting the cap between the two worst-case calls.
+      const complementaryOverhead = complementaryDiscovery
+        ? reviewCostUpperBound({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) - coreCost
+        : 0;
+      const optionalContextBudget = complementaryDiscovery
+        ? (REVIEW_MAX_USD - complementaryOverhead) / 2
+        : maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
       let omitted = 0;
@@ -1574,28 +1587,55 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       let lastRetryError: unknown;
       let attemptReq = req;
       const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
-      for (let attempt = 0; ; attempt++) {
+      const parseBatchResponse = (raw: string, providerName: string) => {
+        const obj = extractJson(raw) as Record<string, unknown>;
+        if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
+            !toVerdict(obj.verdict) || !hasExactReviewedPaths(obj.reviewedPaths, files.map((f) => f.newPath ?? f.oldPath!)) ||
+            obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
+          throw new IncompleteResponseError(providerName, 'Incomplete review response; no review was published.');
+        }
+        let findings: Finding[];
+        try {
+          findings = files.flatMap((file) => parseFindings(JSON.stringify({
+            findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
+          }), file));
+        } catch (err) {
+          throw new IncompleteResponseError(providerName, errMessage(err));
+        }
+        return { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
+      };
+      if (complementaryDiscovery) {
+        await assertHeadUnchanged();
+        const complementaryReq: CompleteRequest = { ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT };
+        const combinedEstimate = reviewCostUpperBound(req) + reviewCostUpperBound(complementaryReq);
+        if (combinedEstimate > REVIEW_MAX_USD) {
+          throw new Error(`Combined discovery passes exceed the $0.50 review budget; estimated $${combinedEstimate.toFixed(6)}; no review was published.`);
+        }
+        // Reserve both worst-case calls before either provider starts.
+        reservedUsd += combinedEstimate;
+        const [localCall, contractCall] = await Promise.all([
+          completeCall(req, activeLlm, true),
+          completeCall(complementaryReq, llm, true),
+        ]);
+        if (localCall.failed) throw localCall.error;
+        if (contractCall.failed) throw contractCall.error;
+        let local: { findings: Finding[]; summary: string; verdict: Verdict };
+        let contract: { findings: Finding[]; summary: string; verdict: Verdict };
+        try { local = parseBatchResponse(localCall.raw!, activeLlm.name); }
+        catch (err) { markTraceValidation(localCall.traceIndex, err); throw err; }
+        try { contract = parseBatchResponse(contractCall.raw!, llm.name); }
+        catch (err) { markTraceValidation(contractCall.traceIndex, err); throw err; }
+        const findings = deduplicateProvisionalCandidates([...local.findings, ...contract.findings])
+          .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+        batch = { findings, summary: local.summary, verdict: local.verdict };
+      } else for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
         let traceIndex: number | undefined;
         try {
           const call = await completeCall(attemptReq);
           traceIndex = call.traceIndex;
           if (call.failed) throw call.error;
-          const obj = extractJson(call.raw!) as Record<string, unknown>;
-          if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
-              !toVerdict(obj.verdict) || !hasExactReviewedPaths(obj.reviewedPaths, files.map((f) => f.newPath ?? f.oldPath!)) ||
-              obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
-            throw new IncompleteResponseError(activeLlm.name, 'Incomplete review response; no review was published.');
-          }
-          let findings: Finding[];
-          try {
-            findings = files.flatMap((file) => parseFindings(JSON.stringify({
-              findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-            }), file));
-          } catch (err) {
-            throw new IncompleteResponseError(activeLlm.name, errMessage(err));
-          }
-          batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
+          batch = parseBatchResponse(call.raw!, activeLlm.name);
           break;
         } catch (err) {
           const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;

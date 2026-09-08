@@ -10,6 +10,7 @@ describe('loadConfig', () => {
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
     expect(c.review.escalationModel).toBe('openai/gpt-5-mini');
+    expect(c.review.dualDiscovery).toBe(false);
   });
   it('trims the running image revision', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');
@@ -49,6 +50,13 @@ describe('loadConfig', () => {
     });
     expect(c.review.verifierModel).toBe('openai/gpt-5-mini');
     expect(c.review.escalationModel).toBe('');
+  });
+  it('parses the dual discovery switch as a strict boolean', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.dualDiscovery).toBe(false);
+    expect(loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'true' }).review.dualDiscovery).toBe(true);
+    expect(loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'false' }).review.dualDiscovery).toBe(false);
+    expect(() => loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'yes' })).toThrow(ConfigError);
   });
   it('enables embeddings when a model is set', () => {
     const c = loadConfig({ LLM_PROVIDER: 'claude-cli', EMBEDDING_MODEL: 'm', EMBEDDING_API_KEY: 'k' });
