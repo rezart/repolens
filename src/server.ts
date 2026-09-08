@@ -25,6 +25,9 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const usage = new UsageTracker({ db, pricing, log });
   // Reviews get the configured reasoning budget.
   const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
+  const verifierLlm = config.llm.provider === 'openrouter' && config.review.verifierModel
+    ? createProvider(config, { model: config.review.verifierModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
+    : undefined;
   const escalationLlm = config.llm.provider === 'openrouter' && config.review.escalationModel && config.review.escalationModel !== llm.model
     ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
     : undefined;
@@ -44,7 +47,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, escalationLlm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
+  return { config, db, llm, escalationLlm, verifierLlm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {

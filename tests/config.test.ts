@@ -42,6 +42,14 @@ describe('loadConfig', () => {
     expect(loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: '' }).review.escalationModel).toBe('');
     expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: 'bad model' })).toThrow(ConfigError);
   });
+  it('configures an independent verifier model separately from escalation', () => {
+    const c = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'k',
+      REVIEW_VERIFIER_MODEL: ' openai/gpt-5-mini ', REVIEW_ESCALATION_MODEL: '',
+    });
+    expect(c.review.verifierModel).toBe('openai/gpt-5-mini');
+    expect(c.review.escalationModel).toBe('');
+  });
   it('enables embeddings when a model is set', () => {
     const c = loadConfig({ LLM_PROVIDER: 'claude-cli', EMBEDDING_MODEL: 'm', EMBEDDING_API_KEY: 'k' });
     expect(c.embedding?.model).toBe('m');

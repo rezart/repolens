@@ -31,6 +31,8 @@ export interface AppDeps {
   llm: LLMProvider;
   /** Stronger backend for high-risk review hunks, when configured. */
   escalationLlm?: LLMProvider;
+  /** Independent backend for finding verification, when configured. */
+  verifierLlm?: LLMProvider;
   /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
   chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
@@ -167,7 +169,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           db: deps.db,
           llm: deps.llm,
           escalationLlm: deps.escalationLlm,
-          verifierLlm: deps.llm,
+          verifierLlm: deps.verifierLlm,
           retrieve: deps.retrieve,
           github: deps.github,
           identifiers: identifiersFromCode,
