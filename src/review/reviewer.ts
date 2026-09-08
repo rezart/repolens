@@ -398,7 +398,10 @@ function changedSymbolNames(path: string, text: string): string[] {
   }
   for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)) add(match[1]!);
   if (/\.(?:rb|rake)$/i.test(path)) {
-    for (const match of text.matchAll(/(?<![A-Za-z0-9_$:]):([A-Za-z_][\w!?]*)/g)) add(match[1]!);
+    for (const line of text.split(/\r?\n/)) {
+      const args = line.match(/^\s*attributes?\s+((?::[A-Za-z_][\w!?]*)(?:\s*,\s*:[A-Za-z_][\w!?]*)*)/)?.[1];
+      for (const match of args?.matchAll(/:([A-Za-z_][\w!?]*)/g) ?? []) add(match[1]!);
+    }
   }
   return names.slice(0, 2);
 }

@@ -208,6 +208,25 @@ describe('review context selection', () => {
     ]);
   });
 
+  it('ignores validation symbols before line-start serializer attributes', () => {
+    const snippets = buildHeadEvidence({
+      path: 'app/serializers/user_serializer.rb',
+      addedText: [
+        'validates :name, inclusion: { in: [:active] }',
+        'attributes :website_name',
+      ].join('\n'),
+      headContents: new Map([
+        ['app/serializers/user_serializer.rb', 'attributes :website_name'],
+        ['spec/models/user_spec.rb', 'expect(user.name).to eq("Ada")'],
+        ['spec/serializers/user_serializer_spec.rb', 'expect(serializer.website_name).to eq("example.com")'],
+      ]),
+    });
+    expect(snippets.map((snippet) => snippet.path)).toEqual([
+      'app/serializers/user_serializer.rb',
+      'spec/serializers/user_serializer_spec.rb',
+    ]);
+  });
+
   it('does not treat JavaScript object or ternary colons as changed attributes', () => {
     const snippets = buildHeadEvidence({
       path: 'src/change.ts',
