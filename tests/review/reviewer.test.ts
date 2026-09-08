@@ -2845,6 +2845,32 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('stops before a focused verifier call when the PR head moves', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(20, 'Uncertain')] });
+    } };
+    let verifierCalls = 0;
+    let headSha = PR.headSha;
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      verifierCalls++;
+      headSha = 'moved';
+      return verifierCalls === 1
+        ? JSON.stringify({ decisions: [{ id: 0, decision: 'uncertain', explanation: 'Still uncertain.' }] })
+        : JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Focused evidence supports it.', evidence: { path: 'src/mixed.ts', line: 20 } }] });
+    } };
+    const gh = fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } });
+    gh.github.getPull = async () => ({ ...PR, headSha });
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: gh.github }, {
+        repoId: REPO_ID, prNumber: 42, post: false, force: true,
+      })).rejects.toBeInstanceOf(ReviewSupersededError);
+      expect(verifierCalls).toBe(1);
+    } finally { testDb.close(); }
+  });
+
   it('preserves original uncertain IDs through a shuffled focused recheck', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });

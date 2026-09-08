@@ -2103,6 +2103,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         if (budgeted && reviewCostUpperBound(focusedReq) > remaining) {
           verifierFocusedSkipped = 'budget';
         } else {
+          await assertHeadUnchanged();
           const focusedPayload = JSON.parse(focusedReq.messages[0]!.content) as { files: VerifierContextFile[] };
           const focusedFiles = focusedPayload.files;
           const focusedCall = await completeCall(focusedReq, verifierLlm, false, 'focused');
