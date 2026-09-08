@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT, focusedVerifierSystemPrompt } from '../../src/review/prompts.js';
 import type { Lineage } from '../../src/review/lineage.js';
 import type { HistoricalPr } from '../../src/review/history.js';
 
@@ -100,6 +100,13 @@ describe('buildSummaryMessage lineage', () => {
 });
 
 describe('system prompts', () => {
+  it('defines a complementary contract discovery pass without primary allegations', () => {
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).toMatch(/API|caller|contract/i);
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).toMatch(/response|normalization|await|lock|state/i);
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).toMatch(/findings/);
+    expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).not.toMatch(/provisionalFindings|primary finding prose/i);
+  });
+
   it('tell the model how to treat the previous review', () => {
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/previous RepoLens review/i);
     expect(FOLLOWUP_SUMMARY_SYSTEM_PROMPT).toMatch(/previous review/i);
@@ -119,5 +126,29 @@ describe('system prompts', () => {
     expect(ESCALATION_SYSTEM_PROMPT).toContain('evidence');
     expect(ESCALATION_SYSTEM_PROMPT).toContain('"reviewedPaths":["src/app.ts"]');
     expect(ESCALATION_SYSTEM_PROMPT).toContain('"findings":[]');
+  });
+
+  it('names structured headEvidence as the verifier authority', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toContain('headEvidence');
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/revision.*head/i);
+    expect(VERIFIER_SYSTEM_PROMPT).not.toContain('bounded headContext');
+  });
+
+  it('draws a concrete reachable boundary against speculative security, performance, and limit warnings', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/concrete.*reachable.*failure/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/generic.*(?:security|performance|limit)/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/exhaustive whole-program proof/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/trigger.*consequence/i);
+  });
+
+  it('keeps focused verification evidence safeguards in its binary contract', () => {
+    const prompt = focusedVerifierSystemPrompt();
+    expect(prompt).toMatch(/finding(?:'s)? prose.*allegation/i);
+    expect(prompt).toMatch(/currentEvidence.*headEvidence.*authoritative/i);
+    expect(prompt).toMatch(/removedEvidence.*historical.*(?:cannot|not).*prove/i);
+    expect(prompt).toMatch(/declared parameters.*guards.*caller constraints.*callee behavior/i);
+    expect(prompt).toMatch(/counterevidence.*contradict/i);
+    expect(prompt).toMatch(/supported\|contradicted/);
+    expect(prompt).not.toMatch(/supported\|contradicted\|uncertain/);
   });
 });

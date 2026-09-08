@@ -768,6 +768,33 @@ describe('buildDeps', () => {
     }
   });
 
+  it('keeps the primary Qwen provider, creates an independent verifier, and disables escalation when blank', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_VERIFIER_MODEL: 'openai/gpt-5-mini', REVIEW_ESCALATION_MODEL: '',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.llm.model).toBe('qwen/qwen3-coder');
+      expect(deps.verifierLlm?.model).toBe('openai/gpt-5-mini');
+      expect(deps.verifierLlm).not.toBe(deps.llm);
+      expect(deps.escalationLlm).toBeUndefined();
+      expect(deps.dualDiscovery).toBe(false);
+    } finally {
+      deps.db.close();
+    }
+  });
+
+  it('propagates the dual discovery configuration to app dependencies', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_DUAL_DISCOVERY: 'true', REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try { expect(deps.dualDiscovery).toBe(true); } finally { deps.db.close(); }
+  });
+
   it('always gives chat its own low-effort provider, even without CHAT_PROVIDER/CHAT_MODEL', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'claude-cli',
@@ -786,5 +813,14 @@ describe('buildDeps', () => {
     } finally {
       deps.db.close();
     }
+  });
+
+  it('retains the primary provider as verifier for Claude CLI reviews', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'claude-cli', LLM_MODEL: 'sonnet',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try { expect(deps.verifierLlm).toBe(deps.llm); } finally { deps.db.close(); }
   });
 });

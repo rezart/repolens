@@ -45,6 +45,10 @@ const envSchema = z.object({
   REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
   /** Strong model for high-risk hunk re-review; OpenRouter defaults to GPT-5 Mini. */
   REVIEW_ESCALATION_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('openai/gpt-5-mini'),
+  /** Independent model for finding verification; blank disables verification. */
+  REVIEW_VERIFIER_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('openai/gpt-5-mini'),
+  /** Run the complementary contract/concurrency discovery pass. */
+  REVIEW_DUAL_DISCOVERY: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   /** Comma-separated repository-relative globs excluded from PR review. */
   REVIEW_IGNORE_PATTERNS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((p) => p.trim()) : [])
     .pipe(z.array(z.string().min(1).max(200).regex(/^[^,[\]]+$/))),
@@ -77,7 +81,7 @@ export interface Config {
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
   chatModel: string;
-  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; escalationModel?: string; fallbackModels?: string[]; ignorePatterns?: string[] };
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; escalationModel?: string; verifierModel?: string; dualDiscovery?: boolean; fallbackModels?: string[]; ignorePatterns?: string[] };
 }
 
 export class ConfigError extends Error {}
@@ -135,7 +139,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     chatProvider: e.CHAT_PROVIDER,
     chatModel: e.CHAT_MODEL,
-    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, escalationModel: e.REVIEW_ESCALATION_MODEL, fallbackModels: e.REVIEW_FALLBACK_MODELS, ignorePatterns: e.REVIEW_IGNORE_PATTERNS },
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, escalationModel: e.REVIEW_ESCALATION_MODEL, verifierModel: e.REVIEW_VERIFIER_MODEL, dualDiscovery: e.REVIEW_DUAL_DISCOVERY, fallbackModels: e.REVIEW_FALLBACK_MODELS, ignorePatterns: e.REVIEW_IGNORE_PATTERNS },
     github: {
       token: e.GITHUB_TOKEN,
       app: e.GITHUB_APP_ID ? { appId: e.GITHUB_APP_ID, installationId: e.GITHUB_APP_INSTALLATION_ID, privateKeyPath: e.GITHUB_APP_PRIVATE_KEY_PATH } : undefined,

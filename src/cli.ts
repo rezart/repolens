@@ -5,6 +5,41 @@ import { enqueueIndex, enqueueReview, normalizeRepoId } from './app.js';
 import { parseRemote, repoIdOf } from './indexer/git.js';
 import { answerQuestion } from './query/answer.js';
 import { listPullStatuses, reviewPulls } from './review/pulls.js';
+import { reviewPullRequest, ReviewExecutionError, type ReviewTrace } from './review/reviewer.js';
+import { identifiersFromCode } from './search/tokenize.js';
+import { formatContext } from './search/retrieve.js';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export interface ReviewCliArgs {
+  repoId: string;
+  prNumber?: number;
+  all: boolean;
+  post: boolean;
+  force: boolean;
+  fresh: boolean;
+}
+
+export function parseReviewArgs(args: string[]): ReviewCliArgs {
+  const repoId = args[0] ?? '';
+  const all = args.includes('--all');
+  const parsedNumber = args[1] && args[1] !== '--all' ? Number(args[1]) : undefined;
+  return { repoId, prNumber: Number.isFinite(parsedNumber) ? parsedNumber : undefined, all,
+    post: args.includes('--post'), force: args.includes('--force'), fresh: args.includes('--fresh') };
+}
+
+type FreshReviewDeps = ReturnType<typeof buildDeps> & { verifierLlm?: ReturnType<typeof buildDeps>['llm'] };
+
+export function freshReviewDeps(deps: FreshReviewDeps) {
+  return {
+    db: deps.db, llm: deps.llm, escalationLlm: deps.escalationLlm, verifierLlm: deps.verifierLlm,
+    dualDiscovery: deps.config.review.dualDiscovery,
+    retrieve: deps.retrieve, github: deps.github, identifiers: identifiersFromCode,
+    formatContext: (chunks: Parameters<typeof formatContext>[0]) => formatContext(chunks, 16000),
+    statusContext: deps.config.review.statusContext, failOn: deps.config.review.failOn,
+    maxRetries: deps.config.review.maxRetries, ignorePatterns: deps.config.review.ignorePatterns ?? [],
+    publicUrl: deps.config.publicUrl,
+  };
+}
 
 function loadDotEnv() {
   if (!existsSync('.env')) return;
@@ -21,8 +56,8 @@ function usage(): never {
   repolens index <owner/name | github url | local path> [--branch <b>]
   repolens ask <github:owner/name | local:name> "<question>"
   repolens pulls <github:owner/name>
-  repolens review <github:owner/name> <pr-number> [--post] [--force]
-  repolens review <github:owner/name> --all [--post] [--force]`);
+  repolens review <github:owner/name> <pr-number> [--post] [--force] [--fresh]
+  repolens review <github:owner/name> --all [--post] [--force] [--fresh]`);
   process.exit(1);
 }
 
@@ -37,6 +72,57 @@ function printTable(headers: string[], rows: string[][]) {
   const line = (cells: string[]) => cells.map((c, i) => (i === cells.length - 1 ? c : c.padEnd(widths[i]))).join('  ').trimEnd();
   console.log(line(headers));
   for (const row of rows) console.log(line(row));
+}
+
+function stageModelsForTrace(trace: ReviewTrace | null | undefined) {
+  return Object.fromEntries((trace?.stages ?? []).map((stage) => [
+    stage.stage, [...new Set(stage.calls.map((call) => call.model))],
+  ]));
+}
+
+export function freshReviewFailureRecord(repoId: string, error: unknown, latencyMs: number) {
+  const telemetry = error instanceof ReviewExecutionError ? error.telemetry : undefined;
+  const trace = telemetry?.trace ?? null;
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    fixture: repoId,
+    arm: 'fresh',
+    headSha: telemetry?.headSha ?? null,
+    stageModels: stageModelsForTrace(trace),
+    findings: [],
+    cost: telemetry?.costUsd ?? null,
+    latencyMs,
+    warnings: [message],
+    trace,
+    reviewId: null,
+    posted: false,
+    error: message,
+  };
+}
+
+async function runFreshReview(deps: FreshReviewDeps, repoId: string, prNumber: number, post: boolean, force: boolean) {
+  const started = Date.now();
+  try {
+    const result = await reviewPullRequest(freshReviewDeps(deps), { repoId, prNumber, post, force, fresh: true });
+    const row = deps.db.getReview(result.reviewId);
+    return {
+      fixture: repoId,
+      arm: 'fresh',
+      headSha: result.headSha,
+      stageModels: stageModelsForTrace(result.trace),
+      findings: result.findings,
+      cost: row?.cost_usd ?? null,
+      latencyMs: Date.now() - started,
+      warnings: result.warnings,
+      trace: result.trace,
+      reviewId: result.reviewId,
+      posted: result.posted,
+    };
+  } catch (error) {
+    // Keep the existing nonzero exit and stderr error while giving harnesses one JSON record to retain.
+    console.log(JSON.stringify(freshReviewFailureRecord(repoId, error, Date.now() - started)));
+    throw error;
+  }
 }
 
 async function main() {
@@ -124,8 +210,22 @@ async function main() {
       const deps = buildDeps(config, log);
       const repoId = normalizeRepoId(args[0]);
       if (!deps.db.getRepo(repoId)) throw new Error(`${repoId} is not indexed; run: repolens index first`);
-      const post = args.includes('--post');
-      const force = args.includes('--force');
+      const parsed = parseReviewArgs(args);
+      const post = parsed.post;
+      const force = parsed.force;
+      if (parsed.fresh) {
+        if (parsed.all) {
+          const pulls = await deps.github.listOpenPulls(deps.db.getRepo(repoId)!.owner, deps.db.getRepo(repoId)!.name);
+          for (const pull of pulls) {
+            if (pull.draft) continue;
+            console.log(JSON.stringify(await runFreshReview(deps, repoId, pull.number, post, force)));
+          }
+          return;
+        }
+        if (parsed.prNumber === undefined) usage();
+        console.log(JSON.stringify(await runFreshReview(deps, repoId, parsed.prNumber, post, force)));
+        return;
+      }
       if (args.includes('--all')) {
         const pulls = await listPullStatuses(deps, repoId);
         const out = reviewPulls(deps, repoId, { post, force, pulls });
@@ -168,7 +268,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === fileURLToPath(pathToFileURL(process.argv[1]).href)) {
+  main().catch((err) => {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}
