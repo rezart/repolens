@@ -133,4 +133,11 @@ describe('system prompts', () => {
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/revision.*head/i);
     expect(VERIFIER_SYSTEM_PROMPT).not.toContain('bounded headContext');
   });
+
+  it('draws a concrete reachable boundary against speculative security, performance, and limit warnings', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/concrete.*reachable.*failure/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/generic.*(?:security|performance|limit)/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/exhaustive whole-program proof/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/trigger.*consequence/i);
+  });
 });
