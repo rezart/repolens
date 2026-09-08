@@ -309,26 +309,53 @@ export function defaultFormatContext(chunks: RetrievedChunk[]): string {
   return chunks.map((c) => `### ${c.path}:${c.startLine}-${c.endLine}\n\`\`\`\n${c.content}\n\`\`\``).join('\n\n');
 }
 
+function escapedTerm(term: string): string {
+  return term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function chunkIdentity(chunk: RetrievedChunk): string {
+  return `${chunk.path}\0${chunk.startLine}\0${chunk.endLine}\0${chunk.content}`;
+}
+
+function isCodeLikeTerm(term: string, text: string): boolean {
+  const escaped = escapedTerm(term);
+  return /[A-Z_$]/.test(term) ||
+    new RegExp(`\\.${escaped}\\b`).test(text) ||
+    new RegExp(`(?:[.$({\\[])\\s*${escaped}(?=\\s*[.$({\\[=,:;)]|$)`).test(text) ||
+    new RegExp(`\\b${escaped}(?=\\s*[.$({\\[=,:;)]|$)`).test(text) ||
+    new RegExp('`[^`]*\\b' + escaped + '\\b`').test(text);
+}
+
 /** Keep only base-index chunks that can explain the changed identifiers. */
 export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: string[], changedPath: string, limit = 8): RetrievedChunk[] {
   const terms = [...new Set(identifiers.map((value) => value.toLowerCase()).filter((value) =>
     value.length >= 2 && !CONTEXT_KEYWORDS.has(value)))];
   if (!terms.length) return [];
   const stem = changedPath.slice(changedPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '').toLowerCase();
-  const matches = (text: string, term: string) => new RegExp(`(?:^|[^a-z0-9_$])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^a-z0-9_$])`, 'i').test(text);
-  const scored = chunks.map((chunk, index) => {
+  const matches = (text: string, term: string) => new RegExp(`(?:^|[^a-z0-9_$])${escapedTerm(term)}(?:$|[^a-z0-9_$])`, 'i').test(text);
+  const unique = new Map<string, RetrievedChunk>();
+  for (const chunk of chunks) {
+    if (chunk.path === changedPath) continue;
+    unique.set(chunkIdentity(chunk), chunk);
+  }
+  const scored = [...unique.values()].map((chunk, index) => {
     const haystack = `${chunk.path}\n${chunk.content}`;
-    const score = terms.reduce((total, term) => total + (matches(haystack, term) ? 1 : 0), 0) +
+    const score = terms.reduce((total, term, termIndex) => total + (matches(haystack, term) ? termIndex < 3 ? 2 : 1 : 0), 0) +
       (stem && matches(chunk.path, stem) ? 0.25 : 0);
     return { chunk, score, index };
   }).filter((item) => item.score > 0);
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map((item) => item.chunk);
 }
 
-function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
+export function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
-  const pathTerms = stem.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
-  const symbols = [...new Set([...identifiers(changedText).slice(0, 6), ...pathTerms])]
+  const pathTerms = path.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
+  const raw = [...new Set([...identifiers(changedText), ...(changedText.match(IDENTIFIER_RE) ?? [])])];
+  const precise = raw.filter((term) => isCodeLikeTerm(term, changedText));
+  const strong = precise.filter((term) => /[a-z][A-Z]/.test(term) || /^[A-Z]{2,}$/.test(term) || term.includes('_') || term.includes('$'));
+  const ordinary = precise.filter((term) => !strong.includes(term) && !/^[A-Z][a-z]+$/.test(term));
+  const weak = precise.filter((term) => !strong.includes(term) && !ordinary.includes(term));
+  const symbols = [...new Set([...strong, ...ordinary, ...pathTerms, ...weak])]
     .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
   return { stem, symbols };
 }
@@ -346,15 +373,15 @@ async function retrieveTargetedChunks(
     ? contextQuery(path, focusText, identifiers)
     : contextQuery(path, changedText, identifiers);
   const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 6);
-  const queries = [...changedSymbols];
+  const queries = [...changedSymbols, path, targeted.stem].filter((query, index, all) => query && all.indexOf(query) === index);
   const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
   if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
-  if (!queries.length) queries.push(targeted.stem || path);
   const chunksById = new Map<number, RetrievedChunk>();
   for (const query of queries) {
     for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths })) chunksById.set(chunk.chunkId, chunk);
   }
-  const relevant = selectRelevantChunks([...chunksById.values()], [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
+  const excluded = new Set(excludePaths);
+  const relevant = selectRelevantChunks([...chunksById.values()].filter((chunk) => !excluded.has(chunk.path)), [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
   const selected = relevant.slice(0, 8);
   const testChunk = relevant.find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
   if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
@@ -365,11 +392,13 @@ async function retrieveTargetedChunks(
 }
 
 function mergeRelevantChunks(original: RetrievedChunk[], focused: RetrievedChunk[], limit = 8): RetrievedChunk[] {
-  const unique = new Map<number, RetrievedChunk>();
-  for (const chunk of [...original.slice(0, Math.ceil(limit / 2)), ...focused]) unique.set(chunk.chunkId, chunk);
+  const unique = new Map<string, RetrievedChunk>();
+  for (const chunk of [...original.slice(0, Math.ceil(limit / 2)), ...focused]) {
+    unique.set(chunkIdentity(chunk), chunk);
+  }
   const selected = [...unique.values()].slice(0, limit);
   const testChunk = [...original, ...focused].find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
-  if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
+  if (testChunk && !selected.some((chunk) => chunkIdentity(chunk) === chunkIdentity(testChunk))) {
     selected.pop();
     selected.push(testChunk);
   }
@@ -1512,7 +1541,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     // The precision/recall arm uses two independent Qwen views and the
     // independent verifier; keep older staged/non-Qwen callers unchanged.
     const complementaryDiscovery = Boolean(deps.dualDiscovery) && budgeted && Boolean(verifierLlm) && !escalationLlm && /qwen/i.test(llm.model);
-    let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
+    let batch: { findings: Finding[] } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
         system: lineage.previous ? FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT : BATCH_REVIEW_SYSTEM_PROMPT,
@@ -1545,7 +1574,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
       let omitted = 0;
+      const seenContext = new Set<string>();
       const addContext = (block: string) => {
+        if (!block.trim() || seenContext.has(block)) return;
+        seenContext.add(block);
         const previous = req.messages[0]!.content;
         req.messages[0]!.content += `\n\n${block}`;
         if (reviewCostUpperBound(req) > optionalContextBudget) {
@@ -1602,7 +1634,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         } catch (err) {
           throw new IncompleteResponseError(providerName, errMessage(err));
         }
-        return { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
+        return { findings };
       };
       if (complementaryDiscovery) {
         await assertHeadUnchanged();
@@ -1619,15 +1651,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         ]);
         if (localCall.failed) throw localCall.error;
         if (contractCall.failed) throw contractCall.error;
-        let local: { findings: Finding[]; summary: string; verdict: Verdict };
-        let contract: { findings: Finding[]; summary: string; verdict: Verdict };
+        let local: { findings: Finding[] };
+        let contract: { findings: Finding[] };
         try { local = parseBatchResponse(localCall.raw!, activeLlm.name); }
         catch (err) { markTraceValidation(localCall.traceIndex, err); throw err; }
         try { contract = parseBatchResponse(contractCall.raw!, llm.name); }
         catch (err) { markTraceValidation(contractCall.traceIndex, err); throw err; }
         const findings = deduplicateProvisionalCandidates([...local.findings, ...contract.findings])
           .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-        batch = { findings, summary: local.summary, verdict: local.verdict };
+        batch = { findings };
       } else for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
         let traceIndex: number | undefined;
@@ -1746,30 +1778,35 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       });
       return hunks.length ? [{ ...file, hunks }] : [];
     });
-    const buildVerifierFiles = (candidateFindings: Finding[], trimOptionalContext: boolean) => files.flatMap((file) => {
-      const path = file.newPath ?? file.oldPath!;
-      const lines = candidateFindings.filter((finding) => finding.path === path).map(findingLine);
-      const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
-      if (!hunks.length) return [];
-      const scopedReferencedHeadContents = referencedHeadContentsByVerifierPath.get(path);
-      const scopedReferencedHeadLines = referencedHeadLinesByVerifierPath.get(path);
-      const headEvidence = buildHeadEvidence({
-        path, addedText: hunkText({ ...file, hunks }, Infinity),
-        relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents,
-        referencedHeadContents: scopedReferencedHeadContents, referencedHeadLines: scopedReferencedHeadLines, exportsByPath,
+    const buildVerifierFiles = (candidateFindings: Finding[], trimOptionalContext: boolean) => {
+      const seenContext = new Set<string>();
+      return files.flatMap((file) => {
+        const path = file.newPath ?? file.oldPath!;
+        const lines = candidateFindings.filter((finding) => finding.path === path).map(findingLine);
+        const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
+        if (!hunks.length) return [];
+        const scopedReferencedHeadContents = referencedHeadContentsByVerifierPath.get(path);
+        const scopedReferencedHeadLines = referencedHeadLinesByVerifierPath.get(path);
+        const headEvidence = buildHeadEvidence({
+          path, addedText: hunkText({ ...file, hunks }, Infinity),
+          relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents,
+          referencedHeadContents: scopedReferencedHeadContents, referencedHeadLines: scopedReferencedHeadLines, exportsByPath,
+        });
+        const context = relevantContextByPath.get(path);
+        const packedContext = context && !seenContext.has(context) ? (seenContext.add(context), context) : undefined;
+        return [{
+          path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
+          currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
+            line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
+          }])),
+          removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
+            line: line.oldLine, kind: 'removed', content: line.content,
+          }])),
+          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => snippet.path === path) : headEvidence,
+          ...(!trimOptionalContext && packedContext ? { relevantContext: packedContext } : {}),
+        }];
       });
-      return [{
-        path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
-        currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
-          line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
-        }])),
-        removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
-          line: line.oldLine, kind: 'removed', content: line.content,
-        }])),
-        headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => snippet.path === path) : headEvidence,
-        ...(!trimOptionalContext && relevantContextByPath.get(path) ? { relevantContext: relevantContextByPath.get(path) } : {}),
-      }];
-    });
+    };
     const verifierRequest = (candidateFindings: Finding[], trimOptionalContext = false): CompleteRequest => ({
       system: VERIFIER_SYSTEM_PROMPT,
       messages: [{ role: 'user', content: JSON.stringify({
@@ -1781,6 +1818,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (escalationLlm && riskyFiles.length) {
       await assertHeadUnchanged();
       const paths = riskyFiles.map((file) => file.newPath ?? file.oldPath!);
+      const seenEscalationContext = new Set<string>();
+      const packEscalationContext = (context: string) => {
+        if (!context.trim() || seenEscalationContext.has(context)) return undefined;
+        seenEscalationContext.add(context);
+        return context;
+      };
       const escalationPayload: {
         prTitle: string;
         prBody: string;
@@ -1802,8 +1845,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         files: riskyFiles.map((file) => {
           const path = file.newPath ?? file.oldPath!;
           const headContext = buildHeadContext({ path, addedText: hunkText(file, Infinity), relevantLines: headRelevantLines(file), headContents, exportsByPath });
-          const relevantContext = relevantContextByPath.get(path) ?? '';
-          const historical = renderHistoricalContext(historyFor(file.oldPath, file.newPath));
+          const relevantContext = packEscalationContext(relevantContextByPath.get(path) ?? '');
+          const historical = packEscalationContext(renderHistoricalContext(historyFor(file.oldPath, file.newPath)));
           return {
             path, status: file.status, risk: assessChange(file), diff: hunkText(file, Infinity),
             allowedFindingLines: [...allowedFindingLines(file)].sort((a, b) => a - b),

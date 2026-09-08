@@ -24,6 +24,7 @@ import {
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
+  contextQuery,
   buildHeadContext,
   hasValidVerifierCitation,
   selectRelevantChunks,
@@ -129,6 +130,34 @@ describe('fresh finding evidence validation', () => {
 });
 
 describe('review context selection', () => {
+  it('prioritizes exact response-shape symbols and paths over prose-frequency tokens', () => {
+    const query = contextQuery('src/calcom/response.ts', 'return response.data from getBookingResponse()', () => [
+      'response', 'response', 'shape', 'getBookingResponse', 'data', 'return',
+    ]);
+    expect(query.stem).toBe('response');
+    expect(query.symbols.slice(0, 3)).toEqual(['getBookingResponse', 'response', 'data']);
+    expect(query.symbols).not.toContain('shape');
+    expect(query.symbols).not.toContain('return');
+  });
+
+  it('keeps caller-contract identifiers ahead of repeated prose terms', () => {
+    const query = contextQuery('src/keycloak/handler.ts', 'caller invokes authorizeRequest(client)', () => [
+      'caller', 'caller', 'invokes', 'authorizeRequest', 'client',
+    ]);
+    expect(query.symbols.slice(0, 2)).toEqual(['authorizeRequest', 'client']);
+    expect(query.symbols).not.toContain('caller');
+    expect(query.symbols).not.toContain('invokes');
+  });
+
+  it('does not promote capitalized prose ahead of exact callees', () => {
+    const query = contextQuery('src/calcom/booking.ts', 'The Authorize response shape changed; getBookingResponse() returns data.', () => [
+      'The', 'Authorize', 'response', 'shape', 'getBookingResponse', 'returns', 'data',
+    ]);
+    expect(query.symbols[0]).toBe('getBookingResponse');
+    expect(query.symbols.indexOf('The')).toBeGreaterThan(query.symbols.indexOf('getBookingResponse'));
+    expect(query.symbols.indexOf('Authorize')).toBeGreaterThan(query.symbols.indexOf('getBookingResponse'));
+  });
+
   it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
     const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
     const context = buildHeadContext({
@@ -550,6 +579,59 @@ describe('reviewPullRequest', () => {
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
     expect(lexicalOnlyRequests.every((value) => value === undefined)).toBe(true);
+  });
+
+  it('deduplicates equivalent evidence before packing and leaves room for a retry', async () => {
+    const evidence = `run DUPLICATE_EVIDENCE ${'x'.repeat(350_000)}`;
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
+    } };
+    const retrieve: RetrieveFn = async () => [
+      { ...CHUNK, chunkId: 101, path: 'src/helper.ts', content: evidence },
+      { ...CHUNK, chunkId: 102, path: 'src/helper.ts', content: evidence },
+    ];
+    await reviewPullRequest({ db, llm, retrieve, github: fakeGithub().github, maxRetries: 0 }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.messages[0]!.content.match(/DUPLICATE_EVIDENCE/g)).toHaveLength(1);
+    expect(reviewCostUpperBound(calls[0]!) * 2).toBeLessThanOrEqual(REVIEW_MAX_USD);
+  });
+
+  it('deduplicates shared evidence in escalation and verifier payloads before reserving their costs', async () => {
+    const diff = [
+      'diff --git a/src/one.ts b/src/one.ts', '--- a/src/one.ts', '+++ b/src/one.ts', '@@ -1 +1 @@', '-old', '+if (token) return sharedContract();',
+      'diff --git a/src/two.ts b/src/two.ts', '--- a/src/two.ts', '+++ b/src/two.ts', '@@ -1 +1 @@', '-old', '+if (token) return sharedContract();',
+    ].join('\n');
+    const paths = ['src/one.ts', 'src/two.ts'];
+    const finding = (path: string): Finding => ({
+      path, line: 1, severity: 'warning', title: 'Shared contract', body: 'Check the shared contract.',
+      category: 'correctness', confidence: 'high', rootCause: 'shared contract',
+      evidence: { path, line: 1, trigger: 'the call reaches the shared contract', consequence: 'the contract rejects valid input' },
+    });
+    let escalationRequest: CompleteRequest | undefined;
+    let verifierRequest: CompleteRequest | undefined;
+    const initial: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Reviewed.', verdict: 'comment', findings: paths.map(finding) });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'escalation', async complete(req) {
+      escalationRequest = req;
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    const verifier: LLMProvider = { ...initial, model: 'verifier', async complete(req) {
+      verifierRequest = req;
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'The current evidence supports it.', evidence: { path: item.path, line: 1 } })) });
+    } };
+    const shared = { ...CHUNK, chunkId: 55, path: 'src/shared.ts', content: `SHARED_EVIDENCE sharedContract() ${'x'.repeat(50_000)}` };
+    await reviewPullRequest({ db, llm: initial, escalationLlm: escalation, verifierLlm: verifier, retrieve: async () => [shared], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+    expect(escalationRequest).toBeDefined();
+    expect(escalationRequest!.messages[0]!.content.match(/SHARED_EVIDENCE/g)).toHaveLength(1);
+    expect(verifierRequest).toBeDefined();
+    expect(verifierRequest!.messages[0]!.content.match(/SHARED_EVIDENCE/g)).toHaveLength(1);
+    expect(reviewCostUpperBound(escalationRequest!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
+    expect(reviewCostUpperBound(verifierRequest!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
   });
 
   it('lists exactly the validator-allowed finding lines for normal, deleted and deletion-only files', async () => {
@@ -1290,7 +1372,7 @@ describe('reviewPullRequest', () => {
       if (req.system === BATCH_REVIEW_SYSTEM_PROMPT) return JSON.stringify({ reviewedPaths: ['src/app.ts', 'tests/app.test.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
       return fake.provider.complete(req);
     } } : fake.provider;
-    const matchingTest = { ...CHUNK, chunkId: 99, path: 'tests/app.test.ts', content: 'runThing() assertion' };
+    const matchingTest = { ...CHUNK, chunkId: 99, path: 'tests/other.test.ts', content: 'runThing() assertion' };
     const noisySources = Array.from({ length: 8 }, (_, i) => ({ ...CHUNK, chunkId: 100 + i, path: `src/helper${i}.ts`, content: 'runThing() implementation' }));
     await reviewPullRequest({ db, llm, retrieve: async (req) => {
       queries.push(req.query);
@@ -1298,8 +1380,8 @@ describe('reviewPullRequest', () => {
     }, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(queries.some((query) => query.includes('test'))).toBe(true);
     if (!batch) {
-      expect(fake.calls.some((call) => call.messages[0]!.content.includes('tests/app.test.ts:1-3'))).toBe(true);
-      expect(fake.calls.every((call) => !call.messages[0]!.content.includes('src/helper0.ts:1-3') || call.messages[0]!.content.includes('tests/app.test.ts:1-3'))).toBe(true);
+      expect(fake.calls.some((call) => call.messages[0]!.content.includes('tests/other.test.ts:1-3'))).toBe(true);
+      expect(fake.calls.every((call) => !call.messages[0]!.content.includes('src/helper0.ts:1-3') || call.messages[0]!.content.includes('tests/other.test.ts:1-3'))).toBe(true);
     }
   });
 
