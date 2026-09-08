@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import type { Lineage } from '../../src/review/lineage.js';
 import type { HistoricalPr } from '../../src/review/history.js';
 
@@ -108,5 +108,16 @@ describe('system prompts', () => {
   it('allows deletion findings to be retained without invalid inline comments', () => {
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/deleted file|deletion-only/i);
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/review body/i);
+  });
+
+  it('gives escalation reviews an explicit low-noise JSON contract', () => {
+    expect(ESCALATION_SYSTEM_PROMPT).toContain('severity: critical | warning | nit');
+    expect(ESCALATION_SYSTEM_PROMPT).toContain('category: correctness | edge_case | security | test_gap | repository_rule');
+    expect(ESCALATION_SYSTEM_PROMPT).toContain('confidence: high | medium | low');
+    expect(ESCALATION_SYSTEM_PROMPT).toMatch(/empty findings array|including none/i);
+    expect(ESCALATION_SYSTEM_PROMPT).toMatch(/untrusted.*data.*not instructions/i);
+    expect(ESCALATION_SYSTEM_PROMPT).toContain('evidence');
+    expect(ESCALATION_SYSTEM_PROMPT).toContain('"reviewedPaths":["src/app.ts"]');
+    expect(ESCALATION_SYSTEM_PROMPT).toContain('"findings":[]');
   });
 });

@@ -16,13 +16,10 @@ import { assessChange, selectReviewCandidates, type ChangeRisk } from './selecti
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
-  SUMMARY_SYSTEM_PROMPT,
   FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT,
-  FOLLOWUP_SUMMARY_SYSTEM_PROMPT,
   ESCALATION_SYSTEM_PROMPT,
   VERIFIER_SYSTEM_PROMPT,
   buildFileReviewMessage,
-  buildSummaryMessage,
   renderHistoricalContext,
 } from './prompts.js';
 
@@ -30,6 +27,67 @@ export type Severity = 'critical' | 'warning' | 'nit';
 export type Verdict = 'approve' | 'comment' | 'request_changes';
 export type FindingCategory = 'correctness' | 'edge_case' | 'security' | 'test_gap' | 'repository_rule';
 export type FindingConfidence = 'high' | 'medium' | 'low';
+
+export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] = []): Record<string, unknown> {
+  const stringEnum = (values: readonly string[]) => ({ type: 'string', enum: [...values] });
+  const evidence = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['path', 'line', 'trigger', 'consequence', 'rule'],
+    properties: {
+      path: stringEnum(paths),
+      line: { type: 'integer' },
+      trigger: { type: 'string' },
+      consequence: { type: 'string' },
+      rule: {
+        anyOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path', 'line', 'quote'],
+            properties: { path: { type: 'string' }, line: { type: 'integer' }, quote: { type: 'string' } },
+          },
+          { type: 'null' },
+        ],
+      },
+    },
+  };
+  const finding = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['path', 'line', 'severity', 'title', 'body', 'category', 'confidence', 'rootCause', 'evidence'],
+    properties: {
+      path: stringEnum(paths),
+      line: { type: 'integer' },
+      severity: stringEnum(['critical', 'warning', 'nit']),
+      title: { type: 'string' },
+      body: { type: 'string' },
+      category: stringEnum(['correctness', 'edge_case', 'security', 'test_gap', 'repository_rule']),
+      confidence: stringEnum(['high', 'medium', 'low']),
+      rootCause: { type: 'string' },
+      evidence,
+    },
+  };
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['reviewedPaths', 'decisions', 'findings'],
+    properties: {
+      reviewedPaths: {
+        type: 'array', minItems: paths.length, maxItems: paths.length,
+        items: stringEnum(paths),
+      },
+      decisions: {
+        type: 'array', minItems: primaryIds.length, maxItems: primaryIds.length,
+        items: {
+          type: 'object', additionalProperties: false, required: ['id', 'decision'],
+          properties: { id: stringEnum(primaryIds), decision: stringEnum(['retain', 'reject', 'uncertain']) },
+        },
+      },
+      findings: { type: 'array', items: finding },
+    },
+  };
+}
 
 export interface FindingEvidence {
   path: string;
@@ -85,6 +143,31 @@ export interface ReviewResult {
   riskMetadata: Array<{ path: string; risk: ChangeRisk }>;
   /** The commit status reported on the PR head, when statuses are enabled. */
   status?: ReviewStatus;
+  /** Replayable, non-secret metadata for the staged review. */
+  trace?: ReviewTrace;
+}
+
+export interface ReviewTraceFinding {
+  path: string;
+  line: number;
+  rootCauseMarker: string;
+}
+
+export interface ReviewTrace {
+  version: 1;
+  identity: { repoId: string; prNumber: number; headSha: string; baseSha: string; provider: string; model: string; config: { maxRetries: number; maxFiles: number } };
+  stages: Array<{
+    stage: 'initial' | 'escalation' | 'verification' | 'final';
+    selectedPaths: string[];
+    hunks: Array<{ path: string; lines: number[] }>;
+    omittedContext: number;
+    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string }>;
+    findingCount: number;
+    primaryFindings?: ReviewTraceFinding[];
+    decisions?: Array<{ id: string | number; decision: string }>;
+    findings?: ReviewTraceFinding[];
+  }>;
+  finalFindings: ReviewTraceFinding[];
 }
 
 export interface ReviewDeps {
@@ -115,6 +198,8 @@ export interface ReviewDeps {
   maxFiles?: number;
   /** Extra attempts for failed batch reviews; default 3, within the total budget. */
   maxRetries?: number;
+  /** Injectable for tests; production waits between rate-limit retries. */
+  sleep?: (ms: number) => Promise<void>;
   /** Commit status context reported on the PR head; blank/undefined disables statuses. */
   statusContext?: string;
   /** Which findings turn the commit status red (default `critical`). */
@@ -238,7 +323,7 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
 function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
   const pathTerms = stem.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
-  const symbols = [...new Set([...identifiers(changedText).slice(0, 3), ...pathTerms])]
+  const symbols = [...new Set([...identifiers(changedText).slice(0, 6), ...pathTerms])]
     .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
   return { stem, symbols };
 }
@@ -250,9 +335,12 @@ async function retrieveTargetedChunks(
   changedText: string,
   identifiers: (text: string) => string[],
   excludePaths: string[],
+  focusText?: string,
 ): Promise<RetrievedChunk[]> {
-  const targeted = contextQuery(path, changedText, identifiers);
-  const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 3);
+  const targeted = focusText?.trim()
+    ? contextQuery(path, focusText, identifiers)
+    : contextQuery(path, changedText, identifiers);
+  const changedSymbols = targeted.symbols.filter((symbol) => !symbol.includes('/') && symbol !== targeted.stem).slice(0, 6);
   const queries = [...changedSymbols];
   const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
   if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
@@ -269,6 +357,18 @@ async function retrieveTargetedChunks(
     selected.push(testChunk);
   }
   return selected.slice(0, 8);
+}
+
+function mergeRelevantChunks(original: RetrievedChunk[], focused: RetrievedChunk[], limit = 8): RetrievedChunk[] {
+  const unique = new Map<number, RetrievedChunk>();
+  for (const chunk of [...original.slice(0, Math.ceil(limit / 2)), ...focused]) unique.set(chunk.chunkId, chunk);
+  const selected = [...unique.values()].slice(0, limit);
+  const testChunk = [...original, ...focused].find((chunk) => /(^|\/)(test|tests|spec|__tests__)(\/|$)|\.(test|spec)\./i.test(chunk.path));
+  if (testChunk && !selected.some((chunk) => chunk.chunkId === testChunk.chunkId)) {
+    selected.pop();
+    selected.push(testChunk);
+  }
+  return selected;
 }
 
 /** Root and ancestor rule files that can apply to the changed paths. */
@@ -302,8 +402,6 @@ const CONTEXT_KEYWORDS = new Set([
 
 /** How many changed files RepoLens fetches the post-change content of. */
 const HEAD_FILES_MAX = 60;
-/** Files larger than this are not worth a prompt slot. */
-const HEAD_FILE_CHARS_MAX = 60_000;
 /** Concurrent `contents` requests. */
 const HEAD_FETCH_CONCURRENCY = 4;
 /** Per referenced file, inside the head-context section. */
@@ -312,6 +410,9 @@ const HEAD_SNIPPET_CHARS_MAX = 8_000;
 const HEAD_CONTEXT_CHARS_MAX = 24_000;
 /** The reviewed file's own content is included in full only up to this size. */
 const OWN_HEAD_CHARS_MAX = 12_000;
+const OWN_HEAD_WINDOW_RADIUS = 20;
+const OWN_HEAD_WINDOW_COUNT_MAX = 8;
+const OWN_HEAD_LINE_CHARS_MAX = 600;
 const RULE_FILES_MAX = 16;
 const RULE_REQUESTS_MAX = 128;
 const RULE_CHARS_MAX = 12_000;
@@ -388,6 +489,53 @@ function headBlock(path: string, content: string, max: number): string {
   return `### ${path} (content after this pull request)\n\`\`\`\n${clipContent(content, max)}\n\`\`\``;
 }
 
+/** Render bounded head windows with source line numbers that match the PR head. */
+function headWindowBlock(path: string, content: string, relevantLines: number[]): string {
+  const lines = content.split(/\r?\n/);
+  const points = [...new Set(relevantLines)].filter((line) => Number.isInteger(line) && line > 0 && line <= lines.length).sort((a, b) => a - b);
+  if (!content) return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n\`\`\``;
+
+  const anchors = !points.length ? [1] : points.length <= OWN_HEAD_WINDOW_COUNT_MAX
+    ? points
+    : Array.from({ length: OWN_HEAD_WINDOW_COUNT_MAX }, (_, index) => points[Math.round(index * (points.length - 1) / (OWN_HEAD_WINDOW_COUNT_MAX - 1))]!);
+  const windows: Array<{ start: number; end: number; anchor: number }> = [];
+  for (const line of anchors) {
+    windows.push({
+      start: Math.max(1, line - OWN_HEAD_WINDOW_RADIUS),
+      end: Math.min(lines.length, line + OWN_HEAD_WINDOW_RADIUS),
+      anchor: line,
+    });
+  }
+  const overhead = `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n\`\`\``.length + (windows.length - 1) * 4;
+  const perWindowChars = Math.max(80, Math.floor((OWN_HEAD_CHARS_MAX - overhead) / windows.length));
+  const rendered: string[] = [];
+  for (const window of windows) {
+    const nearby = [window.anchor];
+    for (let distance = 1; distance <= OWN_HEAD_WINDOW_RADIUS; distance++) {
+      if (window.anchor - distance >= window.start) nearby.push(window.anchor - distance);
+      if (window.anchor + distance <= window.end) nearby.push(window.anchor + distance);
+    }
+    const selected = new Map<number, string>();
+    let used = 0;
+    for (const line of nearby) {
+      const prefix = `${line} | `;
+      const text = lines[line - 1] ?? '';
+      const room = perWindowChars - used - prefix.length - 1;
+      if (room < 0) break;
+      const value = text.length > Math.min(OWN_HEAD_LINE_CHARS_MAX, room)
+        ? `${text.slice(0, Math.min(OWN_HEAD_LINE_CHARS_MAX, room))} ... (line truncated)`
+        : text;
+      const output = `${prefix}${value}`;
+      if (used + output.length + 1 > perWindowChars) break;
+      selected.set(line, output);
+      used += output.length + 1;
+    }
+    if (rendered.length) rendered.push('...');
+    for (const line of [...selected.keys()].sort((a, b) => a - b)) rendered.push(selected.get(line)!);
+  }
+  return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n${rendered.join('\n')}\n\`\`\``;
+}
+
 /**
  * The post-change content the model needs to judge `path`: its own new content plus
  * the new content of the changed files it references — the ones a stale index would
@@ -397,6 +545,8 @@ export function buildHeadContext(input: {
   path: string;
   addedText: string;
   headContents: Map<string, string>;
+  /** New-file lines whose surrounding head code is relevant to this review. */
+  relevantLines?: number[];
   /** Precomputed `exportedNames` per path; recomputed here when absent. */
   exportsByPath?: Map<string, Set<string>>;
 }): string {
@@ -439,8 +589,9 @@ export function buildHeadContext(input: {
   }
 
   // The diff alone hides the code around the hunks, so lead with the whole file.
-  if (own !== undefined && own.length <= OWN_HEAD_CHARS_MAX) {
-    blocks.unshift(headBlock(path, own, OWN_HEAD_CHARS_MAX));
+  if (own !== undefined) {
+    const relevantLines = input.relevantLines ?? [];
+    blocks.unshift(headWindowBlock(path, own, relevantLines));
   }
   return blocks.join('\n\n');
 }
@@ -454,20 +605,21 @@ export function buildReviewBody(input: {
   skippedFiles?: string[];
   lineage?: Pick<Lineage, 'reviewNumber' | 'previous'>;
 }): string {
+  const findings = selectPostedFindings(input.findings);
   const counts = { critical: 0, warning: 0, nit: 0 };
-  for (const f of input.findings) counts[f.severity]++;
+  for (const f of findings) counts[f.severity]++;
   const parts: string[] = ['## RepoLens review', '', input.summary.trim(), ''];
   parts.push(
-    `**Verdict:** ${input.verdict} · **Findings:** ${input.findings.length} (${counts.critical} critical, ${counts.warning} warnings, ${counts.nit} nits)`,
+    `**Verdict:** ${input.verdict} · **Findings:** ${findings.length} (${counts.critical} critical, ${counts.warning} warnings, ${counts.nit} nits)`,
   );
-  if (input.findings.length) {
+  if (findings.length) {
     parts.push('');
     parts.push('| Severity | File | Title |');
     parts.push('| --- | --- | --- |');
-    for (const f of input.findings) {
+    for (const f of findings) {
       parts.push(`| ${f.severity} | ${f.path}:${f.line} | ${escapeCell(f.title)} |`);
     }
-    const bodyFindings = input.findings.filter((f) => f.line === 0);
+    const bodyFindings = findings.filter((f) => f.line === 0);
     if (bodyFindings.length) {
       parts.push('');
       parts.push('### Findings without an inline location');
@@ -510,6 +662,31 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return results;
 }
 
+function traceHunks(files: DiffFile[]): Array<{ path: string; lines: number[] }> {
+  return files.map((file) => ({
+    path: file.newPath ?? file.oldPath ?? '',
+    lines: [...new Set(file.hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.newLine !== undefined ? [line.newLine] : line.oldLine !== undefined ? [line.oldLine] : [])))].sort((a, b) => a - b),
+  }));
+}
+
+function traceFinding(finding: Finding): ReviewTraceFinding {
+  return { path: finding.path, line: findingLine(finding), rootCauseMarker: rootCauseMarker(finding) };
+}
+
+function withCorrection(req: CompleteRequest, validationError: string, allowedPathsAndLines: Array<{ path: string; lines: number[] }>): CompleteRequest {
+  const content = req.messages[0]?.content ?? '';
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : { original: parsed };
+  } catch {
+    payload = { original: content };
+  }
+  payload.validationError = validationError;
+  payload.allowedPathsAndLines = allowedPathsAndLines;
+  return { ...req, messages: [{ ...req.messages[0]!, content: JSON.stringify(payload) }, ...req.messages.slice(1)] };
+}
+
 function allowedFindingLines(file: DiffFile): Set<number> {
   const added = changedNewLines(file);
   if (file.status !== 'deleted' && added.size > 0) return added;
@@ -530,6 +707,53 @@ function hunkContainsLine(file: DiffFile, hunkIndex: number, line: number): bool
   const hunk = file.hunks[hunkIndex];
   if (!hunk) return false;
   return hunk.lines.some((item) => item.newLine === line || item.oldLine === line);
+}
+
+/** Keep the first block: the reviewed file's bounded candidate windows come first. */
+function trimVerifierHeadContext(context: string): string {
+  return context.split(/\n\n(?=### )/, 2)[0] ?? context;
+}
+
+function headRelevantLines(file: DiffFile, hunks = file.hunks): number[] {
+  return hunks.flatMap((hunk) => {
+    const lines = hunk.lines.flatMap((line) => line.newLine === undefined ? [] : [line.newLine]);
+    // A deletion-only hunk has no new-file lines; anchor it at the first
+    // post-change line so surrounding guards/exits remain inspectable.
+    if (!lines.length) return [Math.max(1, hunk.newStart)];
+    return lines[0] === lines[lines.length - 1] ? [lines[0]!] : [lines[0]!, lines[lines.length - 1]!];
+  });
+}
+
+type VerifierContextFile = {
+  path: string;
+  currentEvidence?: Array<{ line?: number }>;
+  headContext?: string;
+};
+
+/** Accept only citations that point at supplied post-change evidence. */
+export function hasValidVerifierCitation(decision: Record<string, unknown>, files: VerifierContextFile[]): boolean {
+  const cited = new Set<string>();
+  for (const file of files) {
+    for (const evidence of file.currentEvidence ?? []) {
+      if (Number.isInteger(evidence.line) && evidence.line! > 0) cited.add(`${file.path}:${evidence.line}`);
+    }
+    let currentPath = '';
+    for (const line of file.headContext?.split(/\r?\n/) ?? []) {
+      const heading = /^### (.+) \(content after this pull request/.exec(line);
+      if (heading) currentPath = heading[1]!;
+      const numbered = /^(\d+) \| /.exec(line);
+      if (numbered && currentPath === file.path) cited.add(`${file.path}:${Number(numbered[1])}`);
+    }
+  }
+  const evidence = decision.evidence;
+  const candidates = Array.isArray(evidence) ? evidence : evidence && typeof evidence === 'object' ? [evidence] : [];
+  for (const item of candidates) {
+    if (!item || typeof item !== 'object') continue;
+    const path = typeof (item as Record<string, unknown>).path === 'string' ? (item as Record<string, unknown>).path : '';
+    const line = (item as Record<string, unknown>).line;
+    if (typeof line === 'number' && Number.isInteger(line) && line > 0 && cited.has(`${path}:${line}`)) return true;
+  }
+  return false;
 }
 
 export function parseFindings(raw: string, file: DiffFile): Finding[] {
@@ -589,31 +813,67 @@ export function parseFindings(raw: string, file: DiffFile): Finding[] {
   return out;
 }
 
-/** Select the comments to send to GitHub while retaining all findings for status and storage. */
-export function selectPostedFindings(findings: Finding[], limit = 3): Finding[] {
+function findingGroups(findings: Finding[]): Map<string, Finding[]> {
   const groups = new Map<string, Finding[]>();
-  for (const finding of findings) {
-    const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+  for (const finding of findings.filter((finding) => finding.category !== 'test_gap')) {
+    const key = rootCauseMarker(finding);
     const group = groups.get(key);
     if (group) group.push(finding);
     else groups.set(key, [finding]);
   }
+  return groups;
+}
+
+/** Select one deterministic, non-test-gap finding per root cause for publication. */
+export function selectPostedFindings(findings: Finding[]): Finding[] {
+  const groups = findingGroups(findings);
   const rank = (f: Finding) => severityRank(f.severity);
   const representative = (group: Finding[]) => [...group].sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path) || a.line - b.line || a.title.localeCompare(b.title))[0]!;
-  return [...groups.entries()]
+  const canonical = [...groups.entries()]
     .map(([key, group]) => ({ key, group, finding: representative(group) }))
-    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || a.key.localeCompare(b.key))
-    .slice(0, Math.max(0, limit))
-    .map(({ group, finding }) => {
-      const related = group.filter((other) => other !== finding && other.line > 0);
-      if (!related.length) return finding;
-      return { ...finding, body: `${finding.body}\n\nRelated locations: ${related.map((other) => `${other.path}:${other.line}`).join(', ')}` };
-    });
+    .sort((a, b) => rank(a.finding) - rank(b.finding) || a.finding.path.localeCompare(b.finding.path) || a.finding.line - b.finding.line || normalizedRootCause(a.finding).localeCompare(normalizedRootCause(b.finding)));
+  return canonical.map(({ finding }) => {
+    const key = rootCauseMarker(finding);
+    const group = groups.get(key) ?? [];
+    const related = group.filter((other) => other !== finding && other.line > 0);
+    if (!related.length) return finding;
+    return { ...finding, body: `${finding.body}\n\nRelated locations: ${related.map((other) => `${other.path}:${other.line}`).join(', ')}` };
+  });
+}
+
+const NO_FINDINGS_SUMMARY = 'The review found no actionable issues in the supplied changes.';
+
+export function buildFindingSummary(findings: Finding[]): string {
+  if (!findings.length) return NO_FINDINGS_SUMMARY;
+  const counts = { critical: 0, warning: 0, nit: 0 };
+  for (const finding of findings) counts[finding.severity]++;
+  const count = findings.length === 1 ? '1 actionable issue' : `${findings.length} actionable issues`;
+  const severity = Object.entries(counts).filter(([, n]) => n > 0).map(([name, n]) => `${n} ${name}`).join(', ');
+  const details = findings.map((finding) => `${finding.title} (${finding.path}:${finding.line || 'body'})`).join('; ');
+  return `The review found ${count} (${severity}): ${details}.`;
+}
+
+function normalizedRootCause(finding: Finding): string {
+  const cause = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title.trim()}`;
+  return cause.replace(/\s+/g, ' ').toLowerCase();
 }
 
 function rootCauseMarker(finding: Finding): string {
-  const cause = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title.trim()}`;
-  return createHash('sha256').update(cause.replace(/\s+/g, ' ').toLowerCase()).digest('hex').slice(0, 16);
+  return createHash('sha256').update(normalizedRootCause(finding)).digest('hex').slice(0, 16);
+}
+
+function primaryFindingIds(findings: Finding[]): string[] {
+  const counts = new Map<string, number>();
+  return findings.map((finding) => {
+    const base = `${rootCauseMarker(finding)}:${finding.path}:${findingLine(finding)}`;
+    const count = counts.get(base) ?? 0;
+    counts.set(base, count + 1);
+    return count ? `${base}:${count}` : base;
+  });
+}
+
+function verdictForFindings(findings: Finding[]): Verdict {
+  return findings.some((finding) => finding.severity === 'critical') ? 'request_changes' : findings.length ? 'comment' : 'approve';
 }
 
 function postedFindingBody(finding: Finding): string {
@@ -712,11 +972,12 @@ interface PostContext {
 async function postReview(ctx: PostContext, result: ReviewResult): Promise<void> {
   const { db, github, llm, repo, pr, log } = ctx;
   const warnings = result.warnings;
+  const publishedFindings = result.findings;
 
   let body = buildReviewBody({
     summary: result.summary,
     verdict: result.verdict,
-    findings: result.findings,
+    findings: publishedFindings,
     providerName: llm.name,
     model: llm.model,
     skippedFiles: result.skippedFiles,
@@ -728,13 +989,13 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
   }
 
   // Drop findings that were already commented on an earlier run (e.g. a `synchronize` event).
-  let comments = result.findings;
+  let comments = publishedFindings;
   try {
     const existing = await github.listReviewComments(repo.owner, repo.name, result.prNumber);
     const existingMarkers = new Set(existing.flatMap((comment) => [...comment.body.matchAll(/repolens-root-cause:([a-f0-9]{16})/g)].map((match) => match[1]!)));
     const groups = new Map<string, Finding[]>();
     for (const finding of comments) {
-      const key = finding.rootCause?.trim() || `${finding.path}:${finding.line}:${finding.title}`;
+      const key = rootCauseMarker(finding);
       const group = groups.get(key);
       if (group) group.push(finding); else groups.set(key, [finding]);
     }
@@ -761,7 +1022,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
       commitId: pr.headSha,
       body,
       event: result.verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT',
-      comments: selectPostedFindings(comments.filter((f) => f.line > 0)).map((f) => ({
+      comments: comments.filter((f) => f.line > 0).map((f) => ({
         path: f.path,
         line: f.line,
         body: postedFindingBody(f),
@@ -786,10 +1047,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   let costUsd: number | null = 0;
   let reservedUsd = 0;
   let usedUsd = 0;
-  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null }> => {
+  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string }> = [];
+  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
+    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error' } : undefined;
+    if (traceCall) traceCalls.push(traceCall);
+    const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
     if (req.reviewBudget && reservedUsd + estimate > REVIEW_MAX_USD) {
-      throw new Error(`Review stage exceeds the remaining $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
+      throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
     reservedUsd += estimate;
     const call = { reported: false, costUsd: 0 as number | null };
@@ -809,16 +1074,41 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (req.reviewBudget && validCost) {
       usedUsd += call.costUsd!;
       reservedUsd += call.costUsd! - estimate;
+    } else if (req.reviewBudget && threw && !call.reported && error instanceof ProviderError && error.status === 429) {
+      reservedUsd -= estimate;
     }
     if (req.reviewBudget && reservedUsd > REVIEW_MAX_USD) {
-      return { raw, error: new Error(`Review exceeds the $0.25 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null };
+      if (traceCall) traceCall.outcome = 'error';
+      return { raw, error: new Error(`Review exceeds the $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}; no review was published.`), failed: true, costUsd: validCost ? call.costUsd : null, traceIndex };
     }
-    return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null };
+    if (traceCall) {
+      traceCall.costUsd = validCost ? call.costUsd : null;
+      traceCall.outcome = threw ? 'error' : 'success';
+    }
+    return { raw, error: threw ? error : undefined, failed: threw, costUsd: validCost ? call.costUsd : null, traceIndex };
   };
-  const complete = async (req: CompleteRequest) => {
-    const result = await completeCall(req);
-    if (result.failed) throw result.error;
-    return result.raw!;
+  const markTraceValidation = (traceIndex: number | undefined, error: unknown) => {
+    if (traceIndex === undefined) return;
+    const trace = traceCalls[traceIndex];
+    if (trace) { trace.outcome = 'validation_error'; trace.failure = errMessage(error); }
+  };
+  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean): Promise<T> => {
+    const run = async (request: CompleteRequest) => {
+      const call = await completeCall(request, provider);
+      if (call.failed) {
+        if (call.error instanceof JsonExtractError || call.error instanceof IncompleteResponseError) markTraceValidation(call.traceIndex, call.error);
+        throw call.error;
+      }
+      try { return parse(call.raw!); }
+      catch (err) { markTraceValidation(call.traceIndex, err); throw err; }
+    };
+    try {
+      return await run(req);
+    } catch (err) {
+      if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError)) throw err;
+      if (!consumeRetryAllowance()) throw err;
+      return run(withCorrection(req, errMessage(err), allowed));
+    }
   };
   const log = deps.log ?? (() => {});
   const identifiers = deps.identifiers ?? defaultIdentifiers;
@@ -876,13 +1166,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       } catch {
         findings = [];
       }
-      findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings);
+      findings = selectPostedFindings(await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, statusWarnings));
       const cachedResult: ReviewResult = {
         reviewId: cached.id,
         prNumber: cached.pr_number,
         headSha: cached.head_sha,
-        summary: cached.summary ?? '',
-        verdict: toVerdict(cached.verdict) ?? 'comment',
+        summary: buildFindingSummary(findings),
+        verdict: verdictForFindings(findings),
         findings,
         posted: cached.posted === 1,
         skippedFiles: [],
@@ -982,8 +1272,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
         if (content === null) {
           log(`review: ${path}: no post-change content at ${shortSha(pr.headSha)}`);
-        } else if (content.length > HEAD_FILE_CHARS_MAX) {
-          warnings.push(`${path}: post-change content skipped (${content.length} chars over the ${HEAD_FILE_CHARS_MAX} limit)`);
         } else {
           headContents.set(path, content);
         }
@@ -1003,6 +1291,25 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
     }
     const files = reviewable;
+    let initialOmittedContext = 0;
+    let escalationOmittedContext = 0;
+    let verifierOmittedContext = 0;
+    let primaryTrace: Finding[] = [];
+    let escalationDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let escalationFindingsTrace: Finding[] | undefined;
+    let verifierDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let verifierSelectedPaths = new Set<string>();
+    let verifierExecuted = false;
+    let verifierFindingsTrace: Finding[] = [];
+    const maxRetries = deps.maxRetries ?? 3;
+    let retryAttemptsUsed = 0;
+    let correctiveRetryUsed = false;
+    const consumeRetryAllowance = (corrective = false): boolean => {
+      if (retryAttemptsUsed >= maxRetries || corrective && correctiveRetryUsed) return false;
+      retryAttemptsUsed++;
+      if (corrective) correctiveRetryUsed = true;
+      return true;
+    };
 
     const historyPathSet = new Set<string>();
     for (const file of files) {
@@ -1087,10 +1394,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           log(`review: ${path}: no post-change content at ${shortSha(pr.headSha)}`);
           return;
         }
-        if (content.length > HEAD_FILE_CHARS_MAX) {
-          warnings.push(`${path}: post-change content skipped (${content.length} chars over the ${HEAD_FILE_CHARS_MAX} limit)`);
-          return;
-        }
         headContents.set(path, content);
       } catch (err) {
         const msg = `${path}: fetching post-change content failed: ${errMessage(err)}`;
@@ -1113,6 +1416,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     };
 
     const relevantContextByPath = new Map<string, string>();
+    const relevantChunksByPath = new Map<string, RetrievedChunk[]>();
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
@@ -1129,11 +1433,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }) }],
         json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true, reviewStage: 'initial',
       };
-      const maxRetries = deps.maxRetries ?? 3;
       // Reject the core prompt before the retrieval loop or any inference call.
       const coreCost = reviewCostUpperBound(req);
       if (coreCost > REVIEW_MAX_USD) {
-        throw new Error('Review exceeds the $0.25 budget; split this pull request into smaller reviews.');
+        throw new Error('Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       // Reserve half the ceiling for one retry while keeping the full core diff.
       const optionalContextBudget = maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
@@ -1151,7 +1454,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       for (const file of files) {
         const path = file.newPath ?? file.oldPath!;
         const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
-        const headContext = buildHeadContext({ path, addedText: added, headContents, exportsByPath });
+        const headContext = buildHeadContext({ path, addedText: added, relevantLines: headRelevantLines(file), headContents, exportsByPath });
         if (headContext) addContext(`Relevant post-change context for ${path} (authoritative):\n${headContext}`);
       }
       if (rules) addContext(rules);
@@ -1163,6 +1466,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
           const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
+          relevantChunksByPath.set(path, selected);
           relevantContextByPath.set(path, formatContext(selected));
           for (const chunk of selected) {
             if (seen.has(chunk.chunkId)) continue;
@@ -1173,15 +1477,20 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
         }
       }
-      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.25; all file diffs included.`);
+      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.50; all file diffs included.`);
+      initialOmittedContext = omitted;
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let providerIndex = 0;
       let lastRetryError: unknown;
+      let attemptReq = req;
+      const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
       for (let attempt = 0; ; attempt++) {
         await assertHeadUnchanged();
+        let traceIndex: number | undefined;
         try {
-          const call = await completeCall(req);
+          const call = await completeCall(attemptReq);
+          traceIndex = call.traceIndex;
           if (call.failed) throw call.error;
           const obj = extractJson(call.raw!) as Record<string, unknown>;
           if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
@@ -1200,20 +1509,39 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           batch = { findings, summary: obj.summary.trim(), verdict: toVerdict(obj.verdict)! };
           break;
         } catch (err) {
+          const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
+          if (malformed) {
+            markTraceValidation(traceIndex, err);
+            if (!consumeRetryAllowance(true)) throw err;
+            attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
+            const previous = activeLlm.model;
+            activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
+            const message = `${previous}: ${errMessage(err)}; corrective retry with ${activeLlm.model}`;
+            warnings.push(message);
+            log(`review: ${message}`);
+            continue;
+          }
           const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
             err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
-          if (!retryable || attempt >= maxRetries) {
+          if (correctiveRetryUsed) throw err;
+          if (!retryable || !consumeRetryAllowance()) {
             if (lastRetryError && /budget/i.test(errMessage(err))) {
               throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
             }
             throw err;
           }
           lastRetryError = err;
+          attemptReq = req;
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
-          const message = `${previous}: ${errMessage(err)}; retry ${attempt + 1}/${maxRetries} with ${activeLlm.model}`;
+          const message = `${previous}: ${errMessage(err)}; retry ${retryAttemptsUsed}/${maxRetries} with ${activeLlm.model}`;
           warnings.push(message);
           log(`review: ${message}`);
+          if (err instanceof ProviderError && err.status === 429) {
+            await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(
+              Math.min(60_000, 15_000 * 2 ** (retryAttemptsUsed - 1)),
+            );
+          }
         }
       }
     }
@@ -1223,19 +1551,21 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const changedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content))
         .join('\n');
-      const headContext = buildHeadContext({ path, addedText: changedText, headContents, exportsByPath });
+      const headContext = buildHeadContext({ path, addedText: changedText, relevantLines: headRelevantLines(file), headContents, exportsByPath });
       let context = '';
       try {
         // Excluding every changed path keeps pre-change chunks of this PR's files
         // out of the prompt; their post-change content is in `headContext` instead.
-        context = formatContext(await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths));
+        const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
+        relevantChunksByPath.set(path, selected);
+        context = formatContext(selected);
         relevantContextByPath.set(path, context);
       } catch (err) {
         warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
       }
       await assertHeadUnchanged();
       try {
-        const raw = await complete({
+        const call = await completeCall({
           system: FILE_REVIEW_SYSTEM_PROMPT,
           messages: [
             {
@@ -1258,8 +1588,18 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           ],
           json: true,
           maxTokens: 2000,
+          reviewStage: 'initial',
         });
-        return parseFindings(raw, file);
+        if (call.failed) {
+          if (call.error instanceof JsonExtractError || call.error instanceof IncompleteResponseError) markTraceValidation(call.traceIndex, call.error);
+          throw call.error;
+        }
+        try {
+          return parseFindings(call.raw!, file);
+        } catch (err) {
+          markTraceValidation(call.traceIndex, err);
+          throw err;
+        }
       } catch (err) {
         const msg = `${path}: ${errMessage(err)}`;
         warnings.push(msg);
@@ -1269,9 +1609,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     });
 
     let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-    let stagedSummary: string | undefined;
-    let stagedVerdict: Verdict | undefined;
-
+    primaryTrace = findings.slice();
     const riskyFiles = files.flatMap((file) => {
       const hunks = file.hunks.filter((_, index) => {
         const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });
@@ -1279,148 +1617,244 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       });
       return hunks.length ? [{ ...file, hunks }] : [];
     });
+    const buildVerifierFiles = (candidateFindings: Finding[], trimOptionalContext: boolean) => files.flatMap((file) => {
+      const path = file.newPath ?? file.oldPath!;
+      const lines = candidateFindings.filter((finding) => finding.path === path).map(findingLine);
+      const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
+      if (!hunks.length) return [];
+      const headContext = buildHeadContext({
+        path, addedText: hunkText({ ...file, hunks }, Infinity),
+        relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents, exportsByPath,
+      });
+      return [{
+        path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
+        currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
+          line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
+        }])),
+        removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
+          line: line.oldLine, kind: 'removed', content: line.content,
+        }])),
+        headContext: trimOptionalContext ? trimVerifierHeadContext(headContext) : headContext,
+        ...(!trimOptionalContext && relevantContextByPath.get(path) ? { relevantContext: relevantContextByPath.get(path) } : {}),
+      }];
+    });
+    const verifierRequest = (candidateFindings: Finding[], trimOptionalContext = false): CompleteRequest => ({
+      system: VERIFIER_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: JSON.stringify({
+        rules, files: buildVerifierFiles(candidateFindings, trimOptionalContext),
+        findings: candidateFindings.map((finding, id) => ({ id, finding })),
+      }) }],
+      json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'verification',
+    });
     if (escalationLlm && riskyFiles.length) {
       await assertHeadUnchanged();
       const paths = riskyFiles.map((file) => file.newPath ?? file.oldPath!);
-      const escalationPayload = {
+      const escalationPayload: {
+        prTitle: string;
+        prBody: string;
+        files: Array<{
+          path: string;
+          status: string;
+          risk: ChangeRisk;
+          diff: string;
+          allowedFindingLines: number[];
+          headContext?: string;
+          relevantContext?: string;
+          historical?: string;
+        }>;
+        rules?: string;
+        provisionalFindings: Array<{ id: string; finding: Finding }>;
+      } = {
         prTitle: pr.title,
         prBody: pr.body,
         files: riskyFiles.map((file) => {
           const path = file.newPath ?? file.oldPath!;
+          const headContext = buildHeadContext({ path, addedText: hunkText(file, Infinity), relevantLines: headRelevantLines(file), headContents, exportsByPath });
+          const relevantContext = relevantContextByPath.get(path) ?? '';
+          const historical = renderHistoricalContext(historyFor(file.oldPath, file.newPath));
           return {
             path, status: file.status, risk: assessChange(file), diff: hunkText(file, Infinity),
             allowedFindingLines: [...allowedFindingLines(file)].sort((a, b) => a - b),
-            headContext: buildHeadContext({ path, addedText: hunkText(file, Infinity), headContents, exportsByPath }),
-            relevantContext: relevantContextByPath.get(path) ?? '',
-            historical: renderHistoricalContext(historyFor(file.oldPath, file.newPath)),
+            ...(headContext ? { headContext } : {}),
+            ...(relevantContext ? { relevantContext } : {}),
+            ...(historical ? { historical } : {}),
           };
         }),
-        rules,
-        provisionalFindings: findings.filter((finding) => riskyFiles.some((file) =>
-          (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding)))),
+        ...(rules ? { rules } : {}),
+        provisionalFindings: [],
       };
-      const call = await completeCall({
+      const primaryFindings = findings.filter((finding) => riskyFiles.some((file) =>
+        (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding))));
+      const primaryIds = primaryFindingIds(primaryFindings);
+      const primaryById = new Map(primaryIds.map((id, index) => [id, primaryFindings[index]!]));
+      escalationPayload.provisionalFindings = primaryFindings.map((finding, index) => ({ id: primaryIds[index]!, finding }));
+      const escalationRequest = () => ({
         system: ESCALATION_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
-        json: true, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'escalation',
-      }, escalationLlm);
-      if (call.failed) throw call.error;
-      const obj = extractJson(call.raw!) as Record<string, unknown>;
-      if (!obj || !Array.isArray(obj.findings) || !hasExactReviewedPaths(obj.reviewedPaths, paths) ||
-          obj.findings.some((finding: unknown) => !finding || typeof finding !== 'object' || !paths.includes((finding as { path?: string }).path ?? ''))) {
-        throw new IncompleteResponseError(escalationLlm.name, 'Incomplete escalation response; no review was published.');
+        json: true, jsonSchema: buildEscalationJsonSchema(paths, primaryIds), maxTokens: REVIEW_ESCALATION_MAX_OUTPUT,
+        reviewBudget: budgeted, reviewStage: 'escalation',
+      } satisfies CompleteRequest);
+      const verifierReserve = budgeted && verifierLlm ? (() => {
+        const full = verifierRequest(findings);
+        const trimmed = verifierRequest(findings, true);
+        // ponytail: reserve four UTF-8 bytes per possible escalation output token;
+        // replace with provider tokenization if added-finding payloads need tighter packing.
+        full.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
+        trimmed.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
+        const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
+        return reviewCostUpperBound(reserve);
+      })() : 0;
+      const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
+      const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
+      let omitted = 0;
+      let req = escalationRequest();
+      while (reviewCostUpperBound(req) > remaining && optionalFields.length) {
+        const field = optionalFields.shift()!;
+        if (field === 'rules') delete escalationPayload.rules;
+        else for (const file of escalationPayload.files) delete file[field];
+        omitted++;
+        req = escalationRequest();
       }
-      let escalated: Finding[];
-      try {
-        escalated = riskyFiles.flatMap((file) => parseFindings(JSON.stringify({
-          findings: (obj.findings as Array<{ path?: string }>).filter((finding) => finding.path === (file.newPath ?? file.oldPath)),
-        }), file));
-      } catch (err) {
-        throw new IncompleteResponseError(escalationLlm.name, `Invalid escalation response: ${errMessage(err)}`);
+      const escalationEstimate = reviewCostUpperBound(req);
+      if (escalationEstimate > remaining) {
+        throw new Error(`Escalation core exceeds the remaining $0.50 review budget; reserved $${reservedUsd.toFixed(6)}, verifier reserve $${verifierReserve.toFixed(6)}, core $${escalationEstimate.toFixed(6)}; no review was published.`);
       }
-      findings = findings.filter((finding) => !riskyFiles.some((file) =>
-        (file.newPath ?? file.oldPath) === finding.path && allowedFindingLines(file).has(findingLine(finding))));
-      findings.push(...escalated);
+      if (omitted) warnings.push(`Escalation omitted ${omitted} optional context block${omitted === 1 ? '' : 's'} to stay within the remaining review budget; risky diff hunks were preserved.`);
+      escalationOmittedContext = omitted;
+      const parseEscalation = (raw: string) => {
+        const obj = extractJson(raw) as Record<string, unknown>;
+        if (!obj || !hasExactReviewedPaths(obj.reviewedPaths, paths)) {
+          throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: reviewedPaths must contain exactly every selected path; no review was published.');
+        }
+        const decisions = Array.isArray(obj.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
+        const decisionIds = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
+        if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision) ||
+            Object.keys(decision).some((key) => key !== 'id' && key !== 'decision')) ||
+            decisions.length !== primaryIds.length || new Set(decisionIds).size !== primaryIds.length ||
+            decisionIds.some((id) => typeof id !== 'string' || !primaryById.has(id)) ||
+            decisions.some((decision) => !['retain', 'reject', 'uncertain'].includes(String(decision.decision)))) {
+          throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: decisions must contain exactly one retain, reject, or uncertain decision for every primary finding; no review was published.');
+        }
+        if (!Array.isArray(obj.findings) || obj.findings.some((finding: unknown) =>
+          !finding || typeof finding !== 'object' || Array.isArray(finding) ||
+          !paths.includes((finding as { path?: string }).path ?? ''))) {
+          throw new IncompleteResponseError(escalationLlm.name, 'Invalid escalation response: findings must be objects whose path is one of the selected paths; no review was published.');
+        }
+        let escalated: Finding[];
+        try {
+          escalated = riskyFiles.flatMap((file) => parseFindings(JSON.stringify({
+            findings: (obj.findings as Array<{ path?: string }>).filter((finding) => finding.path === (file.newPath ?? file.oldPath)),
+          }), file));
+        } catch (err) {
+          throw new IncompleteResponseError(escalationLlm.name, `Invalid escalation response: ${errMessage(err)}`);
+        }
+        return { decisions, escalated };
+      };
+      const escalationResult = await completeStructured(req, escalationLlm, parseEscalation,
+        riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })),
+        () => consumeRetryAllowance(true));
+      const { decisions, escalated } = escalationResult;
+      escalationDecisionsTrace = decisions.map((decision) => ({ id: decision.id as string, decision: String(decision.decision) }));
+      escalationFindingsTrace = escalated.slice();
+      const rejected = new Set(decisions.filter((decision) => decision.decision === 'reject').map((decision) => primaryById.get(decision.id as string)));
+      findings = findings.filter((finding) => !rejected.has(finding));
+      findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary &&
+        primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
       findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-      if (!findings.length) {
-        stagedSummary = 'The review found no actionable issues in the supplied changes.';
-        stagedVerdict = 'approve';
-      }
     }
 
-    const findingsBeforeRuleValidation = findings.length;
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
-    if (findingsBeforeRuleValidation && !findings.length) {
-      stagedSummary = 'The review found no actionable issues in the supplied changes.';
-      stagedVerdict = 'approve';
-    }
     if (verifierLlm && findings.length) {
       await assertHeadUnchanged();
-      const verifierFiles = files.flatMap((file) => {
-        const path = file.newPath ?? file.oldPath!;
-        const lines = findings.filter((finding) => finding.path === path).map(findingLine);
-        const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
-        return hunks.length ? [{
-          path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
-          currentEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type === 'del' || line.newLine === undefined ? [] : [{
-            line: line.newLine, kind: line.type === 'add' ? 'added' : 'context', content: line.content,
-          }])),
-          removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
-            line: line.oldLine, kind: 'removed', content: line.content,
-          }])),
-          headContext: buildHeadContext({ path, addedText: hunkText({ ...file, hunks }, Infinity), headContents, exportsByPath }),
-          relevantContext: relevantContextByPath.get(path) ?? '',
-        }] : [];
-      });
-      const call = await completeCall({
-        system: VERIFIER_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify({
-          rules, files: verifierFiles,
-          findings: findings.map((finding, id) => ({ id, finding })),
-        }) }],
-        json: true, maxTokens: 2000, reviewBudget: budgeted, reviewStage: 'verification',
-      }, verifierLlm);
-      if (call.failed) throw call.error;
-      const obj = extractJson(call.raw!) as Record<string, unknown>;
-      const verdict = toVerdict(obj?.verdict);
-      const summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
-      const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
-      const ids = decisions.map((decision) => decision.id);
-      if (!summary || !verdict || decisions.length !== findings.length || new Set(ids).size !== findings.length ||
-          ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
-          decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
-            typeof decision.explanation !== 'string' || !decision.explanation.trim())) {
-        throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
+      // The initial retrieval only knows the diff. Refresh each finding's
+      // context with its implicated identifiers/callees before verification.
+      for (const path of new Set(findings.map((finding) => finding.path))) {
+        const file = files.find((candidate) => (candidate.newPath ?? candidate.oldPath) === path);
+        if (!file) continue;
+        const changedText = file.hunks.flatMap((hunk) => hunk.lines
+          .filter((line) => line.type === 'add' || line.type === 'del')
+          .map((line) => line.content)).join('\n');
+        const focusText = findings.filter((finding) => finding.path === path).map((finding) => [
+          finding.title, finding.body, finding.rootCause, finding.evidence?.trigger, finding.evidence?.consequence,
+        ].filter(Boolean).join(' ')).join('\n');
+        try {
+          const focused = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths, focusText);
+          if (focused.length) {
+            const merged = mergeRelevantChunks(relevantChunksByPath.get(path) ?? [], focused);
+            relevantChunksByPath.set(path, merged);
+            relevantContextByPath.set(path, formatContext(merged));
+          }
+        } catch (err) {
+          warnings.push(`${path}: finding retrieval failed: ${errMessage(err)}`);
+        }
       }
+      const fullVerifierReq = verifierRequest(findings);
+      const verifierReq = !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd
+        ? fullVerifierReq : verifierRequest(findings, true);
+      verifierOmittedContext = verifierReq === fullVerifierReq ? 0 : 1;
+      const verifierPayload = JSON.parse(verifierReq.messages[0]!.content) as { files: VerifierContextFile[] };
+      const verifierFiles = verifierPayload.files;
+      verifierSelectedPaths = new Set(verifierFiles.map((file) => file.path));
+      const allowedVerifierLines = verifierFiles.map((file) => {
+        const lines = new Set<number>((file.currentEvidence ?? []).flatMap((item) => Number.isInteger(item.line) && item.line! > 0 ? [item.line!] : []));
+        let currentPath = '';
+        for (const line of file.headContext?.split(/\r?\n/) ?? []) {
+          const heading = /^### (.+) \(content after this pull request/.exec(line);
+          if (heading) currentPath = heading[1]!;
+          const numbered = /^(\d+) \| /.exec(line);
+          if (numbered && currentPath === file.path) lines.add(Number(numbered[1]));
+        }
+        return { path: file.path, lines: [...lines].sort((a, b) => a - b) };
+      });
+      verifierExecuted = true;
+      verifierFindingsTrace = findings.slice();
+      const parseVerification = (raw: string) => {
+        const obj = extractJson(raw) as Record<string, unknown>;
+        const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
+        const ids = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
+        if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision)) ||
+            decisions.length !== findings.length || new Set(ids).size !== findings.length ||
+            ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
+            decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
+              typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
+              (decision.decision === 'supported' || decision.decision === 'contradicted') && !hasValidVerifierCitation(decision, verifierFiles))) {
+          throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
+        }
+        return decisions;
+      };
+      const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines,
+        () => consumeRetryAllowance(true));
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
+      verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
-      stagedSummary = findings.length ? summary : 'The review found no actionable issues in the supplied changes.';
-      stagedVerdict = verdict;
     }
-    const hasCritical = findings.some((f) => f.severity === 'critical');
+    findings = selectPostedFindings(findings);
 
     await assertHeadUnchanged();
-    let summary = '';
-    let verdict: Verdict = 'comment';
-    try {
-      if (stagedSummary) {
-        summary = stagedSummary;
-        verdict = stagedVerdict ?? 'comment';
-      } else if (batch) {
-        summary = batch.summary;
-        verdict = batch.verdict;
-      } else {
-        const raw = await complete({
-          system: lineage.previous ? FOLLOWUP_SUMMARY_SYSTEM_PROMPT : SUMMARY_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: 'user',
-              content: buildSummaryMessage({
-                prTitle: pr.title,
-                prBody: pr.body,
-                files: files.map((f) => ({ path: f.newPath ?? f.oldPath!, status: f.status })),
-                findings,
-                lineage,
-                historical: historyFor(...historyPaths),
-              }),
-            },
-          ],
-          json: true,
-          maxTokens: 800,
-        });
-        const obj = extractJson(raw) as Record<string, unknown>;
-        summary = typeof obj?.summary === 'string' ? obj.summary.trim() : '';
-        verdict = toVerdict(obj?.verdict) ?? 'comment';
-        if (!summary) throw new Error('summary missing from model output');
-      }
-    } catch (err) {
-      const msg = `summary: ${errMessage(err)}`;
-      warnings.push(msg);
-      log(`review: ${msg}`);
-      throw new Error(`summary review failed: ${errMessage(err)}`);
-    }
-    if (stagedSummary) verdict = hasCritical ? 'request_changes' : findings.length ? 'comment' : 'approve';
-    else if (verdict === 'request_changes' && !hasCritical) verdict = 'comment';
+    const summary = buildFindingSummary(findings);
+    const verdict = verdictForFindings(findings);
+    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; findings?: Finding[] } = {}) => ({
+      stage,
+      selectedPaths: selected.map((file) => file.newPath ?? file.oldPath ?? ''),
+      hunks: traceHunks(selected),
+      omittedContext,
+      calls: traceCalls.filter((call) => call.stage === stage),
+      findingCount: extra.findings?.length ?? extra.primaryFindings?.length ?? 0,
+      ...(extra.primaryFindings ? { primaryFindings: extra.primaryFindings.map(traceFinding) } : {}),
+      ...(extra.decisions ? { decisions: extra.decisions } : {}),
+      ...(extra.findings ? { findings: extra.findings.map(traceFinding) } : {}),
+    });
+    const trace: ReviewTrace = {
+      version: 1,
+      identity: { repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha, provider: activeLlm.name, model: activeLlm.model, config: { maxRetries, maxFiles } },
+      stages: [
+        traceStage('initial', files, initialOmittedContext, { primaryFindings: primaryTrace }),
+        ...(escalationLlm && riskyFiles.length ? [traceStage('escalation', riskyFiles, escalationOmittedContext, { primaryFindings: primaryTrace.filter((finding) => riskyFiles.some((file) => (file.newPath ?? file.oldPath) === finding.path)), decisions: escalationDecisionsTrace, findings: escalationFindingsTrace })] : []),
+        ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, findings: verifierFindingsTrace })] : []),
+        traceStage('final', files, 0, { findings: findings.slice() }),
+      ],
+      finalFindings: findings.map(traceFinding),
+    };
 
     if (!repo.last_commit) {
       warnings.push('Repository has not been indexed; review ran without codebase context.');
@@ -1452,6 +1886,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       skippedFiles,
       warnings,
       riskMetadata: files.map((file) => ({ path: file.newPath ?? file.oldPath!, risk: assessChange(file) })),
+      trace,
     };
 
     postCtx.llm = activeLlm;

@@ -33,19 +33,20 @@ describe('OpenRouter review budget', () => {
   const req = { messages: [{ role: 'user' as const, content: 'review this' }], reviewBudget: true, maxTokens: REVIEW_MAX_OUTPUT };
 
   it.each(['qwen/qwen3-coder', 'qwen/qwen3-coder-next', 'other/coder'])('enforces routing prices and UTF-8 budget bounds for %s', async (model) => {
-    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const f = fakeFetch(Array.from({ length: 2 }, () => jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })));
     const p = new OpenRouterProvider({ apiKey: 'k', model, fetch: f.fetch, reasoningEffort: 'high' });
     const larger = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(20000) }] };
-    expect(REVIEW_MAX_USD).toBe(0.245);
+    expect(REVIEW_MAX_USD).toBe(0.495);
     expect(reviewCostUpperBound(larger)).toBeGreaterThan(0.045);
     await p.complete(larger);
     const body = JSON.parse(String(f.calls[0]!.init.body));
-    expect(body.provider).toEqual({ sort: 'price', require_parameters: true, allow_fallbacks: false, max_price: { prompt: 0.4, completion: 2, request: 0 } });
+    expect(body.provider).toEqual({ order: ['DeepInfra', 'Google', 'Venice', 'Novita'], require_parameters: true, allow_fallbacks: true, max_price: { prompt: 0.4, completion: 2, request: 0 } });
     expect(body.reasoning).toBeUndefined();
-    const huge = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(150000) }] };
+    await p.complete({ ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(150000) }] });
+    const huge = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(310000) }] };
     expect(reviewCostUpperBound(huge)).toBeGreaterThan(REVIEW_MAX_USD);
-    await expect(p.complete(huge)).rejects.toThrow('$0.25');
-    expect(f.calls).toHaveLength(1);
+    await expect(p.complete(huge)).rejects.toThrow('$0.50');
+    expect(f.calls).toHaveLength(2);
   });
 
   it('allows the higher configured price ceiling only for escalation', async () => {
@@ -53,7 +54,7 @@ describe('OpenRouter review budget', () => {
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
     await p.complete({ ...req, reviewStage: 'escalation' });
     const body = JSON.parse(String(f.calls[0]!.init.body));
-    expect(body.provider.max_price).toEqual({ prompt: 1, completion: 4, request: 0 });
+    expect(body.provider).toEqual({ order: ['DeepInfra', 'Google', 'Venice', 'Novita'], require_parameters: true, allow_fallbacks: true, max_price: { prompt: 1, completion: 4, request: 0 } });
   });
 
   it('allows 16k output only for escalation and rejects larger or other-stage requests before fetch', async () => {
@@ -61,10 +62,27 @@ describe('OpenRouter review budget', () => {
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
     await p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewStage: 'escalation' });
     expect(JSON.parse(String(f.calls[0]!.init.body)).max_tokens).toBe(16000);
-    await expect(p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT + 1, reviewStage: 'escalation' })).rejects.toThrow('$0.25');
-    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'initial' })).rejects.toThrow('$0.25');
-    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'verification' })).rejects.toThrow('$0.25');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT + 1, reviewStage: 'escalation' })).rejects.toThrow('$0.50');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'initial' })).rejects.toThrow('$0.50');
+    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'verification' })).rejects.toThrow('$0.50');
     expect(f.calls).toHaveLength(1);
+  });
+
+  it('sends an optional escalation JSON schema as strict json_schema response format', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'openai/gpt-5-mini', fetch: f.fetch });
+    const schema = { type: 'object', additionalProperties: false, required: ['findings'] };
+    await p.complete({ ...req, reviewStage: 'escalation', json: true, jsonSchema: schema });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).response_format).toEqual({
+      type: 'json_schema',
+      json_schema: { name: 'repolens_escalation', strict: true, schema },
+    });
+  });
+
+  it('includes serialized JSON schema bytes in the review cost bound', () => {
+    const schema = { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } } };
+    const base = { ...req, reviewStage: 'escalation' as const };
+    expect(reviewCostUpperBound({ ...base, jsonSchema: schema })).toBeGreaterThan(reviewCostUpperBound(base));
   });
 
   it('does not retry an ambiguous network failure or server failure', async () => {

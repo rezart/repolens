@@ -181,7 +181,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
         },
         { repoId, prNumber, post: opts.post ?? true, force: opts.force },
       );
-      return { reviewId: result.reviewId, findings: result.findings.length, posted: result.posted, reviewUrl: result.reviewUrl };
+      return { reviewId: result.reviewId, findings: result.findings.length, posted: result.posted, reviewUrl: result.reviewUrl, trace: result.trace };
     },
     { prNumber },
   );

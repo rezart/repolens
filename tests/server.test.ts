@@ -761,7 +761,7 @@ describe('buildDeps', () => {
     const deps = buildDeps(config, () => {});
     try {
       expect(deps.llm.reviewFallbacks?.map((p) => p.model)).toEqual(['qwen/qwen3-coder-next']);
-      expect(deps.escalationLlm?.model).toBe('moonshotai/kimi-k2.7-code');
+      expect(deps.escalationLlm?.model).toBe('openai/gpt-5-mini');
       expect(deps.chatLlm.reviewFallbacks ?? []).toEqual([]);
     } finally {
       deps.db.close();

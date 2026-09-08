@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { openDb, type Db } from '../../src/db.js';
-import type { CompleteRequest, LLMProvider } from '../../src/llm/types.js';
+import { NetworkProviderError, ProviderError, type CompleteRequest, type LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrievedChunk } from '../../src/search/types.js';
 import type {
   PullRequest,
@@ -24,6 +24,8 @@ import {
   buildReviewBody,
   defaultIdentifiers,
   defaultFormatContext,
+  buildHeadContext,
+  hasValidVerifierCitation,
   selectRelevantChunks,
   repositoryRulePaths,
   renderRepositoryRules,
@@ -35,7 +37,7 @@ import {
 } from '../../src/review/reviewer.js';
 
 describe('review finding posting', () => {
-  it('keeps at most three root causes and folds related locations into the strongest comment', () => {
+  it('keeps one representative per root cause and folds related locations into the strongest comment', () => {
     const finding = (path: string, line: number, severity: Finding['severity'], rootCause: string): Finding => ({
       path, line, severity, title: `${rootCause} at ${path}`, body: 'Fix it.', rootCause,
       category: 'correctness', confidence: 'high', evidence: { path, line, trigger: 'input', consequence: 'failure' },
@@ -44,10 +46,33 @@ describe('review finding posting', () => {
       finding('a.ts', 1, 'warning', 'shared'), finding('b.ts', 2, 'critical', 'shared'),
       finding('c.ts', 3, 'warning', 'second'), finding('d.ts', 4, 'nit', 'third'), finding('e.ts', 5, 'warning', 'fourth'),
     ]);
-    expect(selected).toHaveLength(3);
+    expect(selected).toHaveLength(4);
     expect(selected[0]).toMatchObject({ path: 'b.ts', line: 2, rootCause: 'shared' });
     expect(selected[0]!.body).toContain('Related locations: a.ts:1');
-    expect(selected.map((f) => f.rootCause)).toEqual(['shared', 'second', 'fourth']);
+    expect(selected.map((f) => f.rootCause)).toEqual(['shared', 'second', 'fourth', 'third']);
+  });
+
+  it('suppresses test gaps but keeps real findings in test files', () => {
+    const finding = (category: Finding['category'], title: string): Finding => ({
+      path: 'tests/app.test.ts', line: 4, severity: 'warning', title, body: 'Details.', rootCause: title,
+      category, confidence: 'high', evidence: { path: 'tests/app.test.ts', line: 4, trigger: 'input', consequence: 'failure' },
+    });
+    expect(selectPostedFindings([
+      finding('test_gap', 'Missing coverage'), finding('correctness', 'Test crashes'),
+    ]).map((item) => item.title)).toEqual(['Test crashes']);
+  });
+
+  it('groups root causes using the same normalized marker as reruns', () => {
+    const finding = (line: number, severity: Finding['severity'], rootCause: string): Finding => ({
+      path: `src/${line}.ts`, line, severity, title: `Issue ${line}`, body: 'Fix it.', rootCause,
+      category: 'correctness', confidence: 'high', evidence: { path: `src/${line}.ts`, line, trigger: 'input', consequence: 'failure' },
+    });
+    const selected = selectPostedFindings([
+      finding(1, 'warning', 'Shared  cause'), finding(2, 'critical', ' shared cause '),
+    ]);
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toMatchObject({ line: 2, rootCause: ' shared cause ' });
+    expect(selected[0]!.body).toContain('Related locations: src/1.ts:1');
   });
 });
 
@@ -94,15 +119,54 @@ describe('fresh finding evidence validation', () => {
     const firstGithub = fakeGithub();
     await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: firstGithub.github }, { repoId: REPO_ID, prNumber: 42 });
     const firstComment = firstGithub.reviews[0]!.input.comments[0]!;
+    expect(firstComment.body).toContain('Related locations:');
     const secondGithub = fakeGithub(DIFF, PR, { existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
     const second = await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: secondGithub.github }, { repoId: REPO_ID, prNumber: 42, force: true });
     expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
-    expect(second.warnings).toContain('Skipped 2 findings already commented');
+    expect(second.warnings).toContain('Skipped 1 findings already commented');
     ruleDb.close();
   });
 });
 
 describe('review context selection', () => {
+  it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
+    const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
+    const context = buildHeadContext({
+      path: 'src/large.ts', addedText: 'guard()',
+      headContents: new Map([['src/large.ts', lines.join('\n')]]),
+      relevantLines: [100, 300],
+    });
+    expect(context).toContain('### src/large.ts (content after this pull request; bounded windows)');
+    expect(context).toContain('100 | line-100');
+    expect(context).toContain('300 | line-300');
+    expect(context).toContain('80 | line-80');
+    expect(context).toContain('320 | line-320');
+    expect(context).not.toMatch(/(?:^|\n)1 \| line-1(?:\n|$)/);
+    expect(context.length).toBeLessThanOrEqual(12_000);
+  });
+
+  it('keeps endpoints when a relevant hunk spans many head lines', () => {
+    const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
+    const context = buildHeadContext({
+      path: 'src/large.ts', addedText: 'guard()',
+      headContents: new Map([['src/large.ts', lines.join('\n')]]),
+      relevantLines: Array.from({ length: 500 }, (_, index) => index + 100),
+    });
+    expect(context).toMatch(/(?:^|\n)100 \| line-100(?:\n|$)/);
+    expect(context).toMatch(/(?:^|\n)599 \| line-599(?:\n|$)/);
+  });
+
+  it('numbers small own head files so nearby guards can be cited', () => {
+    const context = buildHeadContext({
+      path: 'src/small.ts', addedText: 'return value;',
+      headContents: new Map([['src/small.ts', 'function run(input: string) {\n  if (!input) return;\n  return value;\n}']]),
+      relevantLines: [3],
+    });
+    expect(context).toContain('### src/small.ts (content after this pull request; bounded windows)');
+    expect(context).toContain('2 |   if (!input) return;');
+    expect(context).toContain('3 |   return value;');
+  });
+
   it('keeps matching definitions and callers while dropping unrelated chunks', () => {
     const chunks: RetrievedChunk[] = [
       { ...CHUNK, chunkId: 1, path: 'src/helper.ts', content: 'export function helper() {}' },
@@ -143,6 +207,21 @@ describe('review context selection', () => {
     const paths = repositoryRulePaths(['a/b/c/d/e/f/g/h/file.ts']);
     expect(paths.slice(0, 2)).toEqual(['AGENTS.md', 'CLAUDE.md']);
     expect(paths.slice(2, 6)).toEqual(['a/b/c/d/e/f/g/h/AGENTS.md', 'a/b/c/d/e/f/g/h/CLAUDE.md', 'a/b/c/d/e/f/g/AGENTS.md', 'a/b/c/d/e/f/g/CLAUDE.md']);
+  });
+});
+
+describe('verifier decision citations', () => {
+  it('accepts only structured citations for paths containing spaces', () => {
+    const files = [{
+      path: 'src/my file.ts',
+      currentEvidence: [{ line: 7 }],
+      headContext: '### src/my file.ts (content after this pull request; bounded windows)\n```\n7 | return value;\n```',
+    }];
+    expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: 7 }, explanation: 'Supported.' }, files)).toBe(true);
+    expect(hasValidVerifierCitation({ explanation: 'Supported at src/my file.ts:7.' }, files)).toBe(false);
+    expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: 8 } }, files)).toBe(false);
+    expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: '7' } }, files)).toBe(false);
+    expect(VERIFIER_SYSTEM_PROMPT).toContain('Supported and contradicted decisions must include evidence:{path:string,line:number}');
   });
 });
 
@@ -378,12 +457,12 @@ describe('reviewPullRequest', () => {
   afterEach(() => db.close());
 
   it.each([
-    { costs: [0.012, 0.003, 0.004], expected: 0.019 },
+    { costs: [0.012, 0.003], expected: 0.015 },
     { costs: [0, 0, 0], expected: 0 },
-    { costs: [0.012, null, 0.004], expected: null },
-    { costs: [0.012, undefined, 0.004], expected: null },
-    { costs: [[0.01, 0.002], 0.003, 0.004], expected: 0.019 },
-    { costs: [[0.01, 0.002], undefined, 0.004], expected: null },
+    { costs: [0.012, null], expected: null },
+    { costs: [0.012, undefined], expected: null },
+    { costs: [[0.01, 0.002], 0.003], expected: 0.015 },
+    { costs: [[0.01, 0.002], undefined], expected: null },
   ])('stores the review cost for $costs and preserves it on cache hits', async ({ costs, expected }) => {
     const tracker = new UsageTracker({ db, pricing: null });
     const fake = fakeLlm();
@@ -398,10 +477,10 @@ describe('reviewPullRequest', () => {
     } };
     const deps = makeDeps(db, { llm });
     const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(fake.calls).toHaveLength(3); // modified file, deleted file, summary
+    expect(fake.calls).toHaveLength(2); // modified file, deleted file
     expect(db.getReview(result.reviewId)?.cost_usd).toEqual(expected);
     await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(fake.calls).toHaveLength(3);
+    expect(fake.calls).toHaveLength(2);
     expect(db.listReviews(REPO_ID)[0]?.cost_usd).toEqual(expected);
   });
 
@@ -416,7 +495,7 @@ describe('reviewPullRequest', () => {
       } };
       return reviewPullRequest(makeDeps(db, { llm }), { repoId: REPO_ID, prNumber: 42 + i, post: false });
     }));
-    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.03, 0.06]);
+    expect(results.map((r) => db.getReview(r.reviewId)?.cost_usd)).toEqual([0.02, 0.04]);
   });
 
   it('reviews forty Qwen files and summarizes in one bounded call, sharing context once', async () => {
@@ -481,10 +560,10 @@ describe('reviewPullRequest', () => {
 
   it('fails oversized Qwen reviews before inference without posting or caching a clean review', async () => {
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => { throw new Error('must not call'); } };
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(150000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + '💸'.repeat(500000)));
     let retrievals = 0;
     const retrieve: RetrieveFn = async () => { retrievals++; return [CHUNK]; };
-    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.25');
+    await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.50');
     expect(retrievals).toBe(0);
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
@@ -519,10 +598,8 @@ describe('reviewPullRequest', () => {
     const next = queue.enqueue('review', REPO_ID, async () => 'still running');
     await queue.idle();
     expect(db.getJob(failed.id)?.status).toBe('error');
-    expect(db.getJob(failed.id)?.error).toContain('Last retry error: No JSON object found in model output');
-    expect(db.getJob(failed.id)?.error).toContain('used $0.000000, reserved $');
+    expect(db.getJob(failed.id)?.error).toContain('No JSON object found in model output');
     expect(db.getJob(failed.id)?.progress).toContain('commit status error');
-    expect(db.getJob(failed.id)?.error).toContain('next attempt $');
     expect(db.getJob(next.id)?.status).toBe('done');
     expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
     expect(gh.reviews).toHaveLength(0);
@@ -537,17 +614,17 @@ describe('reviewPullRequest', () => {
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
 
-  it.each(['not JSON', JSON.stringify({ findings: [], summary: 'Fine', verdict: 'approve', reviewedPaths: [] })])('retries invalid batch responses and publishes only the valid fourth attempt: %s', async (invalid) => {
+  it.each(['not JSON', JSON.stringify({ findings: [], summary: 'Fine', verdict: 'approve', reviewedPaths: [] })])('uses one corrective retry for malformed batch responses: %s', async (invalid) => {
     const gh = fakeGithub();
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => {
       calls++;
-      return calls < 4 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
+      return calls === 1 ? invalid : JSON.stringify({ findings: [], summary: 'Reviewed all changes.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
     } };
     const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
-    expect(calls).toBe(4);
+    expect(calls).toBe(2);
     expect(result.posted).toBe(true);
-    expect(result.summary).toBe('Reviewed all changes.');
+    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(gh.reviews).toHaveLength(1);
   });
 
@@ -603,18 +680,27 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(1);
   });
 
-  it.each([undefined, 0, 1])('stops invalid response retries at the configured limit %s', async (maxRetries) => {
+  it.each([undefined, 1])('stops malformed response retries after one correction %s', async (maxRetries) => {
     const gh = fakeGithub();
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async () => { calls++; return '{}'; } };
     await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
-    expect(calls).toBe((maxRetries ?? 3) + 1);
+    expect(calls).toBe(2);
     expect(gh.reviews).toHaveLength(0);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
 
+  it('does not retry malformed output when maxRetries is zero', async () => {
+    const gh = fakeGithub();
+    let calls = 0;
+    const llm = { ...fakeLlm().provider, supportsBatchReview: true, complete: async () => { calls++; return '{}'; } };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 0, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review');
+    expect(calls).toBe(1);
+    expect(gh.reviews).toHaveLength(0);
+  });
+
   it('stops retries when the next attempt would exceed the total review budget', async () => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800000)));
     let reserved = 0;
     let calls = 0;
     const llm = { ...fakeLlm().provider, name: 'openrouter', model: 'qwen/qwen3-coder', supportsBatchReview: true, complete: async (req: CompleteRequest) => {
@@ -647,10 +733,11 @@ describe('reviewPullRequest', () => {
       historyPulls: [{ number: 7, title: 'Old fix', body: 'Historical description', htmlUrl: 'https://github.com/o/r/pull/7', mergedAt: '2025-01-01', repository: 'o/r' }],
     });
     const result = await reviewPullRequest({ db, llm: primary, retrieve: async () => [{ ...CHUNK, content: 'x'.repeat(300_000) }], github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
-    expect(result.summary).toBe('Complete.');
+    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(calls).toHaveLength(2);
     const primaryContent = calls[0]!.messages[0]!.content;
-    expect(calls[1]!.messages[0]!.content).toBe(primaryContent);
+    expect(calls[1]!.messages[0]!.content).toContain('validationError');
+    expect(calls[1]!.messages[0]!.content).toContain('Historical description');
     expect(primaryContent).toContain('Historical description');
     const payload = JSON.parse(primaryContent.split('\n\n', 1)[0]!) as { files: Array<{ path: string; status: string; diff: string }> };
     const expected = parseUnifiedDiff(DIFF)
@@ -690,7 +777,7 @@ describe('reviewPullRequest', () => {
     { name: 'Infinity', costs: [Number.POSITIVE_INFINITY, 0.02] },
     { name: 'aggregate overflow', costs: [Number.MAX_VALUE, Number.MAX_VALUE] },
   ])('keeps a full reservation for $name billing', async ({ costs }) => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
     const record = { provider: 'fake', model: 'm1', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 };
@@ -708,7 +795,7 @@ describe('reviewPullRequest', () => {
   });
 
   it.each([0, 0.02])('reconciles cheap invalid calls billed at %s across model fallback', async (costUsd) => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     const models: string[] = [];
     const provider = (model: string): LLMProvider => ({
@@ -731,7 +818,57 @@ describe('reviewPullRequest', () => {
     expect(db.getReview(result.reviewId)?.cost_usd).toBeCloseTo(costUsd * 2);
   });
 
-  it.each([0, 1])('keeps maxRetries=%s when failed calls report zero cost', async (maxRetries) => {
+  it('releases unbilled transient reservations before retrying near the cap', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const delays: number[] = [];
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        if (calls < 3) throw new ProviderError('openrouter', 'HTTP 429', 429);
+        tracker.sinkFor('review')({ provider: 'openrouter', model: 'qwen/qwen3-coder-next', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+        return JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] });
+      },
+    };
+    const result = await reviewPullRequest({ db, llm, maxRetries: 3, sleep: async (ms) => { delays.push(ms); }, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+    expect(calls).toBe(3);
+    expect(delays).toEqual([15_000, 30_000]);
+    expect(result.posted).toBe(true);
+  });
+
+  it('keeps the reservation after an unreported network failure', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
+    let calls = 0;
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        throw new NetworkProviderError('openrouter', 'timeout');
+      },
+    };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 1, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
+    expect(calls).toBe(1);
+  });
+
+  it('keeps a reservation when a transient failure reports unknown-cost usage', async () => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
+    const tracker = new UsageTracker({ db, pricing: null });
+    let calls = 0;
+    const llm: LLMProvider = {
+      name: 'openrouter', model: 'qwen/qwen3-coder-next', supportsBatchReview: true, concurrency: 1,
+      async complete() {
+        calls++;
+        tracker.sinkFor('review')({ provider: 'openrouter', model: 'qwen/qwen3-coder-next', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: null });
+        throw new ProviderError('openrouter', 'HTTP 429', 429);
+      },
+    };
+    await expect(reviewPullRequest({ db, llm, maxRetries: 1, sleep: async () => {}, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
+    expect(calls).toBe(1);
+  });
+
+  it.each([0, 1])('consumes the retry allowance for malformed zero-cost calls (maxRetries=%s)', async (maxRetries) => {
     const gh = fakeGithub();
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
@@ -744,8 +881,8 @@ describe('reviewPullRequest', () => {
     expect(calls).toBe(maxRetries + 1);
   });
 
-  it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.3, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300_000)));
+  it.each([{ costUsd: 0.2, content: '{}' }, { costUsd: 0.5, content: JSON.stringify({ findings: [], summary: 'Complete.', verdict: 'approve', reviewedPaths: ['src/app.ts', 'src/gone.ts'] }) }])('retains the total cap when reported cost is $costUsd', async ({ costUsd, content }) => {
+    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(800_000)));
     const tracker = new UsageTracker({ db, pricing: null });
     let calls = 0;
     const llm = { ...fakeLlm().provider, supportsBatchReview: true, async complete() {
@@ -834,11 +971,15 @@ describe('reviewPullRequest', () => {
     };
     const fallback = new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder-next', fetch, onUsage: tracker.sinkFor('review') });
     const llm = Object.assign(new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder', fetch, onUsage: tracker.sinkFor('review') }), { reviewFallbacks: [fallback] });
-    const result = await reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    const result = await reviewPullRequest({ db, llm, sleep: async () => {}, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(sent.map((r) => r.model)).toEqual(['qwen/qwen3-coder', 'qwen/qwen3-coder-next']);
-    expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+    if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {
+      expect(JSON.stringify(sent[1]!.messages)).toContain('validationError');
+    } else {
+      expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+    }
     expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
-    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
+    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === true)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
     expect(db.getReview(result.reviewId)?.model).toBe('qwen/qwen3-coder-next');
     if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {
@@ -896,17 +1037,6 @@ describe('reviewPullRequest', () => {
     await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, force: true, post: false });
     expect(models).toEqual(['first/coder', 'second/coder', 'first/coder']);
     expect(llm.model).toBe('first/coder');
-  });
-
-  it('reserves failed primary calls against the fallback budget', async () => {
-    const gh = fakeGithub(DIFF.replace('+  if (n = 0) return;', '+' + 'n'.repeat(300000)));
-    let calls = 0;
-    const fetch: typeof globalThis.fetch = async () => { calls++; return new Response('unavailable', { status: 503 }); };
-    const fallback = new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder-next', fetch });
-    const llm = Object.assign(new OpenRouterProvider({ apiKey: 'fake', model: 'qwen/qwen3-coder', fetch }), { reviewFallbacks: [fallback] });
-    await expect(reviewPullRequest({ db, llm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('budget');
-    expect(calls).toBe(1);
-    expect(gh.reviews).toHaveLength(0);
   });
 
   it('abandons the review without posting when the PR head moves mid-review', async () => {
@@ -967,7 +1097,7 @@ describe('reviewPullRequest', () => {
     const { owner, repo, number, input } = gh.reviews[0]!;
     expect({ owner, repo, number }).toEqual({ owner: 'o', repo: 'r', number: 42 });
     expect(input.commitId).toBe('head-sha-1');
-    expect(input.event).toBe('COMMENT');
+    expect(input.event).toBe('REQUEST_CHANGES');
     expect(input.comments).toHaveLength(1);
     expect(input.comments[0]).toMatchObject({ path: 'src/app.ts', line: 4, body: expect.stringContaining('**[critical] Assignment**\n\nUse `===`.') });
     expect(input.comments[0]!.body).toMatch(/repolens-root-cause:[a-f0-9]{16}/);
@@ -1044,6 +1174,19 @@ describe('reviewPullRequest', () => {
     expect(second.verdict).toBe(first.verdict);
   });
 
+  it('derives the cached verdict from the accepted findings', async () => {
+    const llm = fakeLlm({
+      file: JSON.stringify({ findings: [{ line: 4, severity: 'critical', title: 'Critical issue', body: 'Fix it.' }] }),
+      summary: JSON.stringify({ summary: 'Approve this.', verdict: 'approve' }),
+    });
+    const deps = { db, llm: llm.provider, retrieve: retrieveOne, github: fakeGithub().github };
+    const first = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(first.verdict).toBe('request_changes');
+    db.raw.prepare('update reviews set verdict=? where id=?').run('approve', first.reviewId);
+    const second = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(second.verdict).toBe('request_changes');
+  });
+
   it('re-reviews when force is set', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub();
@@ -1064,16 +1207,18 @@ describe('reviewPullRequest', () => {
     expect(gh.reviews).toHaveLength(0);
   });
 
-  it('fails closed when the summary call fails', async () => {
+  it('uses a deterministic summary without a non-batch summary call', async () => {
     const llm = fakeLlm({
       file: JSON.stringify({ findings: [{ line: 4, severity: 'warning', title: 'Hmm', body: 'check' }] }),
       summary: 'not json',
     });
     const gh = fakeGithub();
-    await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+    const result = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
       repoId: REPO_ID,
       prNumber: 42,
-    })).rejects.toThrow('summary review failed');
+    });
+    expect(result.summary).toContain('The review found 1 actionable issue');
+    expect(llm.calls.every((call) => call.system !== SUMMARY_SYSTEM_PROMPT && call.system !== FOLLOWUP_SUMMARY_SYSTEM_PROMPT)).toBe(true);
   });
 
   it('passes repo instructions and retrieved context to the file prompt', async () => {
@@ -1381,7 +1526,7 @@ describe('reviewPullRequest PR-head context', () => {
     expect(msg.indexOf(AUTHORITATIVE)).toBeLessThan(msg.indexOf('### src/b.ts (content after this pull request)'));
     expect(msg).not.toContain(INDEXED);
     // The reviewed file's own new content is there too, so the model sees past the hunk.
-    expect(msg).toContain('### src/a.ts (content after this pull request)');
+    expect(msg).toContain('### src/a.ts (content after this pull request; bounded windows)');
 
     // Every changed path is excluded from retrieval, so no stale chunk survives.
     for (const paths of excludes) expect(paths).toEqual(['src/a.ts', 'src/b.ts']);
@@ -1416,7 +1561,7 @@ describe('reviewPullRequest PR-head context', () => {
     expect(msg).toContain('export function helper(n: number) { return n + base; }');
   });
 
-  it('warns but completes when head content is oversized, missing or fails to fetch', async () => {
+  it('keeps oversized head content for bounded context, while warning only on fetch failures', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub(TWO_FILE_DIFF, PR, {
       headFiles: { 'src/a.ts': 'x'.repeat(60_001) },
@@ -1429,10 +1574,10 @@ describe('reviewPullRequest PR-head context', () => {
 
     expect(res.findings).toEqual([]);
     expect(llm.fileCalls()).toHaveLength(2);
-    expect(res.warnings.some((w) => w.includes('src/a.ts: post-change content skipped'))).toBe(true);
+    expect(res.warnings.some((w) => w.includes('src/a.ts: post-change content skipped'))).toBe(false);
     expect(res.warnings.some((w) => w.includes('src/b.ts: fetching post-change content failed: GitHub 502'))).toBe(true);
-    const msg = llm.fileCalls()[0]!.messages[0]!.content;
-    expect(msg).not.toContain('content after this pull request');
+    const msg = llm.fileCalls().find((call) => call.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
+    expect(msg).toContain('### src/a.ts (content after this pull request; bounded windows)');
   });
 
   it('logs, but does not warn, when a changed file has no content at the head sha', async () => {
@@ -1447,7 +1592,7 @@ describe('reviewPullRequest PR-head context', () => {
     expect(logs.some((l) => l.includes('src/b.ts: no post-change content at head-sh'))).toBe(true);
     // a.ts still gets its own content; b.ts is simply not quoted.
     const msg = llm.fileCalls().find((c) => c.messages[0]!.content.includes('File under review: src/a.ts'))!.messages[0]!.content;
-    expect(msg).toContain('### src/a.ts (content after this pull request)');
+    expect(msg).toContain('### src/a.ts (content after this pull request; bounded windows)');
     expect(msg).not.toContain('### src/b.ts');
   });
 });
@@ -1490,15 +1635,7 @@ describe('reviewPullRequest lineage', () => {
     expect(file).toContain('- [critical] src/app.ts:5 — Assignment in condition');
     expect(file).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(file).toContain('- head-sh fix: compare');
-    const summaryRequest = llm.calls.find((c) => c.system === FOLLOWUP_SUMMARY_SYSTEM_PROMPT)!;
-    expect(summaryRequest.system).not.toContain('what the pull request changes');
-    const summary = summaryRequest.messages[0]!.content;
-    expect(summary).not.toContain('First pass.');
-    expect(summary).not.toContain(PR.body);
-    expect(summary).not.toContain('feat: run');
-    expect(summary).toContain('1 commit since that review');
-    expect(summary).toContain('Changes since the previous review');
-    expect(summary).toMatch(/\+\s+if \(n === 0\) return;/);
+    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
     expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
     expect(result.warnings).toEqual([]);
   });
@@ -1518,7 +1655,7 @@ describe('reviewPullRequest lineage', () => {
     expect(calls[0]!.system).not.toContain('what the pull request changes');
     expect(calls[0]!.messages[0]!.content).not.toContain('Original PR overview.');
     expect(calls[0]!.messages[0]!.content).toContain('if (n === 0) return;');
-    expect(gh.reviews[0]!.input.body).toContain('Since the previous review, the condition now checks equality.');
+    expect(gh.reviews[0]!.input.body).toContain('The review found no actionable issues in the supplied changes.');
   });
 
   it('reads overview docs at the base sha and puts them in the file prompt', async () => {
@@ -1580,7 +1717,7 @@ describe('reviewPullRequest lineage', () => {
     expect(content.match(/Relevant merged pull requests/g)).toHaveLength(1);
   });
 
-  it('merges rename history into the new-file prompt and ordinary summary', async () => {
+  it('merges rename history into the new-file prompt', async () => {
     const renameDiff = [
       'diff --git a/src/old.ts b/src/new.ts', 'similarity index 80%', 'rename from src/old.ts', 'rename to src/new.ts',
       '--- a/src/old.ts', '+++ b/src/new.ts', '@@ -1,1 +1,2 @@', ' export const value = 1;', '+export const next = 2;', '',
@@ -1603,11 +1740,8 @@ describe('reviewPullRequest lineage', () => {
     });
     await reviewPullRequest(makeDeps(db, { llm: llm.provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42, post: false });
     const file = llm.fileCalls()[0]!.messages[0]!.content;
-    const summary = llm.calls.find((c) => c.system === SUMMARY_SYSTEM_PROMPT)!.messages[0]!.content;
     expect(file).toContain('Old path finding');
     expect(file).toContain('New path finding');
-    expect(summary).toContain('Old path finding');
-    expect(summary).toContain('New path finding');
   });
 
   it('keeps both paths\' historical findings in the Qwen batch context', async () => {
@@ -1855,6 +1989,105 @@ describe('staged review', () => {
     rootCause: title, evidence: { path: 'src/mixed.ts', line, trigger: `${title} trigger`, consequence: `${title} consequence` },
   });
 
+  it('trims escalation context after an unknown-cost initial failure while keeping risky hunks', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const tracker = new UsageTracker({ db: testDb, pricing: null });
+    const initialResponse = JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    const calls: CompleteRequest[] = [];
+    const primary: LLMProvider = { name: 'openrouter', model: 'primary', concurrency: 1, supportsBatchReview: true, async complete() {
+      return 'not JSON';
+    } };
+    const fallback: LLMProvider = { name: 'openrouter', model: 'fallback', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'fallback', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+      calls.push(req);
+      return initialResponse;
+    } };
+    (primary as { reviewFallbacks?: readonly LLMProvider[] }).reviewFallbacks = [fallback];
+    const escalation: LLMProvider = { name: 'openrouter', model: 'strong', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'strong', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, findings: [] });
+    } };
+    const retrieve: RetrieveFn = async () => [{ ...CHUNK, content: `request token ${'x'.repeat(500_000)}` }];
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: primary, escalationLlm: escalation, retrieve,
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const escalationRequest = calls.find((call) => call.reviewStage === 'escalation')!;
+      const payload = JSON.parse(escalationRequest.messages[0]!.content) as { files: Array<Record<string, unknown>>; rules?: string };
+      expect(payload.files[0]).toMatchObject({ path: 'src/mixed.ts', status: 'modified', allowedFindingLines: [1] });
+      expect(payload.files[0]!.diff).toContain('request.token');
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+      expect(escalationRequest.jsonSchema).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        required: ['reviewedPaths', 'decisions', 'findings'],
+        properties: {
+          reviewedPaths: { minItems: paths.length, maxItems: paths.length, items: { enum: paths } },
+          findings: { items: { additionalProperties: false, properties: { path: { enum: paths } } } },
+        },
+      });
+      const schema = escalationRequest.jsonSchema as Record<string, any>;
+      const evidence = schema.properties.findings.items.properties.evidence;
+      expect(evidence).toMatchObject({ additionalProperties: false, required: ['path', 'line', 'trigger', 'consequence', 'rule'] });
+      expect(evidence.properties.path.enum).toEqual(paths);
+      expect(evidence.properties.rule.anyOf).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'null' }),
+        expect.objectContaining({ type: 'object', additionalProperties: false }),
+      ]));
+      expect(reviewCostUpperBound(escalationRequest) + 0.01).toBeLessThanOrEqual(REVIEW_MAX_USD);
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('reports reviewedPaths validation separately for an escalation response', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'initial', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      return JSON.stringify({ reviewedPaths: [], findings: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: async () => [], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/reviewedPaths/);
+    } finally { testDb.close(); }
+  });
+
+  it('reports finding path shape validation separately for an escalation response', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'initial', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [{}] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: async () => [], github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/finding.*path|findings.*path/i);
+    } finally { testDb.close(); }
+  });
+
+  it('fails before escalation inference when its core hunks cannot fit the remaining budget', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const largeDiff = diff.replace('+const token = request.token;', `+const token = request.token;${'x'.repeat(400_000)}`);
+    const initial: LLMProvider = { name: 'openrouter', model: 'initial', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, findings: [], summary: 'Initial.', verdict: 'approve' });
+    } };
+    let escalationCalls = 0;
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      escalationCalls++;
+      return JSON.stringify({ reviewedPaths: paths, findings: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: async () => [], github: fakeGithub(largeDiff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/escalation.*budget|budget.*escalation/i);
+      expect(escalationCalls).toBe(0);
+    } finally { testDb.close(); }
+  });
+
   it('rechecks only risky hunks, replaces their findings, and verifies every provisional finding', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -1868,13 +2101,15 @@ describe('staged review', () => {
     const escalationCalls: CompleteRequest[] = [];
     const escalationLlm: LLMProvider = { name: 'openrouter', model: 'moonshotai/kimi-k2.7-code', concurrency: 1, supportsBatchReview: true, async complete(req) {
       escalationCalls.push(req);
-      return JSON.stringify({ reviewedPaths: paths, findings: [finding(1, 'Strong risky finding')] });
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'reject' })), findings: [finding(1, 'Strong risky finding')] });
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       expect(req.reviewStage).toBe('verification');
-      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string } }> };
+      expect(req.maxTokens).toBe(4000);
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string; path: string; line: number } }> };
       expect(payload.findings.map((item) => item.finding.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
-      return JSON.stringify({ decisions: payload.findings.map(({ id }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.' })), summary: 'Two supported issues remain.', verdict: 'approve' });
+      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.', evidence: { path: item.path, line: item.line } })), summary: 'Two supported issues remain.', verdict: 'approve' });
     } };
     try {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false });
@@ -1884,8 +2119,108 @@ describe('staged review', () => {
       expect(escalationCalls[0]!.messages[0]!.content).toContain('request.token');
       expect(escalationCalls[0]!.messages[0]!.content).not.toContain('+newCall();');
       expect(result.findings.map((item) => item.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
-      expect(result.summary).toBe('Two supported issues remain.');
+      expect(result.summary).toContain('The review found 2 actionable issues');
       expect(result.verdict).toBe('comment');
+    } finally { testDb.close(); }
+  });
+
+  it('requires explicit retain, reject, or uncertain decisions for every risky primary finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const primaries = ['Retain primary', 'Reject primary', 'Uncertain primary'].map((title) => finding(1, title));
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: primaries });
+    } };
+    let verifierTitles: string[] = [];
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Reject primary' ? 'reject' : item.title === 'Uncertain primary' ? 'uncertain' : 'retain' })), findings: [] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      verifierTitles = payload.findings.map(({ finding: item }) => item.title);
+      return JSON.stringify({ decisions: payload.findings.map(({ finding: item }, id) => ({ id, decision: 'supported', explanation: 'Current evidence supports the finding.', evidence: { path: item.path, line: item.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierTitles).toEqual(['Retain primary', 'Uncertain primary']);
+      expect(result.findings.map((item) => item.title)).toEqual(['Retain primary', 'Uncertain primary']);
+    } finally { testDb.close(); }
+  });
+
+  it.each(['missing', 'duplicate', 'unknown'] as const)('fails closed when escalation has an %s primary decision ID', async (failure) => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      const id = payload.provisionalFindings[0]!.id;
+      const decisions = failure === 'missing' ? [] : failure === 'duplicate' ? [{ id, decision: 'retain' }, { id, decision: 'retain' }] : [{ id: 'unknown', decision: 'retain' }];
+      return JSON.stringify({ reviewedPaths: paths, decisions, findings: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/escalation/i);
+    } finally { testDb.close(); }
+  });
+
+  it('refreshes verifier retrieval with identifiers implicated by provisional findings', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const queries: string[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'authorizeRequest accepts an invalid token')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ relevantContext?: string }> };
+      expect(payload.files[0]!.relevantContext).toContain('authorizeRequest');
+      expect(payload.files[0]!.relevantContext).toContain('caller invokes request');
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current guard rejects the input.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async (request) => {
+          queries.push(request.query);
+          return request.query.includes('authorizeRequest')
+            ? [{ ...CHUNK, chunkId: 2, path: 'src/auth.ts', content: 'authorizeRequest checks token' }]
+            : [{ ...CHUNK, chunkId: 3, path: 'src/caller.ts', content: 'caller invokes request' }];
+        },
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(queries).toContain('authorizeRequest');
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('rejects a supported verifier decision without structured evidence', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Evidence at src/mixed.ts:999 proves it.' }], summary: 'Supported.', verdict: 'request_changes' });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('verification');
+    } finally { testDb.close(); }
+  });
+
+  it('rejects a contradicted verifier decision without structured evidence', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The guard prevents the alleged behavior.' }], summary: 'Contradicted.', verdict: 'approve' });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('verification');
     } finally { testDb.close(); }
   });
 
@@ -1893,25 +2228,103 @@ describe('staged review', () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
-    const largeDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -1 +1 @@\n-const value = oldValue();\n+const value = newValue();\n`;
+    const largeDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -50 +50 @@\n-const value = oldValue();\n+const value = newValue();\n`;
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Stale allegation.', verdict: 'request_changes', findings: [{ ...finding(1, 'Stale finding'), path: 'src/large.ts', evidence: { ...finding(1, 'Stale finding').evidence, path: 'src/large.ts' } }] });
+      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Stale allegation.', verdict: 'request_changes', findings: [{ ...finding(50, 'Stale finding'), path: 'src/large.ts', evidence: { ...finding(50, 'Stale finding').evidence, path: 'src/large.ts' } }] });
     } };
     let verifierPayload: Record<string, unknown> | undefined;
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current added line uses newValue().' }], summary: 'No current issue.', verdict: 'approve' });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The guard prevents the alleged behavior.', evidence: { path: 'src/large.ts', line: 35 } }], summary: 'No current issue.', verdict: 'approve' });
     } };
     try {
       const result = await reviewPullRequest({
         db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne,
-        github: fakeGithub(largeDiff, PR, { headFiles: { 'src/large.ts': `const value = newValue();\n${'x'.repeat(60_001)}` } }).github,
+        github: fakeGithub(largeDiff, PR, { headFiles: { 'src/large.ts': Array.from({ length: 120 }, (_, index) => index === 34 ? 'if (!request) return;' : index === 49 ? 'const value = newValue();' : `${'x'.repeat(120)}-${index + 1}`).join('\n') } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false });
       expect(verifierPayload?.prBody).toBeUndefined();
       const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
-      expect(verifierFile.currentEvidence).toEqual([{ line: 1, kind: 'added', content: 'const value = newValue();' }]);
-      expect(verifierFile.removedEvidence).toEqual([{ line: 1, kind: 'removed', content: 'const value = oldValue();' }]);
+      expect(verifierFile.currentEvidence).toEqual([{ line: 50, kind: 'added', content: 'const value = newValue();' }]);
+      expect(verifierFile.removedEvidence).toEqual([{ line: 50, kind: 'removed', content: 'const value = oldValue();' }]);
+      expect(verifierFile.headContext).toContain('### src/large.ts (content after this pull request; bounded windows)');
+      expect(verifierFile.headContext).toContain('35 | if (!request) return;');
       expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('trims optional verifier context before reserving while keeping diff evidence', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let verifierRequest: CompleteRequest | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierRequest = req;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, content: 'context ' + 'x'.repeat(500_000) }],
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<Record<string, unknown>> };
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+      expect(payload.files[0]!.currentEvidence).toEqual(expect.arrayContaining([{ line: 1, kind: 'added', content: 'const token = request.token;' }]));
+      expect(reviewCostUpperBound(verifierRequest!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
+    } finally { testDb.close(); }
+  });
+
+  it('chooses trimmed verifier context before reserving escalation output allowance', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const tracker = new UsageTracker({ db: testDb, pricing: null });
+    let escalationCalls = 0;
+    let verifierRequest: CompleteRequest | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.37 });
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      escalationCalls++;
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'strong', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.01 });
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierRequest = req;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, escalationLlm, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, content: 'request token context ' + 'x'.repeat(290_000) }],
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<Record<string, unknown>> };
+      expect(escalationCalls).toBe(1);
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+    } finally { testDb.close(); }
+  });
+
+  it('anchors deletion-only hunks to post-change lines for head context', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const deletionDiff = `diff --git a/src/large.ts b/src/large.ts\n--- a/src/large.ts\n+++ b/src/large.ts\n@@ -50 +49,0 @@\n-deletedGuard();\n`;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: ['src/large.ts'], summary: 'Initial.', verdict: 'request_changes', findings: [{ ...finding(50, 'Removed guard'), path: 'src/large.ts', evidence: { ...finding(50, 'Removed guard').evidence, path: 'src/large.ts' } }] });
+    } };
+    let verifierPayload: Record<string, unknown> | undefined;
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The deleted guard is no longer alleged.', evidence: { path: 'src/large.ts', line: 49 } }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    const head = Array.from({ length: 120 }, (_, index) => index === 48 ? 'afterGuard();' : `${'x'.repeat(120)}-${index + 1}`).join('\n');
+    try {
+      await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(deletionDiff, PR, { headFiles: { 'src/large.ts': head } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
+      expect(verifierFile.headContext).toContain('49 | afterGuard();');
     } finally { testDb.close(); }
   });
 
@@ -1952,14 +2365,15 @@ describe('staged review', () => {
         finding(1, 'Contradicted'), finding(20, 'Marginal', 'medium'),
       ] });
     } };
-    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete() {
-      return JSON.stringify({ reviewedPaths: paths, findings: [finding(1, 'Contradicted')] });
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete() {
       return JSON.stringify({
         decisions: [
-          { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.' },
-          { id: 1, decision: 'supported', explanation: 'The code supports it, but confidence remains marginal.' },
+          { id: 0, decision: 'contradicted', explanation: 'The supplied branch prevents the alleged behavior.', evidence: { path: 'src/mixed.ts', line: 1 } },
+          { id: 1, decision: 'supported', explanation: 'The code supports it, but confidence remains marginal.', evidence: { path: 'src/mixed.ts', line: 20 } },
         ],
         summary: 'Two issues remain.', verdict: 'approve',
       });
@@ -1972,12 +2386,38 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('does not publish a verifier-rejected finding in the summary or review body', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial stale summary mentions REJECTED finding.', verdict: 'request_changes', findings: [
+        finding(1, 'Rejected finding'), finding(20, 'Accepted finding'),
+      ] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return JSON.stringify({
+        decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: item.title === 'Rejected finding' ? 'contradicted' : 'supported', explanation: 'Checked current evidence.', evidence: { path: item.path, line: item.line } })),
+        summary: 'MODEL SUMMARY LEAK REJECTED finding and accepted finding.', verdict: 'request_changes',
+      });
+    } };
+    const gh = fakeGithub(diff);
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: gh.github }, { repoId: REPO_ID, prNumber: 42 });
+      expect(result.findings.map((item) => item.title)).toEqual(['Accepted finding']);
+      expect(result.summary).not.toContain('Rejected finding');
+      expect(result.summary).not.toContain('MODEL SUMMARY LEAK');
+      expect(gh.reviews[0]!.input.body).not.toContain('Rejected finding');
+      expect(gh.reviews[0]!.input.body).toContain('Accepted finding');
+    } finally { testDb.close(); }
+  });
+
   it('shares the total budget with escalation and fails before an over-budget strong call', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     const tracker = new UsageTracker({ db: testDb, pricing: null });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.24 });
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.44 });
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
     } };
     let strongCalls = 0;
@@ -1986,6 +2426,174 @@ describe('staged review', () => {
       await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false })).rejects.toThrow('budget');
       expect(strongCalls).toBe(0);
       expect(testDb.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
+    } finally { testDb.close(); }
+  });
+
+  it('uses one corrective retry for malformed initial output with exact line guidance', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const requests: CompleteRequest[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      requests.push(req);
+      return requests.length === 1 ? 'not JSON' : JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(requests).toHaveLength(2);
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
+      expect(correction.validationError).toContain('JSON');
+      expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1, 20] }]);
+      const initialStage = result.trace!.stages.find((stage) => stage.stage === 'initial')!;
+      expect(initialStage.calls.map((call) => call.outcome)).toEqual(['validation_error', 'success']);
+      expect(initialStage.calls[0]!.failure).toContain('JSON');
+      expect(result.trace!.identity).toMatchObject({ repoId: REPO_ID, prNumber: 42, headSha: PR.headSha, model: 'cheap' });
+      expect(result.trace!.finalFindings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('keeps transient provider failures as provider errors in the trace', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let calls = 0;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      calls++;
+      if (calls === 1) throw new ProviderError('openrouter', 'HTTP 503', 503);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, maxRetries: 1, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const initialStage = result.trace!.stages.find((stage) => stage.stage === 'initial')!;
+      expect(initialStage.calls.map((call) => call.outcome)).toEqual(['error', 'success']);
+      expect(initialStage.calls[0]!.failure).toBeUndefined();
+    } finally { testDb.close(); }
+  });
+
+  it('uses one corrective retry for malformed escalation output with exact path lines', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const requests: CompleteRequest[] = [];
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      requests.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return requests.length === 1 ? JSON.stringify({ reviewedPaths: [] }) : JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'reject' })), findings: [] });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(requests).toHaveLength(2);
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
+      expect(correction.validationError).toContain('reviewedPaths');
+      expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1] }]);
+      const escalationStage = result.trace!.stages.find((stage) => stage.stage === 'escalation')!;
+      expect(escalationStage.calls.map((call) => call.outcome)).toEqual(['validation_error', 'success']);
+      expect(escalationStage.decisions).toEqual([{ id: expect.any(String), decision: 'reject' }]);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'verification')).toBeUndefined();
+      expect(result.trace!.finalFindings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('does not correct malformed escalation output when retries are disabled', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let escalationCalls = 0;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete() {
+      escalationCalls++;
+      return JSON.stringify({ reviewedPaths: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, maxRetries: 0, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('Invalid escalation response');
+      expect(escalationCalls).toBe(1);
+    } finally { testDb.close(); }
+  });
+
+  it('shares one corrective retry across escalation and verification', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    let escalationCalls = 0;
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      escalationCalls++;
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return escalationCalls === 1
+        ? JSON.stringify({ reviewedPaths: [] })
+        : JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    let verifierCalls = 0;
+    const verifier: LLMProvider = { ...initial, async complete() {
+      verifierCalls++;
+      return JSON.stringify({ decisions: [] });
+    } };
+    try {
+      await expect(reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, verifierLlm: verifier, maxRetries: 1, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow('Invalid verification response');
+      expect(escalationCalls).toBe(2);
+      expect(verifierCalls).toBe(1);
+    } finally { testDb.close(); }
+  });
+
+  it.each([
+    { failure: 'malformed verifier citations', decisions: [{ id: 0, decision: 'supported', explanation: 'bad citation', evidence: { path: 'src/mixed.ts', line: 999 } }] },
+    { failure: 'null verifier decisions', decisions: [null] },
+  ])('uses one corrective retry for $failure with exact evidence lines', async ({ decisions }) => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
+    } };
+    const requests: CompleteRequest[] = [];
+    const verifier: LLMProvider = { ...initial, async complete(req) {
+      requests.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return requests.length === 1
+        ? JSON.stringify({ decisions })
+        : JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'Current evidence supports it.', evidence: { path: item.path, line: item.line } })) });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(requests).toHaveLength(2);
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { validationError?: string; allowedPathsAndLines?: unknown };
+      expect(correction.validationError).toContain('verification');
+      expect(correction.allowedPathsAndLines).toEqual([{ path: 'src/mixed.ts', lines: [1, 2] }]);
+      expect(result.findings).toHaveLength(1);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'verification')!.calls.map((call) => call.outcome)).toEqual(['validation_error', 'success']);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'verification')!.decisions).toEqual([{ id: 0, decision: 'supported' }]);
+    } finally { testDb.close(); }
+  });
+
+  it('traces verifier execution when escalation adds the only finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const added = finding(1, 'Escalated finding');
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'approve', findings: [] });
+    } };
+    const escalation: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'uncertain' })), findings: [added] });
+    } };
+    const verifier: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'Current evidence supports it.', evidence: { path: item.path, line: item.line } })) });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm: escalation, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const stages = result.trace!.stages;
+      expect(stages.map((stage) => stage.stage)).toEqual(['initial', 'escalation', 'verification', 'final']);
+      expect(stages.find((stage) => stage.stage === 'verification')!.findings).toEqual([{ path: added.path, line: added.line, rootCauseMarker: expect.any(String) }]);
+      expect(stages.find((stage) => stage.stage === 'verification')!.decisions).toEqual([{ id: 0, decision: 'supported' }]);
+      expect(stages.find((stage) => stage.stage === 'verification')!.findingCount).toBe(1);
+      const serialized = JSON.stringify(result.trace);
+      expect(serialized).toContain('rootCauseMarker');
+      expect(serialized).not.toContain(added.title);
+      expect(serialized).not.toContain(added.body);
+      expect(serialized).not.toContain(added.evidence!.trigger);
+      expect(serialized).not.toContain(added.evidence!.consequence);
     } finally { testDb.close(); }
   });
 });
