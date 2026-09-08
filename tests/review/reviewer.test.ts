@@ -456,6 +456,30 @@ describe('reviewPullRequest', () => {
   });
   afterEach(() => db.close());
 
+  it('fresh reviews ignore prior review lineage and existing GitHub comments while keeping full findings', async () => {
+    db.insertReview({
+      repo_id: REPO_ID, pr_number: 42, head_sha: PR.headSha, status: 'done',
+      summary: 'old review', verdict: 'request_changes', comments_json: JSON.stringify([
+        { path: 'src/app.ts', line: 4, severity: 'critical', title: 'Old', body: 'Old finding.' },
+      ]), posted: 1, error: null,
+    });
+    const llm = fakeLlm({
+      file: JSON.stringify({ findings: [{ line: 4, severity: 'critical', title: 'Fresh', body: 'Use ===.' }] }),
+    });
+    const gh = fakeGithub(DIFF, PR, {
+      existingComments: [{ path: 'src/app.ts', line: 4, body: '**[critical] Fresh**', user: 'repolens' }],
+    });
+
+    const result = await reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github }, {
+      repoId: REPO_ID, prNumber: 42, fresh: true,
+    });
+
+    expect(result.findings).toMatchObject([{ path: 'src/app.ts', line: 4, title: 'Fresh', category: 'correctness', confidence: 'high' }]);
+    expect(result.reviewId).not.toBe(1);
+    expect(gh.listCalls).toEqual([]);
+    expect(gh.reviews[0]!.input.comments).toHaveLength(1);
+  });
+
   it.each([
     { costs: [0.012, 0.003], expected: 0.015 },
     { costs: [0, 0, 0], expected: 0 },
@@ -1987,6 +2011,95 @@ describe('staged review', () => {
   const finding = (line: number, title: string, confidence = 'high') => ({
     path: 'src/mixed.ts', line, severity: 'warning', title, body: `${title} body`, category: 'correctness', confidence,
     rootCause: title, evidence: { path: 'src/mixed.ts', line, trigger: `${title} trigger`, consequence: `${title} consequence` },
+  });
+
+  const candidateDiff = (paths: string[]) => paths.map((path) => [
+    `diff --git a/${path} b/${path}`,
+    `index ${'1'.repeat(7)}..${'2'.repeat(7)} 100644`,
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    '@@ -1,1 +1,13 @@',
+    '-const old = 0;',
+    ...Array.from({ length: 13 }, (_, index) => `+if (token) return ${index + 1};`),
+  ].join('\n')).join('\n');
+
+  const candidate = (path: string, line: number, rootCause: string, title = rootCause): Finding => ({
+    path, line, severity: 'warning', title, body: `${title} body`, category: 'correctness', confidence: 'high', rootCause,
+    evidence: { path, line, trigger: `${title} trigger`, consequence: `${title} consequence` },
+  });
+
+  async function runCandidateReview(diffText: string, initialFindings: Finding[]) {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const paths = [...new Set(initialFindings.map((item) => item.path))];
+    let verifierFindings: Finding[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: initialFindings });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: payload.provisionalFindings.map(({ finding: item }) => item) });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      verifierFindings = payload.findings.map(({ finding: item }) => item);
+      return JSON.stringify({ decisions: payload.findings.map(({ finding: item }, id) => ({ id, decision: 'supported', explanation: 'Current evidence supports the finding.', evidence: { path: item.path, line: item.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diffText, PR).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      return verifierFindings;
+    } finally { testDb.close(); }
+  }
+
+  it('deduplicates identical primary and escalation candidates before verification', async () => {
+    const item = candidate('src/keycloak.ts', 1, 'same cause');
+    const verifierFindings = await runCandidateReview(candidateDiff(['src/keycloak.ts']), [item]);
+    expect(verifierFindings).toEqual([item]);
+  });
+
+  it('keeps distinct causes at one line and one cause at distinct files and locations', async () => {
+    const verifierFindings = await runCandidateReview(candidateDiff(['src/keycloak.ts', 'src/other.ts']), [
+      candidate('src/keycloak.ts', 1, 'cause one'),
+      candidate('src/keycloak.ts', 1, 'cause two'),
+      candidate('src/keycloak.ts', 2, 'cause one'),
+      candidate('src/other.ts', 1, 'cause one'),
+    ]);
+    expect(verifierFindings.map(({ rootCause, path, line }) => `${rootCause}:${path}:${line}`)).toEqual([
+      'cause one:src/keycloak.ts:1', 'cause two:src/keycloak.ts:1',
+      'cause one:src/keycloak.ts:2', 'cause one:src/other.ts:1',
+    ]);
+  });
+
+  it('collapses eleven duplicate pairs to eleven verifier candidates', async () => {
+    const initial = Array.from({ length: 11 }, (_, index) => candidate('src/discourse.ts', index + 1, `cause ${index + 1}`));
+    const verifierFindings = await runCandidateReview(candidateDiff(['src/discourse.ts']), initial);
+    expect(verifierFindings).toHaveLength(11);
+    expect(new Set(verifierFindings.map(({ rootCause, path, line }) => `${rootCause}:${path}:${line}`)).size).toBe(11);
+  });
+
+  it('does not reintroduce a rejected primary through an identical escalation finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const item = candidate('src/keycloak.ts', 1, 'rejected cause');
+    let verifierCalls = 0;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: ['src/keycloak.ts'], summary: 'Initial.', verdict: 'request_changes', findings: [item] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      return JSON.stringify({ reviewedPaths: ['src/keycloak.ts'], decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'reject' })), findings: [item] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      verifierCalls++;
+      return JSON.stringify({ decisions: [], summary: 'Checked.', verdict: 'approve' });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(candidateDiff(['src/keycloak.ts']), PR).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierCalls).toBe(0);
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
   });
 
   it('trims escalation context after an unknown-cost initial failure while keeping risky hunks', async () => {

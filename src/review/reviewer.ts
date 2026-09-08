@@ -218,6 +218,8 @@ export interface ReviewOptions {
   post?: boolean;
   /** Re-review even when a review for this head sha already exists. */
   force?: boolean;
+  /** Ignore prior reviews and GitHub comments for an independent benchmark run. */
+  fresh?: boolean;
 }
 
 const SEVERITIES: readonly Severity[] = ['critical', 'warning', 'nit'];
@@ -862,10 +864,24 @@ function rootCauseMarker(finding: Finding): string {
   return createHash('sha256').update(normalizedRootCause(finding)).digest('hex').slice(0, 16);
 }
 
+function provisionalCandidateKey(finding: Finding): string {
+  return `${rootCauseMarker(finding)}:${finding.path}:${findingLine(finding)}`;
+}
+
+function deduplicateProvisionalCandidates(findings: Finding[]): Finding[] {
+  const seen = new Set<string>();
+  return findings.filter((finding) => {
+    const key = provisionalCandidateKey(finding);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function primaryFindingIds(findings: Finding[]): string[] {
   const counts = new Map<string, number>();
   return findings.map((finding) => {
-    const base = `${rootCauseMarker(finding)}:${finding.path}:${findingLine(finding)}`;
+    const base = provisionalCandidateKey(finding);
     const count = counts.get(base) ?? 0;
     counts.set(base, count + 1);
     return count ? `${base}:${count}` : base;
@@ -963,6 +979,7 @@ interface PostContext {
   log: (msg: string) => void;
   /** Set by runReview; a cached review is re-posted with its original body. */
   lineage?: Pick<Lineage, 'reviewNumber' | 'previous'>;
+  fresh?: boolean;
 }
 
 /**
@@ -990,30 +1007,32 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
 
   // Drop findings that were already commented on an earlier run (e.g. a `synchronize` event).
   let comments = publishedFindings;
-  try {
-    const existing = await github.listReviewComments(repo.owner, repo.name, result.prNumber);
-    const existingMarkers = new Set(existing.flatMap((comment) => [...comment.body.matchAll(/repolens-root-cause:([a-f0-9]{16})/g)].map((match) => match[1]!)));
-    const groups = new Map<string, Finding[]>();
-    for (const finding of comments) {
-      const key = rootCauseMarker(finding);
-      const group = groups.get(key);
-      if (group) group.push(finding); else groups.set(key, [finding]);
-    }
-    const kept = [...groups.values()].filter((group) => {
-      const marker = rootCauseMarker(group[0]!);
-      return !existingMarkers.has(marker) && !group.some((f) => existing.some((c) => c.path === f.path && c.line === f.line && c.body.includes(f.title)));
-    }).flat();
-    const dropped = comments.length - kept.length;
-    if (dropped > 0) {
-      const msg = `Skipped ${dropped} findings already commented`;
+  if (!ctx.fresh) {
+    try {
+      const existing = await github.listReviewComments(repo.owner, repo.name, result.prNumber);
+      const existingMarkers = new Set(existing.flatMap((comment) => [...comment.body.matchAll(/repolens-root-cause:([a-f0-9]{16})/g)].map((match) => match[1]!)));
+      const groups = new Map<string, Finding[]>();
+      for (const finding of comments) {
+        const key = rootCauseMarker(finding);
+        const group = groups.get(key);
+        if (group) group.push(finding); else groups.set(key, [finding]);
+      }
+      const kept = [...groups.values()].filter((group) => {
+        const marker = rootCauseMarker(group[0]!);
+        return !existingMarkers.has(marker) && !group.some((f) => existing.some((c) => c.path === f.path && c.line === f.line && c.body.includes(f.title)));
+      }).flat();
+      const dropped = comments.length - kept.length;
+      if (dropped > 0) {
+        const msg = `Skipped ${dropped} findings already commented`;
+        warnings.push(msg);
+        log(`review: ${msg}`);
+      }
+      comments = kept;
+    } catch (err) {
+      const msg = `listing existing review comments failed: ${errMessage(err)}`;
       warnings.push(msg);
       log(`review: ${msg}`);
     }
-    comments = kept;
-  } catch (err) {
-    const msg = `listing existing review comments failed: ${errMessage(err)}`;
-    warnings.push(msg);
-    log(`review: ${msg}`);
   }
 
   try {
@@ -1124,7 +1143,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const repo: RepoRow = found;
 
   const pr = await github.getPull(repo.owner, repo.name, opts.prNumber);
-  const postCtx: PostContext = { db, github, llm, repo, pr, log };
+  const postCtx: PostContext = { db, github, llm, repo, pr, log, fresh: opts.fresh };
 
   // Commit statuses need a GitHub repository and a head commit to attach to.
   const statusEnabled = Boolean(statusContext) && opts.repoId.startsWith('github:') && Boolean(repo.owner && repo.name && pr.headSha);
@@ -1147,7 +1166,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
   };
 
-  const cached = opts.force ? null : db.findReview(opts.repoId, opts.prNumber, pr.headSha);
+  const cached = opts.fresh || opts.force ? null : db.findReview(opts.repoId, opts.prNumber, pr.headSha);
   const statusWarnings: string[] = [];
   // A cached, already-posted review is not "in progress": go straight to its final state.
   if (!cached || cached.posted !== 1) {
@@ -1217,7 +1236,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const warnings: string[] = [...statusWarnings];
 
-    const lineage = await buildLineage(
+    const lineage: Lineage = opts.fresh ? { reviewNumber: 1, commits: [], overview: '', warnings: [] } : await buildLineage(
       {
         previousReview: () => db.findLatestReview(opts.repoId, opts.prNumber),
         reviewCount: () => db.countPrReviews(opts.repoId, opts.prNumber),
@@ -1760,6 +1779,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       findings = findings.filter((finding) => !rejected.has(finding));
       findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary &&
         primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
+      findings = deduplicateProvisionalCandidates(findings);
       findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     }
 
