@@ -27,6 +27,8 @@ Focus only on things that matter:
 - breaking changes to public behaviour, schemas or contracts
 - a fix applied at one call site when other callers of the same function share the bug
 
+Compare changed API or callback declarations with the supplied callers, registration sites, and sibling conventions, and cite a demonstrated contract mismatch before reporting one.
+
 Every finding must fit exactly one target category: correctness means a definite failure in changed execution; edge_case means a concrete supported trigger that breaks behavior; security means an input or permission vulnerability; test_gap means a demonstrable behavior change with no test coverage for that behavior; repository_rule means a violation of an exact rule cited from a repository instruction file.
 
 Context comes in two kinds. Content under "Files changed in this pull request" is the post-change state and is authoritative. Content from the base-branch index may be stale for any file changed in this PR. Never report a symbol, export, method, option or type as missing or nonexistent unless you have verified it is absent from the post-change content of the files provided; if a referenced file's post-change content is not provided, do not speculate about its exports.

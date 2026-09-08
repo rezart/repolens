@@ -385,15 +385,26 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map((item) => item.chunk);
 }
 
+function declarationNames(text: string): string[] {
+  const names: string[] = [];
+  const add = (name: string) => {
+    if (name.length >= 2 && !CONTEXT_KEYWORDS.has(name.toLowerCase()) && !names.includes(name)) names.push(name);
+  };
+  for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:def|function)\s+([A-Za-z_$][\w$]*[!?]?)(?=\s*\()/g)) add(match[1]!);
+  for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)) add(match[1]!);
+  return names.slice(0, 2);
+}
+
 export function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
   const pathTerms = path.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
+  const declarations = declarationNames(changedText);
   const raw = [...new Set([...identifiers(changedText), ...(changedText.match(IDENTIFIER_RE) ?? [])])];
   const precise = raw.filter((term) => isCodeLikeTerm(term, changedText));
   const strong = precise.filter((term) => /[a-z][A-Z]/.test(term) || /^[A-Z]{2,}$/.test(term) || term.includes('_') || term.includes('$'));
   const ordinary = precise.filter((term) => !strong.includes(term) && !/^[A-Z][a-z]+$/.test(term));
   const weak = precise.filter((term) => !strong.includes(term) && !ordinary.includes(term));
-  const symbols = [...new Set([...strong, ...ordinary, ...pathTerms, ...weak])]
+  const symbols = [...new Set([...declarations, ...strong, ...ordinary, ...pathTerms, ...weak])]
     .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
   return { stem, symbols };
 }

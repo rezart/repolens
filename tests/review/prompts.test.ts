@@ -107,6 +107,11 @@ describe('system prompts', () => {
     expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).not.toMatch(/provisionalFindings|primary finding prose/i);
   });
 
+  it('requires demonstrated contract mismatches for changed declarations', () => {
+    expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/changed API or callback declarations.*callers, registration sites, and sibling conventions/i);
+    expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/demonstrated contract mismatch/i);
+  });
+
   it('tell the model how to treat the previous review', () => {
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/previous RepoLens review/i);
     expect(FOLLOWUP_SUMMARY_SYSTEM_PROMPT).toMatch(/previous review/i);

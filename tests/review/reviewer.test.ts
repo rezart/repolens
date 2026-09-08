@@ -159,6 +159,19 @@ describe('review context selection', () => {
     expect(query.symbols.indexOf('Authorize')).toBeGreaterThan(query.symbols.indexOf('getBookingResponse'));
   });
 
+  it('prioritizes at most two declarations over repeated implementation variables', () => {
+    const query = contextQuery('lib/thing.rb', [
+      'def save?(record)',
+      '  implementation_value = record',
+      'end',
+      'def publish(record)',
+      '  implementation_value = save?(record)',
+      'end',
+    ].join('\n'), () => ['implementation_value', 'record', 'implementation_value']);
+    expect(query.symbols.slice(0, 2)).toEqual(['save?', 'publish']);
+    expect(query.symbols.slice(0, 6).filter((symbol) => ['save?', 'publish'].includes(symbol))).toHaveLength(2);
+  });
+
   it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
     const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
     const context = buildHeadContext({
@@ -1359,6 +1372,7 @@ describe('reviewPullRequest', () => {
     expect(seen).toContain('run');
     expect(seen.some((query) => query.includes('gone'))).toBe(true);
     expect(seen).not.toContain('number');
+    expect(seen.length).toBeLessThanOrEqual(9);
     expect(lexicalOnlyRequests.every((value) => value === undefined)).toBe(true);
   });
 

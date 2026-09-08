@@ -70,6 +70,15 @@ describe('collectStaticEvidence', () => {
     expect(collectStaticEvidence('lib/api.rb', 'pattern = /response.data/')).toEqual([]);
   });
 
+  it('does not label Ruby calls as awaited or unawaited async calls', () => {
+    const facts = collectStaticEvidence('lib/api.rb', [
+      'URI.parse(value)',
+      'send(:save, value)',
+      'define_method(:run) { save(value) }',
+    ].join('\n'));
+    expect(facts.some((fact) => fact.kind === 'awaited-call' || fact.kind === 'unawaited-call')).toBe(false);
+  });
+
   it('does not fabricate facts from regex literals after JavaScript arrows', () => {
     const facts = collectStaticEvidence('src/api.ts', 'const matcher = () => /response.data/;');
     expect(facts.some((fact) => fact.kind === 'response-property' || fact.kind === 'unawaited-call')).toBe(false);
