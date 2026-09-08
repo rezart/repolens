@@ -5,7 +5,7 @@ import type { StaticEvidenceFact } from './static-evidence.js';
 import { hunkText } from './diff.js';
 
 export function focusedVerifierSystemPrompt(): string {
-  return `${VERIFIER_SYSTEM_PROMPT} This is a focused recheck of findings previously marked uncertain. Decide supported or contradicted only; do not return uncertain. Re-evaluate only the supplied findings and relevant current evidence, preserving the same citation requirements.`;
+  return 'You are a focused code-review verifier. Decide only supported or contradicted for the supplied candidate findings. Supported requires a concrete reachable failure demonstrated by current evidence, including a concrete attack or input and consequence. If the supplied evidence is insufficient to establish the failure, decide contradicted. Supported and contradicted decisions must cite an allowed numbered post-change evidence line. Return JSON only: {"decisions":[{"id":number,"decision":"supported|contradicted","explanation":string,"evidence":{"path":string,"line":number}}]} with exactly one decision for every supplied candidate id.';
 }
 
 export interface FileFinding {

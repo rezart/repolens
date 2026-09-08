@@ -2828,7 +2828,11 @@ describe('staged review', () => {
         ] });
       }
       expect(payload.findings.map(({ finding: item }) => item.title)).toEqual(['Uncertain']);
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'The focused evidence demonstrates it.', evidence: { path: 'src/mixed.ts', line: 20 } }] });
+      expect(req.system).toMatch(/supported\|contradicted/);
+      expect(req.system).not.toMatch(/supported\|contradicted\|uncertain/);
+      expect(req.system).not.toContain('uncertain');
+      expect(req.jsonSchema).toBeUndefined();
+      return JSON.stringify({ decisions: [{ id: 2, decision: 'supported', explanation: 'The focused evidence demonstrates it.', evidence: { path: 'src/mixed.ts', line: 20 } }] });
     } };
     try {
       const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
@@ -2837,7 +2841,43 @@ describe('staged review', () => {
       const stage = result.trace!.stages.find((item) => item.stage === 'verification')!;
       expect(stage.calls).toHaveLength(2);
       expect(stage.calls.map((call) => call.pass)).toEqual(['normal', 'focused']);
-      expect(stage.focusedDecisions).toEqual([{ id: 0, decision: 'supported' }]);
+      expect(stage.focusedDecisions).toEqual([{ id: 2, decision: 'supported' }]);
+    } finally { testDb.close(); }
+  });
+
+  it('preserves original uncertain IDs through a shuffled focused recheck', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const candidates = [finding(1, 'Uncertain zero'), finding(20, 'Contradicted'), finding(1, 'Supported'), finding(20, 'Uncertain three')];
+    const calls: CompleteRequest[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: candidates });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      calls.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: Finding }> };
+      if (calls.filter((call) => call.reviewStage === 'verification').length === 1) {
+        return JSON.stringify({ decisions: [
+          { id: 3, decision: 'uncertain', explanation: 'Needs focus.' },
+          { id: 2, decision: 'contradicted', explanation: 'Guard prevents it.', evidence: { path: 'src/mixed.ts', line: 20 } },
+          { id: 0, decision: 'uncertain', explanation: 'Needs focus.' },
+          { id: 1, decision: 'supported', explanation: 'The code demonstrates it.', evidence: { path: 'src/mixed.ts', line: 1 } },
+        ] });
+      }
+      expect(payload.findings.map(({ id, finding: item }) => [id, item.title])).toEqual([[3, 'Uncertain three'], [0, 'Uncertain zero']]);
+      return JSON.stringify({ decisions: [
+        { id: 0, decision: 'supported', explanation: 'Focused evidence supports it.', evidence: { path: 'src/mixed.ts', line: 1 } },
+        { id: 3, decision: 'contradicted', explanation: 'Focused evidence disproves it.', evidence: { path: 'src/mixed.ts', line: 20 } },
+      ] });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings.map((item) => item.title)).toEqual(['Supported', 'Uncertain zero']);
+      expect(result.trace!.stages.find((item) => item.stage === 'verification')!.focusedDecisions).toEqual([
+        { id: 0, decision: 'supported' }, { id: 3, decision: 'contradicted' },
+      ]);
     } finally { testDb.close(); }
   });
 
@@ -2880,8 +2920,8 @@ describe('staged review', () => {
       const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       expect(verifierCalls).toBe(1);
       expect(result.findings).toEqual([]);
-      expect(result.warnings.some((warning) => /uncertain.*budget/i.test(warning))).toBe(true);
-      expect(result.trace!.stages.find((item) => item.stage === 'verification')!.calls).toHaveLength(1);
+      expect(result.warnings).toEqual([]);
+      expect((result.trace!.stages.find((item) => item.stage === 'verification')! as { focusedSkipped?: string }).focusedSkipped).toBe('budget');
     } finally { testDb.close(); }
   });
 

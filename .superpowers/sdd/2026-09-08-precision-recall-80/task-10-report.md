@@ -59,3 +59,38 @@ Results: 32 test files / 691 tests passed; typecheck exited 0; diff check clean.
 ## Concerns
 
 None beyond the intentional suppression of uncertain findings when the focused request cannot fit the cap.
+
+## Round 1 fixes
+
+### RED
+
+Added regression coverage for the standalone focused contract, original candidate IDs, and budget-skip trace semantics before production edits. The focused reviewer run produced the expected three failures:
+
+- The focused system prompt inherited the normal contract and advertised `uncertain`.
+- Focused findings were renumbered locally instead of retaining the normal verifier's uncertain IDs.
+- Budget suppression emitted a warning instead of preserving a zero-warning result.
+
+### GREEN
+
+- Focused verification now uses a standalone binary `supported|contradicted` contract, treats insufficient evidence as contradicted, and has no uncertain schema/token.
+- Focused requests preserve original normal-verifier candidate IDs, require exactly that uncertain-ID set (in any order), and trace those IDs.
+- Budget-skipped focused verification records `focusedSkipped: 'budget'`, suppresses uncertain findings, and emits no warning.
+
+Round 1 focused verification:
+
+```text
+npx vitest run tests/review/reviewer.test.ts -t 'focused|uncertain findings' --reporter=verbose
+npx vitest run tests/review/prompts.test.ts -t 'system prompts' --reporter=verbose
+```
+
+Result: 4 reviewer tests and 6 prompt tests passed.
+
+Round 1 full verification:
+
+```text
+npm test
+npm run typecheck
+git diff --check
+```
+
+Results: 32 test files / 692 tests passed; typecheck exited 0; diff check clean.

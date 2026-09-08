@@ -183,6 +183,7 @@ export interface ReviewTrace {
     primaryFindings?: ReviewTraceFinding[];
     decisions?: Array<{ id: string | number; decision: string }>;
     focusedDecisions?: Array<{ id: string | number; decision: string }>;
+    focusedSkipped?: 'budget';
     findings?: ReviewTraceFinding[];
   }>;
   finalFindings: ReviewTraceFinding[];
@@ -1461,6 +1462,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let escalationFindingsTrace: Finding[] | undefined;
     let verifierDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
     let verifierFocusedDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let verifierFocusedSkipped: 'budget' | undefined;
     let verifierSelectedPaths = new Set<string>();
     let verifierExecuted = false;
     let verifierFindingsTrace: Finding[] = [];
@@ -1862,12 +1864,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }];
       });
     };
-    const verifierRequest = (candidateFindings: Finding[], trimOptionalContext = false, system = VERIFIER_SYSTEM_PROMPT): CompleteRequest => ({
+    const verifierRequest = (candidateFindings: Finding[], trimOptionalContext = false, system = VERIFIER_SYSTEM_PROMPT, candidateIds?: number[]): CompleteRequest => ({
       system,
       messages: [{ role: 'user', content: JSON.stringify({
         rules, files: buildVerifierFiles(candidateFindings, trimOptionalContext),
         ...(!trimOptionalContext && staticEvidence.length ? { staticEvidence: verifierStaticEvidence(candidateFindings) } : {}),
-        findings: candidateFindings.map((finding, id) => ({ id, finding })),
+        findings: candidateFindings.map((finding, id) => ({ id: candidateIds?.[id] ?? id, finding })),
       }) }],
       json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'verification',
     });
@@ -2083,19 +2085,23 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines,
         () => consumeRetryAllowance(true));
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
-      const uncertainFindings = decisions.filter((decision) => decision.decision === 'uncertain').map((decision) => findings[decision.id as number]).filter((finding): finding is Finding => Boolean(finding));
+      const uncertainCandidates = decisions.filter((decision) => decision.decision === 'uncertain')
+        .map((decision) => ({ id: decision.id as number, finding: findings[decision.id as number] }))
+        .filter((candidate): candidate is { id: number; finding: Finding } => Boolean(candidate.finding));
+      const uncertainFindings = uncertainCandidates.map(({ finding }) => finding);
       verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
 
       if (uncertainFindings.length) {
         const focusedSystem = focusedVerifierSystemPrompt();
-        const fullFocusedReq = verifierRequest(uncertainFindings, false, focusedSystem);
-        const trimmedFocusedReq = verifierRequest(uncertainFindings, true, focusedSystem);
+        const uncertainIds = uncertainCandidates.map(({ id }) => id);
+        const fullFocusedReq = verifierRequest(uncertainFindings, false, focusedSystem, uncertainIds);
+        const trimmedFocusedReq = verifierRequest(uncertainFindings, true, focusedSystem, uncertainIds);
         const remaining = REVIEW_MAX_USD - reservedUsd;
         const focusedReq = !budgeted || reviewCostUpperBound(fullFocusedReq) <= remaining
           ? fullFocusedReq : trimmedFocusedReq;
         if (budgeted && reviewCostUpperBound(focusedReq) > remaining) {
-          warnings.push(`Suppressed ${uncertainFindings.length} uncertain finding${uncertainFindings.length === 1 ? '' : 's'} because focused verification exceeds the remaining $0.50 budget.`);
+          verifierFocusedSkipped = 'budget';
         } else {
           const focusedPayload = JSON.parse(focusedReq.messages[0]!.content) as { files: VerifierContextFile[] };
           const focusedFiles = focusedPayload.files;
@@ -2110,8 +2116,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             focusedDecisions = Array.isArray(focusedObj?.decisions) ? focusedObj.decisions as Array<Record<string, unknown>> : [];
             const focusedIds = focusedDecisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
             if (focusedDecisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision)) ||
-                focusedDecisions.length !== uncertainFindings.length || new Set(focusedIds).size !== uncertainFindings.length ||
-                focusedIds.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= uncertainFindings.length) ||
+                focusedDecisions.length !== uncertainIds.length || new Set(focusedIds).size !== uncertainIds.length ||
+                focusedIds.some((id) => !Number.isInteger(id) || !uncertainIds.includes(id as number)) ||
                 focusedDecisions.some((decision) => !['supported', 'contradicted'].includes(String(decision.decision)) ||
                   typeof decision.explanation !== 'string' || !decision.explanation.trim() || !hasValidVerifierCitation(decision, focusedFiles))) {
               throw new IncompleteResponseError(verifierLlm.name, 'Invalid focused verification response; no review was published.');
@@ -2122,7 +2128,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           }
           verifierFocusedDecisionsTrace = focusedDecisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
           const focusedSupported = new Set(focusedDecisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
-          findings.push(...uncertainFindings.filter((finding, id) => focusedSupported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit'));
+          findings.push(...uncertainCandidates.filter(({ id, finding }) => focusedSupported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit').map(({ finding }) => finding));
         }
       }
     }
@@ -2131,7 +2137,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     await assertHeadUnchanged();
     const summary = buildFindingSummary(findings);
     const verdict = verdictForFindings(findings);
-    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; findings?: Finding[] } = {}) => ({
+    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget'; findings?: Finding[] } = {}) => ({
       stage,
       selectedPaths: selected.map((file) => file.newPath ?? file.oldPath ?? ''),
       hunks: traceHunks(selected),
@@ -2141,6 +2147,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       ...(extra.primaryFindings ? { primaryFindings: extra.primaryFindings.map(traceFinding) } : {}),
       ...(extra.decisions ? { decisions: extra.decisions } : {}),
       ...(extra.focusedDecisions ? { focusedDecisions: extra.focusedDecisions } : {}),
+      ...(extra.focusedSkipped ? { focusedSkipped: extra.focusedSkipped } : {}),
       ...(extra.findings ? { findings: extra.findings.map(traceFinding) } : {}),
     });
     const trace: ReviewTrace = {
@@ -2149,7 +2156,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       stages: [
         traceStage('initial', files, initialOmittedContext, { primaryFindings: primaryTrace }),
         ...(escalationLlm && riskyFiles.length ? [traceStage('escalation', riskyFiles, escalationOmittedContext, { primaryFindings: primaryTrace.filter((finding) => riskyFiles.some((file) => (file.newPath ?? file.oldPath) === finding.path)), decisions: escalationDecisionsTrace, findings: escalationFindingsTrace })] : []),
-        ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, focusedDecisions: verifierFocusedDecisionsTrace, findings: verifierFindingsTrace })] : []),
+        ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, focusedDecisions: verifierFocusedDecisionsTrace, focusedSkipped: verifierFocusedSkipped, findings: verifierFindingsTrace })] : []),
         traceStage('final', files, 0, { findings: findings.slice() }),
       ],
       finalFindings: findings.map(traceFinding),
