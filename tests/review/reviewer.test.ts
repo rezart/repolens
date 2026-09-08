@@ -27,6 +27,7 @@ import {
   defaultFormatContext,
   contextQuery,
   buildHeadContext,
+  buildHeadEvidence,
   hasValidVerifierCitation,
   selectRelevantChunks,
   repositoryRulePaths,
@@ -181,6 +182,30 @@ describe('review context selection', () => {
     ].join('\n'), () => ['implementation_value', 'implementation_value', 'record']);
     expect(query.symbols.slice(0, 6)).toContain('include_website_name');
     expect(query.symbols.slice(0, 2)[0]).toBe('include_website_name');
+  });
+
+  it('pulls exact changed sibling evidence from declarations and attributes', () => {
+    const snippets = buildHeadEvidence({
+      path: 'app/serializers/user_serializer.rb',
+      addedText: [
+        'def website_name',
+        '  attributes :website_name',
+        'end',
+        'def include_website_name',
+      ].join('\n'),
+      headContents: new Map([
+        ['app/serializers/user_serializer.rb', 'def website_name\nend'],
+        ['spec/serializers/user_serializer_spec.rb', 'expect(serializer.website_name).to eq("example.com")'],
+        ['app/views/users/show.html.erb', '{{website_name}}'],
+        ['app/views/users/unrelated.html.erb', '{{website_name_suffix}} include_website_name?'],
+        ['app/models/user.rb', 'website_name'],
+      ]),
+    });
+    expect(snippets.map((snippet) => snippet.path)).toEqual([
+      'app/serializers/user_serializer.rb',
+      'spec/serializers/user_serializer_spec.rb',
+      'app/views/users/show.html.erb',
+    ]);
   });
 
   it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
@@ -3086,6 +3111,39 @@ describe('staged review', () => {
       expect(payload.files[0]!.relevantContext).toBeUndefined();
       expect(payload.files[0]!.currentEvidence).toEqual(expect.arrayContaining([{ line: 1, kind: 'added', content: 'const token = request.token;' }]));
       expect(reviewCostUpperBound(verifierRequest!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
+    } finally { testDb.close(); }
+  });
+
+  it('keeps related changed-file head evidence when verifier context is trimmed', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const changedPaths = ['src/mixed.ts', 'src/sibling.ts'];
+    const twoFileDiff = [
+      'diff --git a/src/mixed.ts b/src/mixed.ts', '--- a/src/mixed.ts', '+++ b/src/mixed.ts', '@@ -1 +1 @@',
+      '-old()', '+export function contract() {}',
+      'diff --git a/src/sibling.ts b/src/sibling.ts', '--- a/src/sibling.ts', '+++ b/src/sibling.ts', '@@ -1 +1 @@',
+      '-old()', '+export function sibling() {}',
+    ].join('\n');
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: changedPaths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
+    } };
+    let verifierRequest: CompleteRequest | undefined;
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierRequest = req;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The current code disproves it.', evidence: { path: 'src/mixed.ts', line: 1 } }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, content: 'context ' + 'x'.repeat(500_000) }],
+        github: fakeGithub(twoFileDiff, PR, { headFiles: {
+          'src/mixed.ts': 'export function contract() {}',
+          'src/sibling.ts': 'export function contract() {}',
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<{ relevantContext?: string; headEvidence?: Array<{ path: string }> }> };
+      expect(payload.files[0]!.relevantContext).toBeUndefined();
+      expect(payload.files[0]!.headEvidence?.map((snippet) => snippet.path)).toEqual(['src/mixed.ts', 'src/sibling.ts']);
     } finally { testDb.close(); }
   });
 

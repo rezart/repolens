@@ -385,7 +385,7 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map((item) => item.chunk);
 }
 
-function declarationNames(path: string, text: string): string[] {
+function changedSymbolNames(path: string, text: string): string[] {
   const names: string[] = [];
   const add = (name: string) => {
     if (name.length >= 2 && !CONTEXT_KEYWORDS.has(name.toLowerCase()) && !names.includes(name)) names.push(name);
@@ -395,13 +395,14 @@ function declarationNames(path: string, text: string): string[] {
     for (const match of text.matchAll(/(?:^|\n)\s*def\s+([A-Za-z_][\w]*[!?]?)(?=\s*(?:\([^)]*\))?\s*(?:#.*)?(?:\r?\n|$))/g)) add(match[1]!);
   }
   for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)) add(match[1]!);
+  for (const match of text.matchAll(/(?<![A-Za-z0-9_$:]):([A-Za-z_][\w!?]*)/g)) add(match[1]!);
   return names.slice(0, 2);
 }
 
 export function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
   const pathTerms = path.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
-  const declarations = declarationNames(path, changedText);
+  const declarations = changedSymbolNames(path, changedText);
   const raw = [...new Set([...identifiers(changedText), ...(changedText.match(IDENTIFIER_RE) ?? [])])];
   const precise = raw.filter((term) => isCodeLikeTerm(term, changedText));
   const strong = precise.filter((term) => /[a-z][A-Z]/.test(term) || /^[A-Z]{2,}$/.test(term) || term.includes('_') || term.includes('$'));
@@ -643,6 +644,19 @@ function matchingHeadLines(content: string, terms: Set<string>): number[] {
   return matches.length ? matches : [1];
 }
 
+function relatedChangedHeadPaths(path: string, addedText: string, headContents: Map<string, string>): string[] {
+  const names = changedSymbolNames(path, addedText);
+  if (!names.length) return [];
+  const exact = (content: string, name: string) => new RegExp(
+    `(?<![A-Za-z0-9_$?!])${escapedTerm(name)}(?![A-Za-z0-9_$?!])`, 'i',
+  ).test(content);
+  return [...headContents].flatMap(([other, content], index) => other === path || !names.some((name) => exact(content, name)) ? [] : [{
+    path: other,
+    index,
+    preferred: /(^|\/)(?:test|tests|spec|specs)(\/|$)|(?:\.|_)(?:test|spec)\b/i.test(other),
+  }]).sort((a, b) => Number(b.preferred) - Number(a.preferred) || a.index - b.index).slice(0, 2).map(({ path: related }) => related);
+}
+
 /**
  * The post-change content the model needs to judge `path`: its own new content plus
  * the new content of the changed files it references — the ones a stale index would
@@ -716,7 +730,9 @@ function collectHeadEvidence(input: {
 
   const snippets: HeadEvidence[] = [];
   let used = 0;
-  for (const referenced of [...imported, ...byExport]) {
+  const related = relatedChangedHeadPaths(path, addedText, headContents);
+  for (const referenced of [...imported, ...byExport, ...related]) {
+    if (referenced === path || snippets.some((snippet) => snippet.path === referenced)) continue;
     const content = headContents.get(referenced);
     if (content === undefined) continue;
     const terms = new Set([...mentioned, referenced.slice(referenced.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '')]);
@@ -1886,7 +1902,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const scopedReferencedHeadContents = referencedHeadContentsByVerifierPath.get(path);
         const scopedReferencedHeadLines = referencedHeadLinesByVerifierPath.get(path);
         const headEvidence = buildHeadEvidence({
-          path, addedText: hunkText({ ...file, hunks }, Infinity),
+          path, addedText: hunks.flatMap((hunk) => hunk.lines.filter((line) => line.type === 'add').map((line) => line.content)).join('\n'),
           relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents,
           referencedHeadContents: scopedReferencedHeadContents, referencedHeadLines: scopedReferencedHeadLines, exportsByPath,
         });
@@ -1900,7 +1916,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
             line: line.oldLine, kind: 'removed', content: line.content,
           }])),
-          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => snippet.path === path) : headEvidence,
+          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => headContents.has(snippet.path)) : headEvidence,
           ...(!trimOptionalContext && packedContext ? { relevantContext: packedContext } : {}),
         }];
       });
