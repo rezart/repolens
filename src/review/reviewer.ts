@@ -397,7 +397,9 @@ function changedSymbolNames(path: string, text: string): string[] {
     for (const match of text.matchAll(/(?:^|\n)\s*def\s+([A-Za-z_][\w]*[!?]?)(?=\s*(?:\([^)]*\))?\s*(?:#.*)?(?:\r?\n|$))/g)) add(match[1]!);
   }
   for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)) add(match[1]!);
-  for (const match of text.matchAll(/(?<![A-Za-z0-9_$:]):([A-Za-z_][\w!?]*)/g)) add(match[1]!);
+  if (/\.(?:rb|rake)$/i.test(path)) {
+    for (const match of text.matchAll(/(?<![A-Za-z0-9_$:]):([A-Za-z_][\w!?]*)/g)) add(match[1]!);
+  }
   return names.slice(0, 2);
 }
 
@@ -646,17 +648,24 @@ function matchingHeadLines(content: string, terms: Set<string>): number[] {
   return matches.length ? matches : [1];
 }
 
-function relatedChangedHeadPaths(path: string, addedText: string, headContents: Map<string, string>): string[] {
+function relatedChangedHeadPaths(path: string, addedText: string, headContents: Map<string, string>): Array<{ path: string; lines: number[] }> {
   const names = changedSymbolNames(path, addedText);
   if (!names.length) return [];
-  const exact = (content: string, name: string) => new RegExp(
+  const exact = (line: string, name: string) => new RegExp(
     `(?<![A-Za-z0-9_$?!])${escapedTerm(name)}(?![A-Za-z0-9_$?!])`, 'i',
-  ).test(content);
-  return [...headContents].flatMap(([other, content], index) => other === path || !names.some((name) => exact(content, name)) ? [] : [{
-    path: other,
-    index,
-    preferred: /(^|\/)(?:test|tests|spec|specs)(\/|$)|(?:\.|_)(?:test|spec)\b/i.test(other),
-  }]).sort((a, b) => Number(b.preferred) - Number(a.preferred) || a.index - b.index).slice(0, 2).map(({ path: related }) => related);
+  ).test(line);
+  return [...headContents].flatMap(([other, content], index) => {
+    if (other === path) return [];
+    const lines = content.split(/\r?\n/).flatMap((line, lineIndex) =>
+      names.some((name) => exact(line, name)) ? [lineIndex + 1] : []);
+    return lines.length ? [{
+      path: other,
+      lines,
+      index,
+      preferred: /(^|\/)(?:test|tests|spec|specs)(\/|$)|(?:\.|_)(?:test|spec)\b/i.test(other),
+    }] : [];
+  }).sort((a, b) => Number(b.preferred) - Number(a.preferred) || a.index - b.index)
+    .slice(0, 2).map(({ path: related, lines }) => ({ path: related, lines }));
 }
 
 /**
@@ -733,17 +742,19 @@ function collectHeadEvidence(input: {
   const snippets: HeadEvidence[] = [];
   let used = 0;
   const related = relatedChangedHeadPaths(path, addedText, headContents);
-  for (const referenced of [...imported, ...byExport, ...related]) {
-    if (referenced === path || snippets.some((snippet) => snippet.path === referenced)) continue;
+  const addChangedSnippet = (referenced: string, lines?: number[]) => {
+    if (referenced === path || snippets.some((snippet) => snippet.path === referenced)) return;
     const content = headContents.get(referenced);
-    if (content === undefined) continue;
+    if (content === undefined) return;
     const terms = new Set([...mentioned, referenced.slice(referenced.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '')]);
-    const snippet = headSnippet(referenced, content, matchingHeadLines(content, terms));
+    const snippet = headSnippet(referenced, content, lines ?? matchingHeadLines(content, terms));
     const block = renderHeadEvidence(snippet, 'content after this pull request; bounded snippet');
-    if (used + block.length > HEAD_CONTEXT_CHARS_MAX) break;
+    if (used + block.length > HEAD_CONTEXT_CHARS_MAX) return;
     snippets.push(snippet);
     used += block.length + 2;
-  }
+  };
+  for (const { path: referenced, lines } of related) addChangedSnippet(referenced, lines);
+  for (const referenced of [...imported, ...byExport]) addChangedSnippet(referenced);
   for (const [referenced, content] of input.referencedHeadContents ?? []) {
     if (referenced === path || headContents.has(referenced) || snippets.some((snippet) => snippet.path === referenced)) continue;
     const snippet = headSnippet(referenced, content, input.referencedHeadLines?.get(referenced) ?? [1]);

@@ -208,6 +208,39 @@ describe('review context selection', () => {
     ]);
   });
 
+  it('does not treat JavaScript object or ternary colons as changed attributes', () => {
+    const snippets = buildHeadEvidence({
+      path: 'src/change.ts',
+      addedText: [
+        'export function changed() {}',
+        'const choice = enabled ? left :right;',
+        'const options = { callback:fake };',
+      ].join('\n'),
+      headContents: new Map([
+        ['src/change.ts', 'export function changed() {}'],
+        ['src/real.ts', 'export function changed() {}'],
+        ['src/right.ts', 'right();'],
+        ['src/fake.ts', 'fake();'],
+      ]),
+    });
+    expect(snippets.map((snippet) => snippet.path)).toEqual(['src/change.ts', 'src/real.ts']);
+  });
+
+  it('anchors a large related spec on the exact changed symbol', () => {
+    const spec = Array.from({ length: 2_000 }, () => 'end');
+    spec[1_499] = 'expect(serializer.include_website_name).to eq(true)';
+    const snippets = buildHeadEvidence({
+      path: 'app/serializers/user_serializer.rb',
+      addedText: 'def include_website_name',
+      headContents: new Map([
+        ['app/serializers/user_serializer.rb', 'def include_website_name\nend'],
+        ['spec/serializers/user_serializer_spec.rb', spec.join('\n')],
+      ]),
+    });
+    const related = snippets.find((snippet) => snippet.path === 'spec/serializers/user_serializer_spec.rb');
+    expect(related?.lines).toEqual(expect.arrayContaining([{ line: 1_500, text: 'expect(serializer.include_website_name).to eq(true)' }]));
+  });
+
   it('keeps numbered bounded head windows for oversized files around every relevant line', () => {
     const lines = Array.from({ length: 4_000 }, (_, index) => `line-${index + 1}`);
     const context = buildHeadContext({
