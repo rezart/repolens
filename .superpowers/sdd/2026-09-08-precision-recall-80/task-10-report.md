@@ -94,3 +94,40 @@ git diff --check
 ```
 
 Results: 32 test files / 692 tests passed; typecheck exited 0; diff check clean.
+
+## Round 2 fixes
+
+### RED
+
+Added a focused prompt safeguard test before editing production code. The targeted run failed as expected because the standalone focused prompt did not retain the allegation, authoritative head-evidence, historical removed-evidence, reachability/callee, or counterevidence guidance.
+
+### GREEN
+
+Retained those non-conflicting normal-verifier safety rules in the standalone focused contract:
+
+- finding prose is an allegation, not evidence;
+- currentEvidence and structured `revision:"head"` headEvidence are authoritative;
+- removedEvidence is historical and cannot prove current code;
+- declared parameters, guards/early exits, caller constraints, callee behavior, and counterevidence must be checked;
+- citations must support the claim, not merely cite an allowed line.
+
+The focused contract remains binary (`supported|contradicted`) and treats insufficient evidence as contradicted. Assertions use semantic patterns rather than full-string coupling.
+
+Round 2 focused verification:
+
+```text
+npx vitest run tests/review/prompts.test.ts -t 'focused verification evidence safeguards' --reporter=verbose
+npx vitest run tests/review/reviewer.test.ts -t 'focused|uncertain findings' --reporter=dot
+```
+
+Result: 1 prompt test and 4 reviewer tests passed.
+
+Round 2 full verification:
+
+```text
+npm test
+npm run typecheck
+git diff --check
+```
+
+Results: 32 test files / 693 tests passed; typecheck exited 0; diff check clean.

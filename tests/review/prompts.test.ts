@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT, focusedVerifierSystemPrompt } from '../../src/review/prompts.js';
 import type { Lineage } from '../../src/review/lineage.js';
 import type { HistoricalPr } from '../../src/review/history.js';
 
@@ -139,5 +139,16 @@ describe('system prompts', () => {
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/generic.*(?:security|performance|limit)/i);
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/exhaustive whole-program proof/i);
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/trigger.*consequence/i);
+  });
+
+  it('keeps focused verification evidence safeguards in its binary contract', () => {
+    const prompt = focusedVerifierSystemPrompt();
+    expect(prompt).toMatch(/finding(?:'s)? prose.*allegation/i);
+    expect(prompt).toMatch(/currentEvidence.*headEvidence.*authoritative/i);
+    expect(prompt).toMatch(/removedEvidence.*historical.*(?:cannot|not).*prove/i);
+    expect(prompt).toMatch(/declared parameters.*guards.*caller constraints.*callee behavior/i);
+    expect(prompt).toMatch(/counterevidence.*contradict/i);
+    expect(prompt).toMatch(/supported\|contradicted/);
+    expect(prompt).not.toMatch(/supported\|contradicted\|uncertain/);
   });
 });
