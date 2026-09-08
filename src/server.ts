@@ -26,7 +26,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   // Reviews get the configured reasoning budget.
   const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
   const verifierLlm = config.llm.provider === 'openrouter' && config.review.verifierModel
-    ? createProvider(config, { model: config.review.verifierModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
+    ? createProvider(config, { model: config.review.verifierModel, reasoningEffort: '', onUsage: usage.sinkFor('review') })
     : config.llm.provider === 'claude-cli' ? llm : undefined;
   const escalationLlm = config.llm.provider === 'openrouter' && config.review.escalationModel && config.review.escalationModel !== llm.model
     ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
@@ -47,7 +47,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, escalationLlm, verifierLlm, dualDiscovery: config.review.dualDiscovery, focusedVerification: config.review.focusedVerification, chatLlm, embeddings, retrieve, github, jobs, usage, log };
+  return { config, db, llm, escalationLlm, verifierLlm, dualDiscovery: config.review.dualDiscovery, focusedVerification: config.review.focusedVerification, discoveryMaxOutput: config.review.discoveryMaxOutput, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {

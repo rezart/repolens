@@ -41,7 +41,7 @@ describe('OpenRouter review budget', () => {
     await p.complete(larger);
     const body = JSON.parse(String(f.calls[0]!.init.body));
     expect(body.provider).toEqual({ order: ['DeepInfra', 'Google', 'Venice', 'Novita'], require_parameters: true, allow_fallbacks: true, max_price: { prompt: 0.4, completion: 2, request: 0 } });
-    expect(body.reasoning).toBeUndefined();
+    expect(body.reasoning).toEqual({ effort: 'high' });
     await p.complete({ ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(150000) }] });
     const huge = { ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(310000) }] };
     expect(reviewCostUpperBound(huge)).toBeGreaterThan(REVIEW_MAX_USD);
@@ -57,15 +57,29 @@ describe('OpenRouter review budget', () => {
     expect(body.provider).toEqual({ order: ['DeepInfra', 'Google', 'Venice', 'Novita'], require_parameters: true, allow_fallbacks: true, max_price: { prompt: 1, completion: 4, request: 0 } });
   });
 
-  it('allows 16k output only for escalation and rejects larger or other-stage requests before fetch', async () => {
-    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+  it('allows bounded 16k discovery and escalation output while keeping verification at 4k', async () => {
+    const f = fakeFetch(Array.from({ length: 2 }, () => jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })));
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
-    await p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewStage: 'escalation' });
+    await p.complete({ ...req, maxTokens: 16000, reviewStage: 'initial' });
     expect(JSON.parse(String(f.calls[0]!.init.body)).max_tokens).toBe(16000);
+    await expect(p.complete({ ...req, maxTokens: 16001, reviewStage: 'initial' })).rejects.toThrow('$0.50');
+    await p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT, reviewStage: 'escalation' });
     await expect(p.complete({ ...req, maxTokens: REVIEW_ESCALATION_MAX_OUTPUT + 1, reviewStage: 'escalation' })).rejects.toThrow('$0.50');
-    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'initial' })).rejects.toThrow('$0.50');
-    await expect(p.complete({ ...req, maxTokens: REVIEW_MAX_OUTPUT + 1, reviewStage: 'verification' })).rejects.toThrow('$0.50');
-    expect(f.calls).toHaveLength(1);
+    await expect(p.complete({ ...req, maxTokens: 4001, reviewStage: 'verification' })).rejects.toThrow('$0.50');
+    expect(f.calls).toHaveLength(2);
+  });
+
+  it('rejects a budgeted response that ends from output length', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'length' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch });
+    await expect(p.complete({ ...req, reviewStage: 'initial' })).rejects.toBeInstanceOf(IncompleteResponseError);
+  });
+
+  it('omits reasoning from a budgeted request when effort is blank', async () => {
+    const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] })]);
+    const p = new OpenRouterProvider({ apiKey: 'k', model: 'm1', fetch: f.fetch, reasoningEffort: '' });
+    await p.complete({ ...req, reviewStage: 'initial' });
+    expect(JSON.parse(String(f.calls[0]!.init.body)).reasoning).toBeUndefined();
   });
 
   it('sends an optional escalation JSON schema as strict json_schema response format', async () => {

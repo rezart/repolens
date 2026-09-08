@@ -10,8 +10,17 @@ describe('loadConfig', () => {
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
     expect(c.review.escalationModel).toBe('openai/gpt-5-mini');
+    expect(c.review.discoveryMaxOutput).toBe(8000);
     expect(c.review.dualDiscovery).toBe(false);
     expect(c.review.focusedVerification).toBe(false);
+  });
+
+  it('bounds the optional discovery output override', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig({ ...base, REVIEW_DISCOVERY_MAX_OUTPUT: '16000' }).review.discoveryMaxOutput).toBe(16000);
+    for (const value of ['0', '16001', '1.5', 'invalid']) {
+      expect(() => loadConfig({ ...base, REVIEW_DISCOVERY_MAX_OUTPUT: value })).toThrow(ConfigError);
+    }
   });
   it('trims the running image revision', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');

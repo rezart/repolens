@@ -796,6 +796,21 @@ describe('buildDeps', () => {
     try { expect(deps.dualDiscovery).toBe(true); } finally { deps.db.close(); }
   });
 
+  it('propagates discovery output bounds and leaves the verifier at provider default effort', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      LLM_REASONING_EFFORT: 'high', REVIEW_DISCOVERY_MAX_OUTPUT: '16000',
+      REVIEW_VERIFIER_MODEL: 'openai/gpt-5-mini', REVIEW_ESCALATION_MODEL: '',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.discoveryMaxOutput).toBe(16000);
+      expect(effortOf(deps.llm)).toBe('high');
+      expect(effortOf(deps.verifierLlm!)).toBeUndefined();
+    } finally { deps.db.close(); }
+  });
+
   it('always gives chat its own low-effort provider, even without CHAT_PROVIDER/CHAT_MODEL', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'claude-cli',

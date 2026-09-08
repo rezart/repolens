@@ -35,6 +35,7 @@ export function freshReviewDeps(deps: FreshReviewDeps) {
     db: deps.db, llm: deps.llm, escalationLlm: deps.escalationLlm, verifierLlm: deps.verifierLlm,
     dualDiscovery: deps.config.review.dualDiscovery,
     focusedVerification: deps.config.review.focusedVerification,
+    discoveryMaxOutput: deps.config.review.discoveryMaxOutput,
     retrieve: deps.retrieve, github: deps.github, identifiers: identifiersFromCode,
     formatContext: (chunks: Parameters<typeof formatContext>[0]) => formatContext(chunks, 16000),
     statusContext: deps.config.review.statusContext, failOn: deps.config.review.failOn,

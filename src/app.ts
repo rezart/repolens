@@ -37,6 +37,8 @@ export interface AppDeps {
   dualDiscovery?: boolean;
   /** Enables the uncertain-only focused verifier recheck. */
   focusedVerification?: boolean;
+  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 4000. */
+  discoveryMaxOutput?: number;
   /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
   chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
@@ -176,6 +178,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           verifierLlm: deps.verifierLlm,
           dualDiscovery: deps.dualDiscovery,
           focusedVerification: deps.focusedVerification,
+          discoveryMaxOutput: deps.discoveryMaxOutput,
           retrieve: deps.retrieve,
           github: deps.github,
           identifiers: identifiersFromCode,

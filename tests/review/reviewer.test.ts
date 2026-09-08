@@ -1412,6 +1412,22 @@ describe('reviewPullRequest', () => {
     expect(lexicalOnlyRequests.every((value) => value === undefined)).toBe(true);
   });
 
+  it('uses the bounded discovery output override before estimating its request', async () => {
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Clean.', verdict: 'approve', findings: [] });
+    } };
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    try {
+      await reviewPullRequest({ db: testDb, llm, discoveryMaxOutput: 16000, retrieve: async () => [], github: fakeGithub().github }, { repoId: REPO_ID, prNumber: 42, post: false });
+      expect(calls[0]!.maxTokens).toBe(16000);
+      expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(reviewCostUpperBound({ ...calls[0]!, maxTokens: REVIEW_MAX_OUTPUT }));
+    } finally { testDb.close(); }
+  });
+
   it.each([false, true])('includes test context keywords in %s batch mode queries', async (batch) => {
     const diff = [
       'diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', '@@ -1 +1 @@', '-old', '+runThing();',

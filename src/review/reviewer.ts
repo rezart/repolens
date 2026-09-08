@@ -216,6 +216,8 @@ export interface ReviewDeps {
   dualDiscovery?: boolean;
   /** Recheck verifier-uncertain findings with a focused call. */
   focusedVerification?: boolean;
+  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 4000. */
+  discoveryMaxOutput?: number;
   retrieve: RetrieveFn;
   github: Pick<
     GitHubClient,
@@ -1476,6 +1478,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
 
     const budgeted = llm.supportsBatchReview === true;
+    const discoveryMaxOutput = Math.min(
+      REVIEW_ESCALATION_MAX_OUTPUT,
+      Math.max(1, Number.isInteger(deps.discoveryMaxOutput) ? deps.discoveryMaxOutput! : REVIEW_MAX_OUTPUT),
+    );
     // Read head files before final filtering so an unchanged generated header
     // outside the diff still suppresses the review.
     const headContents = new Map<string, string>();
@@ -1667,7 +1673,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath ?? f.oldPath!) : undefined,
           })),
         }) }],
-        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true, reviewStage: 'initial',
+        json: true, maxTokens: discoveryMaxOutput, reviewBudget: true, reviewStage: 'initial',
       };
       // Reject the core prompt before the retrieval loop or any inference call.
       const coreCost = reviewCostUpperBound(req);

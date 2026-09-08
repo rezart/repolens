@@ -23,6 +23,7 @@ export interface OpenRouterOptions {
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const MAX_ATTEMPTS = 3;
 const ESCALATION_TIMEOUT_MS = 600_000;
+const VERIFIER_MAX_OUTPUT = 4000;
 
 const defaultSleep: Sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -129,7 +130,9 @@ export class OpenRouterProvider implements LLMProvider {
     if (streaming) body.stream = true;
     // Every model uses the same token bounds and routing price caps below.
     if (req.reviewBudget) {
-      const maxOutput = req.reviewStage === 'escalation' ? REVIEW_ESCALATION_MAX_OUTPUT : REVIEW_MAX_OUTPUT;
+      const maxOutput = req.reviewStage === 'verification' ? VERIFIER_MAX_OUTPUT
+        : req.reviewStage === 'initial' || req.reviewStage === 'escalation' ? REVIEW_ESCALATION_MAX_OUTPUT
+          : REVIEW_MAX_OUTPUT;
       if (streaming || !Number.isInteger(req.maxTokens) ||
           req.maxTokens! <= 0 || req.maxTokens! > maxOutput || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
         throw new ProviderError('openrouter', 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
@@ -143,7 +146,6 @@ export class OpenRouterProvider implements LLMProvider {
           request: 0,
         },
       };
-      delete body.reasoning;
     }
     return JSON.stringify(body);
   }
