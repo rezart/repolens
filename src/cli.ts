@@ -17,6 +17,7 @@ export interface ReviewCliArgs {
   post: boolean;
   force: boolean;
   fresh: boolean;
+  experimentTrace: boolean;
 }
 
 export function parseReviewArgs(args: string[]): ReviewCliArgs {
@@ -24,7 +25,7 @@ export function parseReviewArgs(args: string[]): ReviewCliArgs {
   const all = args.includes('--all');
   const parsedNumber = args[1] && args[1] !== '--all' ? Number(args[1]) : undefined;
   return { repoId, prNumber: Number.isFinite(parsedNumber) ? parsedNumber : undefined, all,
-    post: args.includes('--post'), force: args.includes('--force'), fresh: args.includes('--fresh') };
+    post: args.includes('--post'), force: args.includes('--force'), fresh: args.includes('--fresh'), experimentTrace: args.includes('--experiment-trace') };
 }
 
 type FreshReviewDeps = ReturnType<typeof buildDeps> & { verifierLlm?: ReturnType<typeof buildDeps>['llm'] };
@@ -33,6 +34,7 @@ export function freshReviewDeps(deps: FreshReviewDeps) {
   return {
     db: deps.db, llm: deps.llm, escalationLlm: deps.escalationLlm, verifierLlm: deps.verifierLlm,
     dualDiscovery: deps.config.review.dualDiscovery,
+    focusedVerification: deps.config.review.focusedVerification,
     retrieve: deps.retrieve, github: deps.github, identifiers: identifiersFromCode,
     formatContext: (chunks: Parameters<typeof formatContext>[0]) => formatContext(chunks, 16000),
     statusContext: deps.config.review.statusContext, failOn: deps.config.review.failOn,
@@ -56,8 +58,8 @@ function usage(): never {
   repolens index <owner/name | github url | local path> [--branch <b>]
   repolens ask <github:owner/name | local:name> "<question>"
   repolens pulls <github:owner/name>
-  repolens review <github:owner/name> <pr-number> [--post] [--force] [--fresh]
-  repolens review <github:owner/name> --all [--post] [--force] [--fresh]`);
+  repolens review <github:owner/name> <pr-number> [--post] [--force] [--fresh [--experiment-trace]]
+  repolens review <github:owner/name> --all [--post] [--force] [--fresh [--experiment-trace]]`);
   process.exit(1);
 }
 
@@ -100,10 +102,10 @@ export function freshReviewFailureRecord(repoId: string, error: unknown, latency
   };
 }
 
-async function runFreshReview(deps: FreshReviewDeps, repoId: string, prNumber: number, post: boolean, force: boolean) {
+async function runFreshReview(deps: FreshReviewDeps, repoId: string, prNumber: number, post: boolean, force: boolean, experimentTrace: boolean) {
   const started = Date.now();
   try {
-    const result = await reviewPullRequest(freshReviewDeps(deps), { repoId, prNumber, post, force, fresh: true });
+    const result = await reviewPullRequest(freshReviewDeps(deps), { repoId, prNumber, post, force, fresh: true, experimentTrace });
     const row = deps.db.getReview(result.reviewId);
     return {
       fixture: repoId,
@@ -218,12 +220,12 @@ async function main() {
           const pulls = await deps.github.listOpenPulls(deps.db.getRepo(repoId)!.owner, deps.db.getRepo(repoId)!.name);
           for (const pull of pulls) {
             if (pull.draft) continue;
-            console.log(JSON.stringify(await runFreshReview(deps, repoId, pull.number, post, force)));
+            console.log(JSON.stringify(await runFreshReview(deps, repoId, pull.number, post, force, parsed.experimentTrace)));
           }
           return;
         }
         if (parsed.prNumber === undefined) usage();
-        console.log(JSON.stringify(await runFreshReview(deps, repoId, parsed.prNumber, post, force)));
+        console.log(JSON.stringify(await runFreshReview(deps, repoId, parsed.prNumber, post, force, parsed.experimentTrace)));
         return;
       }
       if (args.includes('--all')) {

@@ -771,7 +771,7 @@ describe('buildDeps', () => {
   it('keeps the primary Qwen provider, creates an independent verifier, and disables escalation when blank', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
-      REVIEW_VERIFIER_MODEL: 'openai/gpt-5-mini', REVIEW_ESCALATION_MODEL: '',
+      REVIEW_VERIFIER_MODEL: 'openai/gpt-5-mini', REVIEW_ESCALATION_MODEL: '', REVIEW_FOCUSED_VERIFICATION: 'true',
       REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
     });
     const deps = buildDeps(config, () => {});
@@ -781,6 +781,7 @@ describe('buildDeps', () => {
       expect(deps.verifierLlm).not.toBe(deps.llm);
       expect(deps.escalationLlm).toBeUndefined();
       expect(deps.dualDiscovery).toBe(false);
+      expect(deps.focusedVerification).toBe(true);
     } finally {
       deps.db.close();
     }

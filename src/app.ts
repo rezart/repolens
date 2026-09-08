@@ -35,6 +35,8 @@ export interface AppDeps {
   verifierLlm?: LLMProvider;
   /** Enables the independent complementary discovery pass. */
   dualDiscovery?: boolean;
+  /** Enables the uncertain-only focused verifier recheck. */
+  focusedVerification?: boolean;
   /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
   chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
@@ -173,6 +175,7 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           escalationLlm: deps.escalationLlm,
           verifierLlm: deps.verifierLlm,
           dualDiscovery: deps.dualDiscovery,
+          focusedVerification: deps.focusedVerification,
           retrieve: deps.retrieve,
           github: deps.github,
           identifiers: identifiersFromCode,

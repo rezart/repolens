@@ -47,7 +47,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, escalationLlm, verifierLlm, dualDiscovery: config.review.dualDiscovery, chatLlm, embeddings, retrieve, github, jobs, usage, log };
+  return { config, db, llm, escalationLlm, verifierLlm, dualDiscovery: config.review.dualDiscovery, focusedVerification: config.review.focusedVerification, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {

@@ -11,6 +11,7 @@ describe('loadConfig', () => {
     expect(c.revision).toBeNull();
     expect(c.review.escalationModel).toBe('openai/gpt-5-mini');
     expect(c.review.dualDiscovery).toBe(false);
+    expect(c.review.focusedVerification).toBe(false);
   });
   it('trims the running image revision', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');
@@ -57,6 +58,13 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'true' }).review.dualDiscovery).toBe(true);
     expect(loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'false' }).review.dualDiscovery).toBe(false);
     expect(() => loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'yes' })).toThrow(ConfigError);
+  });
+  it('parses the focused verification switch as a strict boolean', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.focusedVerification).toBe(false);
+    expect(loadConfig({ ...base, REVIEW_FOCUSED_VERIFICATION: 'true' }).review.focusedVerification).toBe(true);
+    expect(loadConfig({ ...base, REVIEW_FOCUSED_VERIFICATION: 'false' }).review.focusedVerification).toBe(false);
+    expect(() => loadConfig({ ...base, REVIEW_FOCUSED_VERIFICATION: 'yes' })).toThrow(ConfigError);
   });
   it('enables embeddings when a model is set', () => {
     const c = loadConfig({ LLM_PROVIDER: 'claude-cli', EMBEDDING_MODEL: 'm', EMBEDDING_API_KEY: 'k' });

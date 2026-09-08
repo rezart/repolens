@@ -170,6 +170,21 @@ export interface ReviewTraceFinding {
   rootCauseMarker: string;
 }
 
+export interface ReviewTraceDecision {
+  id: string | number;
+  decision: string;
+  explanation: string;
+  evidence?: unknown;
+}
+
+export interface ReviewTraceExperiment {
+  discovery: Finding[];
+  verificationCandidates: Array<{ id: number; rootCauseMarker: string; finding: Finding }>;
+  verificationDecisions: ReviewTraceDecision[];
+  focusedDecisions?: ReviewTraceDecision[];
+  publishedFindings: Array<{ id: number | null; rootCauseMarker: string; finding: Finding }>;
+}
+
 export interface ReviewTrace {
   version: 1;
   identity: { repoId: string; prNumber: number; headSha: string; baseSha: string; provider: string; model: string; config: { maxRetries: number; maxFiles: number } };
@@ -178,15 +193,16 @@ export interface ReviewTrace {
     selectedPaths: string[];
     hunks: Array<{ path: string; lines: number[] }>;
     omittedContext: number;
-    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass?: 'normal' | 'focused' }>;
+    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass?: 'normal' | 'focused'; elapsedMs?: number }>;
     findingCount: number;
     primaryFindings?: ReviewTraceFinding[];
     decisions?: Array<{ id: string | number; decision: string }>;
     focusedDecisions?: Array<{ id: string | number; decision: string }>;
-    focusedSkipped?: 'budget';
+    focusedSkipped?: 'budget' | 'disabled';
     findings?: ReviewTraceFinding[];
   }>;
   finalFindings: ReviewTraceFinding[];
+  experiment?: ReviewTraceExperiment;
 }
 
 export interface ReviewDeps {
@@ -198,6 +214,8 @@ export interface ReviewDeps {
   verifierLlm?: LLMProvider;
   /** Run the independent contract/concurrency discovery view when true. */
   dualDiscovery?: boolean;
+  /** Recheck verifier-uncertain findings with a focused call. */
+  focusedVerification?: boolean;
   retrieve: RetrieveFn;
   github: Pick<
     GitHubClient,
@@ -241,6 +259,8 @@ export interface ReviewOptions {
   force?: boolean;
   /** Ignore prior reviews and GitHub comments for an independent benchmark run. */
   fresh?: boolean;
+  /** Include full discovery/verifier/publication provenance in the trace. */
+  experimentTrace?: boolean;
 }
 
 const SEVERITIES: readonly Severity[] = ['critical', 'warning', 'nit'];
@@ -1180,17 +1200,20 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const { db, llm, retrieve, github } = deps;
   const escalationLlm = deps.escalationLlm;
   const verifierLlm = deps.verifierLlm;
+  const experimentTrace = Boolean(opts.fresh && opts.experimentTrace);
   let activeLlm = llm;
   let costUsd: number | null = 0;
   let reservedUsd = 0;
   let usedUsd = 0;
-  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' }> = [];
+  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused'; elapsedMs: number }> = [];
   const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' = 'normal'): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
-    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass } : undefined;
+    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass, elapsedMs: 0 } : undefined;
     if (traceCall) traceCalls.push(traceCall);
     const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
+    const started = Date.now();
     if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > REVIEW_MAX_USD) {
+      if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
     if (req.reviewBudget && !alreadyReserved) reservedUsd += estimate;
@@ -1204,6 +1227,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       threw = true;
       error = err;
     } finally {
+      if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       const next = costUsd !== null && call.reported && call.costUsd !== null ? costUsd + call.costUsd : null;
       costUsd = next !== null && Number.isFinite(next) ? next : null;
     }
@@ -1462,10 +1486,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let escalationFindingsTrace: Finding[] | undefined;
     let verifierDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
     let verifierFocusedDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
-    let verifierFocusedSkipped: 'budget' | undefined;
+    let verifierFocusedSkipped: 'budget' | 'disabled' | undefined;
     let verifierSelectedPaths = new Set<string>();
     let verifierExecuted = false;
     let verifierFindingsTrace: Finding[] = [];
+    let experimentVerificationCandidates: Array<{ id: number; rootCauseMarker: string; finding: Finding }> = [];
+    let experimentVerificationDecisions: ReviewTraceDecision[] = [];
+    let experimentFocusedDecisions: ReviewTraceDecision[] | undefined;
     const maxRetries = deps.maxRetries ?? 3;
     let retryAttemptsUsed = 0;
     let correctiveRetryUsed = false;
@@ -2068,6 +2095,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const allowedVerifierLines = [...allowedByPath].map(([path, lines]) => ({ path, lines: [...lines].sort((a, b) => a - b) }));
       verifierExecuted = true;
       verifierFindingsTrace = findings.slice();
+      if (experimentTrace) {
+        experimentVerificationCandidates = findings.map((finding, id) => ({ id, rootCauseMarker: rootCauseMarker(finding), finding }));
+      }
       const parseVerification = (raw: string) => {
         const obj = extractJson(raw) as Record<string, unknown>;
         const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
@@ -2084,6 +2114,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines,
         () => consumeRetryAllowance(true));
+      if (experimentTrace) {
+        experimentVerificationDecisions = decisions.map((decision) => ({
+          id: decision.id as number, decision: String(decision.decision), explanation: String(decision.explanation),
+          ...(decision.evidence !== undefined ? { evidence: decision.evidence } : {}),
+        }));
+      }
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
       const uncertainCandidates = decisions.filter((decision) => decision.decision === 'uncertain')
         .map((decision) => ({ id: decision.id as number, finding: findings[decision.id as number] }))
@@ -2092,7 +2128,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
 
-      if (uncertainFindings.length) {
+      if (uncertainFindings.length && !deps.focusedVerification) {
+        verifierFocusedSkipped = 'disabled';
+      } else if (uncertainFindings.length) {
         const focusedSystem = focusedVerifierSystemPrompt();
         const uncertainIds = uncertainCandidates.map(({ id }) => id);
         const fullFocusedReq = verifierRequest(uncertainFindings, false, focusedSystem, uncertainIds);
@@ -2128,6 +2166,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             throw err;
           }
           verifierFocusedDecisionsTrace = focusedDecisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
+          if (experimentTrace) {
+            experimentFocusedDecisions = focusedDecisions.map((decision) => ({
+              id: decision.id as number, decision: String(decision.decision), explanation: String(decision.explanation),
+              ...(decision.evidence !== undefined ? { evidence: decision.evidence } : {}),
+            }));
+          }
           const focusedSupported = new Set(focusedDecisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
           findings.push(...uncertainCandidates.filter(({ id, finding }) => focusedSupported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit').map(({ finding }) => finding));
         }
@@ -2135,10 +2179,21 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
     findings = selectPostedFindings(findings);
 
+    const experiment = experimentTrace ? {
+      discovery: [...primaryTrace, ...(escalationFindingsTrace ?? [])],
+      verificationCandidates: experimentVerificationCandidates,
+      verificationDecisions: experimentVerificationDecisions,
+      ...(experimentFocusedDecisions ? { focusedDecisions: experimentFocusedDecisions } : {}),
+      publishedFindings: findings.map((finding) => ({
+        id: experimentVerificationCandidates.find((candidate) => provisionalCandidateKey(candidate.finding) === provisionalCandidateKey(finding))?.id ?? null,
+        rootCauseMarker: rootCauseMarker(finding), finding,
+      })),
+    } : undefined;
+
     await assertHeadUnchanged();
     const summary = buildFindingSummary(findings);
     const verdict = verdictForFindings(findings);
-    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget'; findings?: Finding[] } = {}) => ({
+    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget' | 'disabled'; findings?: Finding[] } = {}) => ({
       stage,
       selectedPaths: selected.map((file) => file.newPath ?? file.oldPath ?? ''),
       hunks: traceHunks(selected),
@@ -2161,6 +2216,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         traceStage('final', files, 0, { findings: findings.slice() }),
       ],
       finalFindings: findings.map(traceFinding),
+      ...(experiment ? { experiment } : {}),
     };
 
     if (!repo.last_commit) {

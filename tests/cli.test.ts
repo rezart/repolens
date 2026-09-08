@@ -8,6 +8,7 @@ describe('review CLI options', () => {
       repoId: 'github:o/r', prNumber: 42, fresh: true, post: false, force: false,
     });
     expect(parseReviewArgs(['github:o/r', '42', '--fresh', '--post']).post).toBe(true);
+    expect(parseReviewArgs(['github:o/r', '42', '--fresh', '--experiment-trace']).experimentTrace).toBe(true);
   });
 
   it('passes the configured verifier backend through fresh review wiring', () => {
@@ -25,6 +26,13 @@ describe('review CLI options', () => {
       llm: { name: 'qwen' }, config: { review: { statusContext: '', failOn: 'critical', maxRetries: 3, dualDiscovery: true, ignorePatterns: [] } },
     } as never);
     expect(wired.dualDiscovery).toBe(true);
+  });
+
+  it('passes focused verification through fresh review wiring', () => {
+    const wired = freshReviewDeps({
+      llm: { name: 'qwen' }, config: { review: { statusContext: '', failOn: 'critical', maxRetries: 3, focusedVerification: true, ignorePatterns: [] } },
+    } as never);
+    expect(wired.focusedVerification).toBe(true);
   });
 
   it('renders terminal fresh-review failures as structured telemetry', () => {
