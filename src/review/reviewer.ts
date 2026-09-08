@@ -410,6 +410,8 @@ const HEAD_FETCH_CONCURRENCY = 4;
 const HEAD_SNIPPET_CHARS_MAX = 8_000;
 /** Total budget for referenced files (the reviewed file's own content is separate). */
 const HEAD_CONTEXT_CHARS_MAX = 24_000;
+/** At most this many unchanged files may be fetched for verifier evidence. */
+const REFERENCED_HEAD_FILES_MAX = 16;
 /** The reviewed file's own content is included in full only up to this size. */
 const OWN_HEAD_CHARS_MAX = 12_000;
 const OWN_HEAD_WINDOW_RADIUS = 20;
@@ -483,19 +485,16 @@ export function buildExportIndex(headContents: Map<string, string>): Map<string,
   return index;
 }
 
-function clipContent(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max)}\n... (truncated)` : text;
+export interface HeadEvidence {
+  path: string;
+  revision: 'head';
+  lines: Array<{ line: number; text: string }>;
 }
 
-function headBlock(path: string, content: string, max: number): string {
-  return `### ${path} (content after this pull request)\n\`\`\`\n${clipContent(content, max)}\n\`\`\``;
-}
-
-/** Render bounded head windows with source line numbers that match the PR head. */
-function headWindowBlock(path: string, content: string, relevantLines: number[]): string {
+function numberedHeadLines(content: string, relevantLines: number[], maxChars: number): Array<{ line: number; text: string }> {
   const lines = content.split(/\r?\n/);
   const points = [...new Set(relevantLines)].filter((line) => Number.isInteger(line) && line > 0 && line <= lines.length).sort((a, b) => a - b);
-  if (!content) return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n\`\`\``;
+  if (!content) return [];
 
   const anchors = !points.length ? [1] : points.length <= OWN_HEAD_WINDOW_COUNT_MAX
     ? points
@@ -508,9 +507,9 @@ function headWindowBlock(path: string, content: string, relevantLines: number[])
       anchor: line,
     });
   }
-  const overhead = `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n\`\`\``.length + (windows.length - 1) * 4;
-  const perWindowChars = Math.max(80, Math.floor((OWN_HEAD_CHARS_MAX - overhead) / windows.length));
-  const rendered: string[] = [];
+  const perWindowChars = Math.max(80, Math.floor(maxChars / windows.length));
+  const rendered: Array<{ line: number; text: string }> = [];
+  const emitted = new Set<number>();
   for (const window of windows) {
     const nearby = [window.anchor];
     for (let distance = 1; distance <= OWN_HEAD_WINDOW_RADIUS; distance++) {
@@ -532,10 +531,30 @@ function headWindowBlock(path: string, content: string, relevantLines: number[])
       selected.set(line, output);
       used += output.length + 1;
     }
-    if (rendered.length) rendered.push('...');
-    for (const line of [...selected.keys()].sort((a, b) => a - b)) rendered.push(selected.get(line)!);
+    for (const line of [...selected.keys()].sort((a, b) => a - b)) {
+      if (emitted.has(line)) continue;
+      const output = selected.get(line)!;
+      rendered.push({ line, text: output.slice(output.indexOf(' | ') + 3) });
+      emitted.add(line);
+    }
   }
-  return `### ${path} (content after this pull request; bounded windows)\n\`\`\`\n${rendered.join('\n')}\n\`\`\``;
+  return rendered;
+}
+
+function renderHeadEvidence(snippet: HeadEvidence, heading: string): string {
+  return `### ${snippet.path} (${heading})\n\`\`\`\n${snippet.lines.map(({ line, text }) => `${line} | ${text}`).join('\n')}\n\`\`\``;
+}
+
+function headSnippet(path: string, content: string, relevantLines: number[]): HeadEvidence {
+  return { path, revision: 'head', lines: numberedHeadLines(content, relevantLines, HEAD_SNIPPET_CHARS_MAX) };
+}
+
+function matchingHeadLines(content: string, terms: Set<string>): number[] {
+  const lowerTerms = [...terms].map((term) => term.toLowerCase());
+  if (!lowerTerms.length) return [1];
+  const lines = content.split(/\r?\n/);
+  const matches = lines.flatMap((line, index) => lowerTerms.some((term) => line.toLowerCase().includes(term)) ? [index + 1] : []);
+  return matches.length ? matches : [1];
 }
 
 /**
@@ -547,11 +566,41 @@ export function buildHeadContext(input: {
   path: string;
   addedText: string;
   headContents: Map<string, string>;
+  /** Unchanged files fetched at the PR head for explicit verifier evidence. */
+  referencedHeadContents?: Map<string, string>;
+  /** Retrieved base-index ranges that identify the bounded head snippets above. */
+  referencedHeadLines?: Map<string, number[]>;
   /** New-file lines whose surrounding head code is relevant to this review. */
   relevantLines?: number[];
   /** Precomputed `exportedNames` per path; recomputed here when absent. */
   exportsByPath?: Map<string, Set<string>>;
 }): string {
+  return collectHeadEvidence(input).map((snippet) => renderHeadEvidence(snippet,
+    snippet.path === input.path ? 'content after this pull request; bounded windows' : 'content after this pull request')).join('\n\n');
+}
+
+/** Structured authoritative snippets used to construct verifier citation allowlists. */
+export function buildHeadEvidence(input: {
+  path: string;
+  addedText: string;
+  headContents: Map<string, string>;
+  referencedHeadContents?: Map<string, string>;
+  referencedHeadLines?: Map<string, number[]>;
+  relevantLines?: number[];
+  exportsByPath?: Map<string, Set<string>>;
+}): HeadEvidence[] {
+  return collectHeadEvidence(input);
+}
+
+function collectHeadEvidence(input: {
+  path: string;
+  addedText: string;
+  headContents: Map<string, string>;
+  referencedHeadContents?: Map<string, string>;
+  referencedHeadLines?: Map<string, number[]>;
+  relevantLines?: number[];
+  exportsByPath?: Map<string, Set<string>>;
+}): HeadEvidence[] {
   const { path, addedText, headContents } = input;
   const exportsByPath = input.exportsByPath ?? buildExportIndex(headContents);
   const own = headContents.get(path);
@@ -579,23 +628,33 @@ export function buildHeadContext(input: {
     }
   }
 
-  const blocks: string[] = [];
+  const snippets: HeadEvidence[] = [];
   let used = 0;
   for (const referenced of [...imported, ...byExport]) {
     const content = headContents.get(referenced);
     if (content === undefined) continue;
-    const block = headBlock(referenced, content, HEAD_SNIPPET_CHARS_MAX);
+    const terms = new Set([...mentioned, referenced.slice(referenced.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '')]);
+    const snippet = headSnippet(referenced, content, matchingHeadLines(content, terms));
+    const block = renderHeadEvidence(snippet, 'content after this pull request; bounded snippet');
     if (used + block.length > HEAD_CONTEXT_CHARS_MAX) break;
-    blocks.push(block);
+    snippets.push(snippet);
+    used += block.length + 2;
+  }
+  for (const [referenced, content] of input.referencedHeadContents ?? []) {
+    if (referenced === path || headContents.has(referenced) || snippets.some((snippet) => snippet.path === referenced)) continue;
+    const snippet = headSnippet(referenced, content, input.referencedHeadLines?.get(referenced) ?? [1]);
+    const block = renderHeadEvidence(snippet, 'content after this pull request; bounded snippet');
+    if (used + block.length > HEAD_CONTEXT_CHARS_MAX) break;
+    snippets.push(snippet);
     used += block.length + 2;
   }
 
   // The diff alone hides the code around the hunks, so lead with the whole file.
   if (own !== undefined) {
     const relevantLines = input.relevantLines ?? [];
-    blocks.unshift(headWindowBlock(path, own, relevantLines));
+    snippets.unshift({ path, revision: 'head', lines: numberedHeadLines(own, relevantLines, OWN_HEAD_CHARS_MAX) });
   }
-  return blocks.join('\n\n');
+  return snippets;
 }
 
 export function buildReviewBody(input: {
@@ -711,11 +770,6 @@ function hunkContainsLine(file: DiffFile, hunkIndex: number, line: number): bool
   return hunk.lines.some((item) => item.newLine === line || item.oldLine === line);
 }
 
-/** Keep the first block: the reviewed file's bounded candidate windows come first. */
-function trimVerifierHeadContext(context: string): string {
-  return context.split(/\n\n(?=### )/, 2)[0] ?? context;
-}
-
 function headRelevantLines(file: DiffFile, hunks = file.hunks): number[] {
   return hunks.flatMap((hunk) => {
     const lines = hunk.lines.flatMap((line) => line.newLine === undefined ? [] : [line.newLine]);
@@ -730,23 +784,35 @@ type VerifierContextFile = {
   path: string;
   currentEvidence?: Array<{ line?: number }>;
   headContext?: string;
+  headEvidence?: HeadEvidence[];
 };
+
+function verifierCitationLines(file: VerifierContextFile): Set<string> {
+  const cited = new Set<string>();
+  for (const evidence of file.currentEvidence ?? []) {
+    if (Number.isInteger(evidence.line) && evidence.line! > 0) cited.add(`${file.path}:${evidence.line}`);
+  }
+  for (const snippet of file.headEvidence ?? []) {
+    if (snippet.revision !== 'head') continue;
+    for (const line of snippet.lines) {
+      if (Number.isInteger(line.line) && line.line > 0) cited.add(`${snippet.path}:${line.line}`);
+    }
+  }
+  // Keep parsing the rendered form for compatibility with older callers/tests;
+  // only the explicit post-change heading is authoritative.
+  let currentPath = '';
+  for (const line of file.headContext?.split(/\r?\n/) ?? []) {
+    const heading = /^### (.+) \(content after this pull request/.exec(line);
+    if (heading) currentPath = heading[1]!;
+    const numbered = /^(\d+) \| /.exec(line);
+    if (numbered && currentPath === file.path) cited.add(`${file.path}:${Number(numbered[1])}`);
+  }
+  return cited;
+}
 
 /** Accept only citations that point at supplied post-change evidence. */
 export function hasValidVerifierCitation(decision: Record<string, unknown>, files: VerifierContextFile[]): boolean {
-  const cited = new Set<string>();
-  for (const file of files) {
-    for (const evidence of file.currentEvidence ?? []) {
-      if (Number.isInteger(evidence.line) && evidence.line! > 0) cited.add(`${file.path}:${evidence.line}`);
-    }
-    let currentPath = '';
-    for (const line of file.headContext?.split(/\r?\n/) ?? []) {
-      const heading = /^### (.+) \(content after this pull request/.exec(line);
-      if (heading) currentPath = heading[1]!;
-      const numbered = /^(\d+) \| /.exec(line);
-      if (numbered && currentPath === file.path) cited.add(`${file.path}:${Number(numbered[1])}`);
-    }
-  }
+  const cited = new Set(files.flatMap((file) => [...verifierCitationLines(file)]));
   const evidence = decision.evidence;
   const candidates = Array.isArray(evidence) ? evidence : evidence && typeof evidence === 'object' ? [evidence] : [];
   for (const item of candidates) {
@@ -1436,6 +1502,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     const relevantContextByPath = new Map<string, string>();
     const relevantChunksByPath = new Map<string, RetrievedChunk[]>();
+    const referencedHeadContents = new Map<string, string>();
+    const referencedHeadContentsByVerifierPath = new Map<string, Map<string, string>>();
+    const referencedHeadLinesByVerifierPath = new Map<string, Map<string, number[]>>();
+    const referencedHeadFetched = new Set<string>();
     let batch: { findings: Finding[]; summary: string; verdict: Verdict } | undefined;
     if (budgeted) {
       const req: CompleteRequest = {
@@ -1641,9 +1711,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const lines = candidateFindings.filter((finding) => finding.path === path).map(findingLine);
       const hunks = file.hunks.filter((_, index) => lines.some((line) => hunkContainsLine(file, index, line)));
       if (!hunks.length) return [];
-      const headContext = buildHeadContext({
+      const scopedReferencedHeadContents = referencedHeadContentsByVerifierPath.get(path);
+      const scopedReferencedHeadLines = referencedHeadLinesByVerifierPath.get(path);
+      const headEvidence = buildHeadEvidence({
         path, addedText: hunkText({ ...file, hunks }, Infinity),
-        relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents, exportsByPath,
+        relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents,
+        referencedHeadContents: scopedReferencedHeadContents, referencedHeadLines: scopedReferencedHeadLines, exportsByPath,
       });
       return [{
         path, status: file.status, diff: hunkText({ ...file, hunks }, Infinity),
@@ -1653,7 +1726,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
           line: line.oldLine, kind: 'removed', content: line.content,
         }])),
-        headContext: trimOptionalContext ? trimVerifierHeadContext(headContext) : headContext,
+        headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => snippet.path === path) : headEvidence,
         ...(!trimOptionalContext && relevantContextByPath.get(path) ? { relevantContext: relevantContextByPath.get(path) } : {}),
       }];
     });
@@ -1803,11 +1876,36 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             const merged = mergeRelevantChunks(relevantChunksByPath.get(path) ?? [], focused);
             relevantChunksByPath.set(path, merged);
             relevantContextByPath.set(path, formatContext(merged));
+            const scopedContents = referencedHeadContentsByVerifierPath.get(path) ?? new Map<string, string>();
+            const scopedLines = referencedHeadLinesByVerifierPath.get(path) ?? new Map<string, number[]>();
+            for (const chunk of focused) {
+              if (changedPaths.includes(chunk.path)) continue;
+              if (!referencedHeadFetched.has(chunk.path)) {
+                if (referencedHeadFetched.size >= REFERENCED_HEAD_FILES_MAX) break;
+                referencedHeadFetched.add(chunk.path);
+                try {
+                  const content = await github.getFileContent(repo.owner, repo.name, chunk.path, pr.headSha);
+                  if (content !== null) {
+                    referencedHeadContents.set(chunk.path, content);
+                  }
+                } catch (err) {
+                  warnings.push(`${chunk.path}: fetching referenced head content failed: ${errMessage(err)}`);
+                }
+              }
+              const content = referencedHeadContents.get(chunk.path);
+              if (content !== undefined) {
+                scopedContents.set(chunk.path, content);
+                scopedLines.set(chunk.path, [...new Set([...(scopedLines.get(chunk.path) ?? []), chunk.startLine, chunk.endLine])]);
+              }
+            }
+            referencedHeadContentsByVerifierPath.set(path, scopedContents);
+            referencedHeadLinesByVerifierPath.set(path, scopedLines);
           }
         } catch (err) {
           warnings.push(`${path}: finding retrieval failed: ${errMessage(err)}`);
         }
       }
+      await assertHeadUnchanged();
       const fullVerifierReq = verifierRequest(findings);
       const verifierReq = !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd
         ? fullVerifierReq : verifierRequest(findings, true);
@@ -1815,17 +1913,18 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const verifierPayload = JSON.parse(verifierReq.messages[0]!.content) as { files: VerifierContextFile[] };
       const verifierFiles = verifierPayload.files;
       verifierSelectedPaths = new Set(verifierFiles.map((file) => file.path));
-      const allowedVerifierLines = verifierFiles.map((file) => {
-        const lines = new Set<number>((file.currentEvidence ?? []).flatMap((item) => Number.isInteger(item.line) && item.line! > 0 ? [item.line!] : []));
-        let currentPath = '';
-        for (const line of file.headContext?.split(/\r?\n/) ?? []) {
-          const heading = /^### (.+) \(content after this pull request/.exec(line);
-          if (heading) currentPath = heading[1]!;
-          const numbered = /^(\d+) \| /.exec(line);
-          if (numbered && currentPath === file.path) lines.add(Number(numbered[1]));
-        }
-        return { path: file.path, lines: [...lines].sort((a, b) => a - b) };
-      });
+      const allowedByPath = new Map<string, Set<number>>();
+      for (const file of verifierFiles) for (const citation of verifierCitationLines(file)) {
+        const split = citation.lastIndexOf(':');
+        if (split <= 0) continue;
+        const citationPath = citation.slice(0, split);
+        const line = Number(citation.slice(split + 1));
+        if (!Number.isInteger(line) || line <= 0) continue;
+        const lines = allowedByPath.get(citationPath) ?? new Set<number>();
+        lines.add(line);
+        allowedByPath.set(citationPath, lines);
+      }
+      const allowedVerifierLines = [...allowedByPath].map(([path, lines]) => ({ path, lines: [...lines].sort((a, b) => a - b) }));
       verifierExecuted = true;
       verifierFindingsTrace = findings.slice();
       const parseVerification = (raw: string) => {

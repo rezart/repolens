@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT } from '../../src/review/prompts.js';
+import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from '../../src/review/prompts.js';
 import type { Lineage } from '../../src/review/lineage.js';
 import type { HistoricalPr } from '../../src/review/history.js';
 
@@ -119,5 +119,11 @@ describe('system prompts', () => {
     expect(ESCALATION_SYSTEM_PROMPT).toContain('evidence');
     expect(ESCALATION_SYSTEM_PROMPT).toContain('"reviewedPaths":["src/app.ts"]');
     expect(ESCALATION_SYSTEM_PROMPT).toContain('"findings":[]');
+  });
+
+  it('names structured headEvidence as the verifier authority', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toContain('headEvidence');
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/revision.*head/i);
+    expect(VERIFIER_SYSTEM_PROMPT).not.toContain('bounded headContext');
   });
 });

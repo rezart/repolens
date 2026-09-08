@@ -2309,6 +2309,185 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('accepts a citation from a bounded unchanged callee head snippet', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Callee guard')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ headEvidence?: Array<{ path: string; revision: string; lines: Array<{ line: number; text: string }> }> }> };
+      expect(payload.files[0]!.headEvidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: 'src/callee.ts', revision: 'head', lines: expect.arrayContaining([
+          expect.objectContaining({ line: 3, text: 'if (!request) return;' }),
+        ]) }),
+      ]));
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'The unchanged callee guard rejects the input.', evidence: { path: 'src/callee.ts', line: 3 } }], summary: 'No issue.', verdict: 'approve' });
+    } };
+    const baseCallee = { ...CHUNK, chunkId: 9, path: 'src/callee.ts', startLine: 3, endLine: 3, content: 'if (request) return;' };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async () => [baseCallee],
+        github: fakeGithub(diff, PR, { headFiles: {
+          'src/mixed.ts': 'const token = request.token;\nnewCall();',
+          'src/callee.ts': 'const before = true;\nconst middle = true;\nif (!request) return;\n',
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings).toEqual([]);
+    } finally { testDb.close(); }
+  });
+
+  it('unions bounded anchors from multiple chunks of the same unchanged callee', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Callee guard')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ headEvidence?: Array<{ path: string; lines: Array<{ line: number; text: string }> }> }> };
+      const callee = payload.files[0]!.headEvidence?.find((snippet) => snippet.path === 'src/callee.ts')!;
+      expect(callee.lines).toEqual(expect.arrayContaining([
+        expect.objectContaining({ line: 3, text: 'first guard' }),
+        expect.objectContaining({ line: 45, text: 'later guard' }),
+      ]));
+      expect(callee.lines.some(({ line }) => line === 200)).toBe(false);
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'The callee evidence supports it.', evidence: { path: 'src/callee.ts', line: 3 } }] });
+    } };
+    const chunks = [
+      { ...CHUNK, chunkId: 21, path: 'src/callee.ts', startLine: 3, endLine: 3, content: 'first guard' },
+      { ...CHUNK, chunkId: 22, path: 'src/callee.ts', startLine: 45, endLine: 45, content: 'later guard' },
+      { ...CHUNK, chunkId: 23, path: 'src/unrelated.ts', startLine: 200, endLine: 200, content: 'unrelated guard' },
+    ];
+    const calleeHead = Array.from({ length: 220 }, (_, index) => index === 2 ? 'first guard' : index === 44 ? 'later guard' : index === 199 ? 'unrelated head line' : `line ${index + 1}`).join('\n');
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm, retrieve: async () => chunks,
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();', 'src/callee.ts': calleeHead } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
+
+  it('keeps shared callee ranges scoped to each verifier candidate', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const changedPaths = ['src/one.ts', 'src/two.ts'];
+    const one = candidate('src/one.ts', 1, 'one contract');
+    const two = candidate('src/two.ts', 1, 'two contract');
+    const oneChunk = { ...CHUNK, chunkId: 31, path: 'src/shared-callee.ts', startLine: 3, endLine: 3, content: 'one guard' };
+    const twoChunk = { ...CHUNK, chunkId: 32, path: 'src/shared-callee.ts', startLine: 45, endLine: 45, content: 'two guard' };
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: changedPaths, summary: 'Initial.', verdict: 'request_changes', findings: [one, two] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ path: string; headEvidence?: Array<{ path: string; lines: Array<{ line: number }> }> }> };
+      const oneFile = payload.files.find((file) => file.path === 'src/one.ts')!;
+      const twoFile = payload.files.find((file) => file.path === 'src/two.ts')!;
+      const oneLines = oneFile.headEvidence?.find((snippet) => snippet.path === 'src/shared-callee.ts')!.lines ?? [];
+      const twoLines = twoFile.headEvidence?.find((snippet) => snippet.path === 'src/shared-callee.ts')!.lines ?? [];
+      expect(oneLines.some(({ line }) => line === 3)).toBe(true);
+      expect(oneLines.some(({ line }) => line === 45)).toBe(false);
+      expect(twoLines.some(({ line }) => line === 45)).toBe(true);
+      expect(twoLines.some(({ line }) => line === 3)).toBe(false);
+      return JSON.stringify({ decisions: [
+        { id: 0, decision: 'supported', explanation: 'One is supported.', evidence: { path: 'src/shared-callee.ts', line: 3 } },
+        { id: 1, decision: 'supported', explanation: 'Two is supported.', evidence: { path: 'src/shared-callee.ts', line: 45 } },
+      ] });
+    } };
+    const sharedHead = Array.from({ length: 80 }, (_, index) => index === 2 ? 'one head guard' : index === 44 ? 'two head guard' : `line ${index + 1}`).join('\n');
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async (request) => /\bone\b/.test(request.query) ? [oneChunk] : /\btwo\b/.test(request.query) ? [twoChunk] : [],
+        github: fakeGithub(candidateDiff(changedPaths), PR, { headFiles: {
+          'src/one.ts': 'one();', 'src/two.ts': 'two();', 'src/shared-callee.ts': sharedHead,
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings).toHaveLength(2);
+    } finally { testDb.close(); }
+  });
+
+  it('scopes unchanged head evidence to the verifier file that retrieved it once', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const changedPaths = ['src/one.ts', 'src/two.ts'];
+    const one = candidate('src/one.ts', 1, 'one contract');
+    const two = candidate('src/two.ts', 1, 'two contract');
+    const oneChunk = { ...CHUNK, chunkId: 11, path: 'src/callee-one.ts', startLine: 3, endLine: 3, content: 'if (one) return;' };
+    const twoChunk = { ...CHUNK, chunkId: 12, path: 'src/callee-two.ts', startLine: 3, endLine: 3, content: 'if (two) return;' };
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: changedPaths, summary: 'Initial.', verdict: 'request_changes', findings: [one, two] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { files: Array<{ path: string; headContext?: string; headEvidence?: Array<{ path: string }> }> };
+      const oneFile = payload.files.find((file) => file.path === 'src/one.ts')!;
+      const twoFile = payload.files.find((file) => file.path === 'src/two.ts')!;
+      expect(oneFile.headContext).toBeUndefined();
+      expect(twoFile.headContext).toBeUndefined();
+      expect(oneFile.headEvidence?.map((snippet) => snippet.path)).toEqual(['src/one.ts', 'src/callee-one.ts']);
+      expect(twoFile.headEvidence?.map((snippet) => snippet.path)).toEqual(['src/two.ts', 'src/callee-two.ts']);
+      return JSON.stringify({ decisions: [
+        { id: 0, decision: 'supported', explanation: 'One is supported.', evidence: { path: 'src/one.ts', line: 1 } },
+        { id: 1, decision: 'supported', explanation: 'Two is supported.', evidence: { path: 'src/two.ts', line: 1 } },
+      ] });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async (request) => request.query.includes('one') ? [oneChunk] : request.query.includes('two') ? [twoChunk] : [],
+        identifiers: () => [],
+        github: fakeGithub(candidateDiff(changedPaths), PR, { headFiles: {
+          'src/one.ts': 'one();', 'src/two.ts': 'two();',
+          'src/callee-one.ts': 'const before = true;\nconst middle = true;\nif (!one) return;\n',
+          'src/callee-two.ts': 'const before = true;\nconst middle = true;\nif (!two) return;\n',
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings).toHaveLength(2);
+    } finally { testDb.close(); }
+  });
+
+  it('includes unchanged head citation lines in a verifier corrective retry allowlist', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Callee guard')] });
+    } };
+    const requests: CompleteRequest[] = [];
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      requests.push(req);
+      if (requests.length === 1) return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Bad line.', evidence: { path: 'src/callee.ts', line: 999 } }] });
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Head guard supports it.', evidence: { path: 'src/callee.ts', line: 3 } }] });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, chunkId: 13, path: 'src/callee.ts', startLine: 3, endLine: 3, content: 'if (request) return;' }],
+        github: fakeGithub(diff, PR, { headFiles: {
+          'src/mixed.ts': 'const token = request.token;\nnewCall();',
+          'src/callee.ts': 'const before = true;\nconst middle = true;\nif (!request) return;\n',
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const correction = JSON.parse(requests[1]!.messages[0]!.content) as { allowedPathsAndLines?: Array<{ path: string; lines: number[] }> };
+      expect(correction.allowedPathsAndLines).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: 'src/callee.ts', lines: expect.arrayContaining([3]) }),
+      ]));
+      expect(result.findings).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
+
+  it('does not accept a base-only retrieved line as verifier evidence', () => {
+    expect(hasValidVerifierCitation(
+      { evidence: { path: 'src/callee.ts', line: 3 } },
+      [{ path: 'src/mixed.ts', currentEvidence: [{ line: 1 }], headContext: '### src/callee.ts (base base-sha-1)\n```\n3 | if (request) return;\n```' }],
+    )).toBe(false);
+  });
+
   it('rejects a supported verifier decision without structured evidence', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -2356,11 +2535,13 @@ describe('staged review', () => {
         github: fakeGithub(largeDiff, PR, { headFiles: { 'src/large.ts': Array.from({ length: 120 }, (_, index) => index === 34 ? 'if (!request) return;' : index === 49 ? 'const value = newValue();' : `${'x'.repeat(120)}-${index + 1}`).join('\n') } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false });
       expect(verifierPayload?.prBody).toBeUndefined();
-      const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
+      const verifierFile = (verifierPayload?.files as Array<Record<string, any>>)[0]!;
       expect(verifierFile.currentEvidence).toEqual([{ line: 50, kind: 'added', content: 'const value = newValue();' }]);
       expect(verifierFile.removedEvidence).toEqual([{ line: 50, kind: 'removed', content: 'const value = oldValue();' }]);
-      expect(verifierFile.headContext).toContain('### src/large.ts (content after this pull request; bounded windows)');
-      expect(verifierFile.headContext).toContain('35 | if (!request) return;');
+      expect(verifierFile.headContext).toBeUndefined();
+      expect(verifierFile.headEvidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: 'src/large.ts', revision: 'head', lines: expect.arrayContaining([{ line: 35, text: 'if (!request) return;' }]) }),
+      ]));
       expect(result.findings).toEqual([]);
     } finally { testDb.close(); }
   });
@@ -2436,8 +2617,11 @@ describe('staged review', () => {
     const head = Array.from({ length: 120 }, (_, index) => index === 48 ? 'afterGuard();' : `${'x'.repeat(120)}-${index + 1}`).join('\n');
     try {
       await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(deletionDiff, PR, { headFiles: { 'src/large.ts': head } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
-      const verifierFile = (verifierPayload?.files as Array<Record<string, unknown>>)[0]!;
-      expect(verifierFile.headContext).toContain('49 | afterGuard();');
+      const verifierFile = (verifierPayload?.files as Array<Record<string, any>>)[0]!;
+      expect(verifierFile.headContext).toBeUndefined();
+      expect(verifierFile.headEvidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: 'src/large.ts', revision: 'head', lines: expect.arrayContaining([{ line: 49, text: 'afterGuard();' }]) }),
+      ]));
     } finally { testDb.close(); }
   });
 
