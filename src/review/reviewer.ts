@@ -13,6 +13,7 @@ import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './di
 import { buildLineage, deltaForFile, type Lineage } from './lineage.js';
 import { buildHistoricalContext, type HistoricalPr } from './history.js';
 import { assessChange, selectReviewCandidates, type ChangeRisk } from './selection.js';
+import { collectStaticEvidence, type StaticEvidenceFact } from './static-evidence.js';
 import {
   FILE_REVIEW_SYSTEM_PROMPT,
   BATCH_REVIEW_SYSTEM_PROMPT,
@@ -452,6 +453,8 @@ const OWN_HEAD_LINE_CHARS_MAX = 600;
 const RULE_FILES_MAX = 16;
 const RULE_REQUESTS_MAX = 128;
 const RULE_CHARS_MAX = 12_000;
+/** Global cap for advisory heuristics in an untrimmed verifier payload. */
+const STATIC_EVIDENCE_VERIFIER_MAX = 80;
 
 /** Module specifiers of `import`, `import()`, `export ... from` and `require()`. */
 const SPECIFIER_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g;
@@ -1520,6 +1523,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     });
 
     const exportsByPath = buildExportIndex(headContents);
+    const staticEvidence: StaticEvidenceFact[] = [...headContents].flatMap(([path, content]) => collectStaticEvidence(path, content));
+    const verifierStaticEvidence = (candidateFindings: Finding[]): StaticEvidenceFact[] => {
+      const candidatePaths = new Set(candidateFindings.map((finding) => finding.path));
+      const relevant = staticEvidence.filter((fact) => candidatePaths.has(fact.path));
+      const other = staticEvidence.filter((fact) => !candidatePaths.has(fact.path));
+      return [...relevant, ...other].slice(0, STATIC_EVIDENCE_VERIFIER_MAX);
+    };
 
     // Each file review is an expensive inference call: bail before it if the PR moved on.
     const assertHeadUnchanged = async () => {
@@ -1591,6 +1601,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const headContext = buildHeadContext({ path, addedText: added, relevantLines: headRelevantLines(file), headContents, exportsByPath });
         if (headContext) addContext(`Relevant post-change context for ${path} (authoritative):\n${headContext}`);
       }
+      if (staticEvidence.length) addContext(`Advisory static evidence (bounded heuristics; not authoritative citations):\n${JSON.stringify(staticEvidence)}`);
       if (rules) addContext(rules);
       const batchHistory = historyFor(...historyPaths);
       if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
@@ -1741,6 +1752,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
                 context,
                 instructions: repo.instructions,
                 rules,
+                staticEvidence: staticEvidence.filter((fact) => fact.path === path),
                 lineage,
                 delta: lineage.previous ? deltaForFile(lineage.previous, path) : undefined,
                 historical: historyFor(file.oldPath, file.newPath),
@@ -1811,6 +1823,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       system: VERIFIER_SYSTEM_PROMPT,
       messages: [{ role: 'user', content: JSON.stringify({
         rules, files: buildVerifierFiles(candidateFindings, trimOptionalContext),
+        ...(!trimOptionalContext && staticEvidence.length ? { staticEvidence: verifierStaticEvidence(candidateFindings) } : {}),
         findings: candidateFindings.map((finding, id) => ({ id, finding })),
       }) }],
       json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'verification',

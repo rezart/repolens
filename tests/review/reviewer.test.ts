@@ -2257,6 +2257,92 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('supplies static facts as advisory evidence to discovery and verification', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const item = candidate('src/mixed.ts', 1, 'response contract');
+    let verifierPayload: Record<string, unknown> | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      expect(req.messages[0]!.content).toContain('Advisory static evidence');
+      expect(req.messages[0]!.content).toContain('declared-parameters');
+      expect(req.messages[0]!.content).toContain('response-property');
+      expect(req.messages[0]!.content).toContain('unawaited-call');
+      return JSON.stringify({ reviewedPaths: ['src/mixed.ts'], summary: 'Initial.', verdict: 'comment', findings: [item] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'The supplied evidence supports the finding.', evidence: { path: item.path, line: item.line } }], summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne,
+        github: fakeGithub(candidateDiff(['src/mixed.ts']), PR, { headFiles: {
+          'src/mixed.ts': 'function fetchUser(id: string, mode: string) { return id; }\nconst value = response.data;\nsave(value);',
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const facts = verifierPayload?.staticEvidence as Array<{ kind: string }> | undefined;
+      expect(facts?.some(({ kind }) => kind === 'declared-parameters')).toBe(true);
+      expect(facts?.some(({ kind }) => kind === 'response-property')).toBe(true);
+      expect(facts?.some(({ kind }) => kind === 'unawaited-call')).toBe(true);
+    } finally { testDb.close(); }
+  });
+
+  it('supplies static facts to non-batch per-file discovery', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const item = candidate('src/mixed.ts', 1, 'response contract');
+    let filePrompt = '';
+    const llm: LLMProvider = { name: 'local', model: 'file', concurrency: 1, supportsBatchReview: false, async complete(req) {
+      filePrompt = req.messages[0]!.content;
+      return JSON.stringify({ findings: [item] });
+    } };
+    try {
+      await reviewPullRequest({
+        db: testDb, llm, retrieve: retrieveOne,
+        github: fakeGithub(candidateDiff(['src/mixed.ts']), PR, { headFiles: {
+          'src/mixed.ts': 'function fetchUser(id: string, mode: string) { return id; }\nconst value = response.data;\nsave(value);',
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(filePrompt).toContain('Advisory static evidence');
+      expect(filePrompt).toContain('declared-parameters');
+      expect(filePrompt).toContain('response-property');
+      expect(filePrompt).toContain('unawaited-call');
+    } finally { testDb.close(); }
+  });
+
+  it('caps verifier static facts globally while retaining candidate-path facts', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const target = candidate('src/target.ts', 1, 'target finding');
+    const source = Array.from({ length: 50 }, (_, index) => `response.value${index};`).join('\n');
+    let verifierPayload: Record<string, unknown> | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: ['src/first.ts', 'src/second.ts', 'src/target.ts'], summary: 'Initial.', verdict: 'comment', findings: [target] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      verifierPayload = JSON.parse(req.messages[0]!.content) as Record<string, unknown>;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'The supplied evidence supports the finding.', evidence: { path: target.path, line: target.line } }], summary: 'Checked.', verdict: 'comment' });
+    } };
+    const multiDiff = candidateDiff(['src/first.ts', 'src/second.ts', 'src/target.ts']);
+    try {
+      await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne,
+        github: fakeGithub(multiDiff, PR, { headFiles: {
+          'src/first.ts': source,
+          'src/second.ts': source,
+          'src/target.ts': source,
+        } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      const facts = verifierPayload?.staticEvidence as Array<{ path: string }> | undefined;
+      expect(facts).toBeDefined();
+      expect(facts!.length).toBeLessThanOrEqual(80);
+      expect(facts!.some(({ path }) => path === target.path)).toBe(true);
+    } finally { testDb.close(); }
+  });
+
   it('trims escalation context after an unknown-cost initial failure while keeping risky hunks', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
