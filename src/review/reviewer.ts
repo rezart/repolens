@@ -1090,8 +1090,16 @@ function staticFactHook(fact: StaticEvidenceFact): string | undefined {
 }
 
 function findingMentionsHook(finding: Finding, hook: string): boolean {
-  return new RegExp(`(?<![A-Za-z0-9_])${escapedTerm(hook)}(?:\\?|$|[^A-Za-z0-9_])`, 'i')
-    .test([finding.title, finding.body, finding.rootCause].filter(Boolean).join(' '));
+  const text = [finding.title, finding.body, finding.rootCause].filter(Boolean).join(' ');
+  const match = new RegExp(`(?<![A-Za-z0-9_])${escapedTerm(hook)}(?=\\?|$|[^A-Za-z0-9_])`, 'i').exec(text);
+  if (!match) return false;
+  const context = text.slice(Math.max(0, match.index - 80), match.index + hook.length + 80);
+  const missing = /\b(?:missing|without|lacks?|omit(?:ted|s)?|does\s+not\s+(?:have|use|end)|not\s+(?:have|using|ending))\b/i;
+  return missing.test(context) && (
+    /\b(?:predicate|suffix|question[- ]mark)\b/i.test(context) ||
+    new RegExp(missing.source + '[^.!?\\n]{0,24}\\?', 'i').test(context) ||
+    /\bending?\s+with\s+\?/i.test(context)
+  );
 }
 
 function primaryFindingIds(findings: Finding[]): string[] {

@@ -2599,6 +2599,30 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('keeps an unrelated same-line hook mention alongside the static finding', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const discovered = candidate(serializerPath, 5, 'mutates include_website_name string output');
+    let verifierCandidates: Finding[] = [];
+    const llm: LLMProvider = { name: 'local', model: 'cheap', concurrency: 1, supportsBatchReview: false, async complete() {
+      return JSON.stringify({ findings: [discovered] });
+    } };
+    const verifierLlm: LLMProvider = { ...llm, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      verifierCandidates = payload.findings.map(({ finding }) => finding);
+      return JSON.stringify({ decisions: payload.findings.map(({ finding }, id) => ({ id, decision: 'supported', explanation: 'The supplied evidence supports the finding.', evidence: { path: finding.path, line: finding.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      await reviewPullRequest({ db: testDb, llm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(serializerDiff, PR, { headFiles: { [serializerPath]: serializerHead } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierCandidates).toHaveLength(2);
+      expect(verifierCandidates.map(({ rootCause }) => rootCause)).toEqual([
+        discovered.rootCause,
+        serializerRootCause,
+      ]);
+    } finally { testDb.close(); }
+  });
+
   it('includes static candidates before escalation and verifier budget reservations', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
