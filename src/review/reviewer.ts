@@ -655,7 +655,8 @@ function matchingHeadLines(content: string, terms: Set<string>): number[] {
   const lowerTerms = [...terms].map((term) => term.toLowerCase());
   if (!lowerTerms.length) return [1];
   const lines = content.split(/\r?\n/);
-  const matches = lines.flatMap((line, index) => lowerTerms.some((term) => line.toLowerCase().includes(term)) ? [index + 1] : []);
+  const matches = lines.flatMap((line, index) => lowerTerms.some((term) =>
+    new RegExp(`(?:^|[^a-z0-9_$])${escapedTerm(term)}(?:$|[^a-z0-9_$])`, 'i').test(line)) ? [index + 1] : []);
   return matches.length ? matches : [1];
 }
 
@@ -2056,7 +2057,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         evidenceRoundEnabled = false;
         evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
       }
-      const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
+      const remaining = budgeted
+        ? REVIEW_MAX_USD - reservedUsd - verifierReserve - (evidenceRoundEnabled ? evidenceReserve : 0)
+        : Number.POSITIVE_INFINITY;
       const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
       let omitted = 0;
       let req = escalationRequest();
@@ -2282,9 +2285,17 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
               if (content === null) continue;
               const basename = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
               const anchorText = `${request.question} ${basename}`;
-              const anchorTerms = new Set([request.symbol, basename, ...identifiers(anchorText), ...(anchorText.match(IDENTIFIER_RE) ?? [])]
-                .filter((term): term is string => typeof term === 'string' && term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase())).slice(0, 12));
-              const lines = matchingHeadLines(content, anchorTerms).slice(0, OWN_HEAD_WINDOW_COUNT_MAX);
+              const proseTerms = new Set(['a', 'an', 'and', 'does', 'how', 'in', 'is', 'of', 'on', 'the', 'this', 'to', 'what', 'where']);
+              const rawTerms = [...new Set([...identifiers(anchorText), ...(anchorText.match(IDENTIFIER_RE) ?? [])])]
+                .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()) && !proseTerms.has(term.toLowerCase()));
+              const codeLikeTerms = rawTerms.filter((term) => isCodeLikeTerm(term, anchorText));
+              const anchorTerms = new Set([
+                ...(request.symbol ? [request.symbol] : []),
+                ...codeLikeTerms,
+                basename,
+                ...rawTerms.filter((term) => !codeLikeTerms.includes(term)),
+              ].filter((term, index, all) => term.length >= 2 && all.indexOf(term) === index).slice(0, 12));
+              const lines = matchingHeadLines(content, anchorTerms);
               referencedHeadContents.set(path, content);
               authoritativeEvidenceAdded = true;
               acquired.push({ path, lines });

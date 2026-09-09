@@ -3023,7 +3023,7 @@ describe('staged review', () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
-    const lateHead = [...Array.from({ length: 48 }, () => 'const filler = true;'), 'function guard() { return true; }'].join('\n');
+    const lateHead = [...Array.from({ length: 48 }, () => 'this is filler;'), 'function guard() { return true; }'].join('\n');
     let verifierCalls = 0;
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Uncertain')] });
@@ -3365,6 +3365,41 @@ describe('staged review', () => {
       const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<Record<string, unknown>> };
       expect(escalationCalls).toBe(1);
       expect(payload.files[0]!.relevantContext).toBeUndefined();
+    } finally { testDb.close(); }
+  });
+
+  it('leaves the reserved evidence budget when escalation admits optional context', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const large = finding(1, 'Uncertain');
+    const tracker = new UsageTracker({ db: testDb, pricing: null });
+    const calls: CompleteRequest[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.36 });
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [large] });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      calls.push(req);
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string }> };
+      return JSON.stringify({ reviewedPaths: paths, decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, model: 'verifier', async complete(req) {
+      calls.push(req);
+      return calls.filter((call) => call.reviewStage === 'verification').length === 1
+        ? JSON.stringify({ decisions: [{ id: 0, decision: 'uncertain', explanation: 'Need unchanged evidence.' }], missingEvidence: [{ path: 'src/callee.ts', question: 'Where is guard?' }] })
+        : JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Head evidence supports it.', evidence: { path: 'src/callee.ts', line: 1 } }] });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, escalationLlm, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, path: 'src/callee.ts', content: 'request token context ' + 'x'.repeat(36_000) }],
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();', 'src/callee.ts': 'guard();' } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(calls.filter((call) => call.reviewStage === 'verification')).toHaveLength(2);
+      expect(result.findings).toHaveLength(1);
+      expect(result.trace!.stages.find((stage) => stage.stage === 'escalation')!.omittedContext).toBeGreaterThan(0);
     } finally { testDb.close(); }
   });
 
