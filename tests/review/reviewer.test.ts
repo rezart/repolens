@@ -2578,6 +2578,60 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('deduplicates a differently worded discovery finding for the same serializer hook', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const discovered = candidate(serializerPath, 5, 'include_website_name hook is missing predicate');
+    let verifierCandidates: Finding[] = [];
+    const llm: LLMProvider = { name: 'local', model: 'cheap', concurrency: 1, supportsBatchReview: false, async complete() {
+      return JSON.stringify({ findings: [discovered] });
+    } };
+    const verifierLlm: LLMProvider = { ...llm, async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      verifierCandidates = payload.findings.map(({ finding }) => finding);
+      return JSON.stringify({ decisions: payload.findings.map(({ finding }, id) => ({ id, decision: 'supported', explanation: 'The supplied evidence supports the finding.', evidence: { path: finding.path, line: finding.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      await reviewPullRequest({ db: testDb, llm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(serializerDiff, PR, { headFiles: { [serializerPath]: serializerHead } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierCandidates).toHaveLength(1);
+      expect(verifierCandidates[0]).toEqual(discovered);
+    } finally { testDb.close(); }
+  });
+
+  it('includes static candidates before escalation and verifier budget reservations', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const riskyHead = `${serializerHead}\nif (password) return true;`;
+    const riskyDiff = [
+      `diff --git a/${serializerPath} b/${serializerPath}`,
+      '--- /dev/null',
+      `+++ b/${serializerPath}`,
+      '@@ -0,0 +1,8 @@',
+      ...riskyHead.split('\n').map((line) => `+${line}`),
+    ].join('\n');
+    let escalationPayload: { provisionalFindings: Array<{ id: string; finding: Finding }> } | undefined;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: [serializerPath], findings: [], summary: 'Initial.', verdict: 'comment' });
+    } };
+    const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
+      escalationPayload = payload;
+      return JSON.stringify({ reviewedPaths: [serializerPath], decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'retain' })), findings: [] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, model: 'verifier', async complete(req) {
+      const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ finding: Finding }> };
+      return JSON.stringify({ decisions: payload.findings.map(({ finding }, id) => ({ id, decision: 'supported', explanation: 'The supplied evidence supports the finding.', evidence: { path: finding.path, line: finding.line } })), summary: 'Checked.', verdict: 'comment' });
+    } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(riskyDiff, PR, { headFiles: { [serializerPath]: riskyHead } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true, fresh: true, experimentTrace: true });
+      expect(escalationPayload?.provisionalFindings).toHaveLength(1);
+      expect(escalationPayload?.provisionalFindings[0]?.finding).toMatchObject({ path: serializerPath, line: 5, rootCause: serializerRootCause });
+      expect(result.trace?.experiment?.verificationCandidates).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
+
   it('supplies static facts to non-batch per-file discovery', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });

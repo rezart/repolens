@@ -1085,6 +1085,15 @@ function staticFactFinding(fact: StaticEvidenceFact): Finding | undefined {
   };
 }
 
+function staticFactHook(fact: StaticEvidenceFact): string | undefined {
+  return fact.kind === 'ruby-serializer-hook' ? /^include_[A-Za-z_][\w]*/.exec(fact.detail)?.[0] : undefined;
+}
+
+function findingMentionsHook(finding: Finding, hook: string): boolean {
+  return new RegExp(`(?<![A-Za-z0-9_])${escapedTerm(hook)}(?:\\?|$|[^A-Za-z0-9_])`, 'i')
+    .test([finding.title, finding.body, finding.rootCause].filter(Boolean).join(' '));
+}
+
 function primaryFindingIds(findings: Finding[]): string[] {
   const counts = new Map<string, number>();
   return findings.map((finding) => {
@@ -1928,6 +1937,18 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     primaryTrace = findings.slice();
+    if (verifierLlm) {
+      const allowedAddedLines = new Map(files.map((file) => [file.newPath ?? file.oldPath!, changedNewLines(file)]));
+      for (const fact of staticEvidence) {
+        const line = allowedAddedLines.get(fact.path);
+        if (!line?.has(fact.line)) continue;
+        const finding = staticFactFinding(fact);
+        const hook = staticFactHook(fact);
+        if (!finding || !hook || findings.some((existing) => existing.path === finding.path && findingLine(existing) === finding.line && findingMentionsHook(existing, hook))) continue;
+        findings.push(finding);
+      }
+      findings = deduplicateProvisionalCandidates(findings);
+    }
     const riskyFiles = files.flatMap((file) => {
       const hunks = file.hunks.filter((_, index) => {
         const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });
@@ -2095,15 +2116,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
     }
 
-    if (verifierLlm) {
-      const allowedAddedLines = new Map(files.map((file) => [file.newPath ?? file.oldPath!, changedNewLines(file)]));
-      findings.push(...staticEvidence.flatMap((fact) => {
-        const line = allowedAddedLines.get(fact.path);
-        if (!line?.has(fact.line)) return [];
-        const finding = staticFactFinding(fact);
-        return finding ? [finding] : [];
-      }));
-    }
     findings = deduplicateProvisionalCandidates(findings);
     findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
