@@ -1571,6 +1571,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let verifierEvidenceDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
     let verifierFocusedSkipped: 'budget' | 'disabled' | undefined;
     let verifierMissingEvidenceTrace: ReviewTrace['stages'][number]['missingEvidence'];
+    let evidenceRoundEnabled = true;
+    let evidenceRoundDisabledReason: string | undefined;
     let verifierSelectedPaths = new Set<string>();
     let verifierExecuted = false;
     let verifierFindingsTrace: Finding[] = [];
@@ -2049,6 +2051,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
         return reviewCostUpperBound(reserve);
       })() : 0;
+      const evidenceReserve = budgeted && verifierLlm ? reviewCostUpperBound(verifierRequest(findings, true)) : 0;
+      if (budgeted && reservedUsd + verifierReserve + evidenceReserve > REVIEW_MAX_USD) {
+        evidenceRoundEnabled = false;
+        evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
+      }
       const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
       const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
       let omitted = 0;
@@ -2162,6 +2169,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const fullVerifierReq = verifierRequest(findings);
       const verifierReq = !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd
         ? fullVerifierReq : verifierRequest(findings, true);
+      const evidenceReserveReq = verifierRequest(findings, true);
+      if (budgeted && reservedUsd + reviewCostUpperBound(verifierReq) + reviewCostUpperBound(evidenceReserveReq) > REVIEW_MAX_USD) {
+        evidenceRoundEnabled = false;
+        evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
+      }
       verifierOmittedContext = verifierReq === fullVerifierReq ? 0 : 1;
       const verifierPayload = JSON.parse(verifierReq.messages[0]!.content) as { files: VerifierContextFile[] };
       const verifierFiles = verifierPayload.files;
@@ -2220,6 +2232,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
       const missingEvidenceRequests = initialVerification.missingEvidence;
       if (uncertainFindings.length && (initialVerification.missingEvidenceRequested || missingEvidenceRequests.length)) {
+        if (!evidenceRoundEnabled) {
+          verifierMissingEvidenceTrace = {
+            requested: missingEvidenceRequests,
+            acquired: [],
+            authoritativeEvidenceAdded: false,
+            unresolved: uncertainCandidates.map(({ id }) => ({ id, reason: evidenceRoundDisabledReason ?? 'Evidence round disabled.' })),
+          };
+        } else {
         const acquired: Array<{ path: string; lines: number[] }> = [];
         let authoritativeEvidenceAdded = false;
         const evidenceOwnerPaths = new Set(uncertainCandidates.map(({ finding }) => finding.path));
@@ -2260,7 +2280,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             try {
               const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
               if (content === null) continue;
-              const lines = matchingHeadLines(content, new Set([request.symbol, request.question, path].filter((term): term is string => Boolean(term)))).slice(0, OWN_HEAD_WINDOW_COUNT_MAX);
+              const basename = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
+              const anchorText = `${request.question} ${basename}`;
+              const anchorTerms = new Set([request.symbol, basename, ...identifiers(anchorText), ...(anchorText.match(IDENTIFIER_RE) ?? [])]
+                .filter((term): term is string => typeof term === 'string' && term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase())).slice(0, 12));
+              const lines = matchingHeadLines(content, anchorTerms).slice(0, OWN_HEAD_WINDOW_COUNT_MAX);
               referencedHeadContents.set(path, content);
               authoritativeEvidenceAdded = true;
               acquired.push({ path, lines });
@@ -2316,6 +2340,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             findings.push(...uncertainCandidates.filter(({ id, finding }) => evidenceSupported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit').map(({ finding }) => finding));
             verifierMissingEvidenceTrace.unresolved = evidenceDecisions.filter((decision) => decision.decision === 'uncertain').map((decision) => ({ id: decision.id as number, reason: String(decision.explanation) }));
           } else verifierMissingEvidenceTrace.unresolved = uncertainCandidates.map(({ id }) => ({ id, reason: 'Evidence verifier round exceeds the remaining review budget.' }));
+        }
         }
       } else if (uncertainFindings.length && !deps.focusedVerification) {
         verifierFocusedSkipped = 'disabled';

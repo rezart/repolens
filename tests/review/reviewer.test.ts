@@ -2413,7 +2413,7 @@ describe('staged review', () => {
       const payload = JSON.parse(req.messages[0]!.content) as { provisionalFindings: Array<{ id: string; finding: Finding }> };
       return JSON.stringify({ reviewedPaths: ['src/keycloak.ts'], decisions: payload.provisionalFindings.map(({ id }) => ({ id, decision: 'reject' })), findings: [item] });
     } };
-    const verifierLlm: LLMProvider = { ...initial, async complete() {
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierCalls++;
       return JSON.stringify({ decisions: [], summary: 'Checked.', verdict: 'approve' });
     } };
@@ -2966,7 +2966,7 @@ describe('staged review', () => {
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Uncertain')] });
     } };
-    const verifierLlm: LLMProvider = { ...initial, async complete() {
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       verifierCalls++;
       return JSON.stringify({ decisions: [{ id: 0, decision: 'uncertain', explanation: 'Need unavailable context.' }], missingEvidence: [
         { path: '../secret.ts', question: 'What does this do?' },
@@ -2986,6 +2986,62 @@ describe('staged review', () => {
       expect(stage.missingEvidence?.unresolved).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: 0 }),
       ]));
+    } finally { testDb.close(); }
+  });
+
+  it('disables an evidence round up front when verifier plus reverify cannot fit the budget', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const oversized = { ...finding(1, 'Uncertain'), body: 'x'.repeat(600_000) };
+    const calls: CompleteRequest[] = [];
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [oversized] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'uncertain', explanation: 'Need unchanged evidence.' }], missingEvidence: [{ path: 'src/callee.ts', question: 'Where is guard invoked?' }] });
+    } };
+    const gh = fakeGithub(diff, PR, {
+      headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();', 'src/callee.ts': 'guard();' },
+    });
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm, retrieve: async () => [{ ...CHUNK, path: 'src/callee.ts' }], github: gh.github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(calls.filter((call) => call.reviewStage === 'verification')).toHaveLength(1);
+      expect(gh.contentCalls.filter((call) => call.path === 'src/callee.ts')).toEqual([]);
+      expect(result.findings).toEqual([]);
+      const stage = result.trace!.stages.find((item) => item.stage === 'verification')! as { missingEvidence?: { authoritativeEvidenceAdded: boolean; unresolved: Array<{ reason: string }> } };
+      expect(stage.missingEvidence).toMatchObject({ authoritativeEvidenceAdded: false });
+      expect(stage.missingEvidence?.unresolved[0]?.reason).toMatch(/budget/i);
+    } finally { testDb.close(); }
+  });
+
+  it('anchors path-only evidence at a late matching line', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const lateHead = [...Array.from({ length: 48 }, () => 'const filler = true;'), 'function guard() { return true; }'].join('\n');
+    let verifierCalls = 0;
+    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Uncertain')] });
+    } };
+    const verifierLlm: LLMProvider = { ...initial, async complete() {
+      verifierCalls++;
+      return verifierCalls === 1
+        ? JSON.stringify({ decisions: [{ id: 0, decision: 'uncertain', explanation: 'Need the guard.' }], missingEvidence: [{ path: 'src/callee.ts', question: 'How is guard invoked?' }] })
+        : JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'The late guard is authoritative.', evidence: { path: 'src/callee.ts', line: 49 } }] });
+    } };
+    try {
+      const result = await reviewPullRequest({
+        db: testDb, llm: initial, verifierLlm,
+        retrieve: async () => [{ ...CHUNK, path: 'src/callee.ts' }],
+        github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();', 'src/callee.ts': lateHead } }).github,
+      }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierCalls).toBe(2);
+      expect(result.findings).toHaveLength(1);
     } finally { testDb.close(); }
   });
 
