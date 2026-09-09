@@ -33,11 +33,15 @@ export interface AppDeps {
   escalationLlm?: LLMProvider;
   /** Independent backend for finding verification, when configured. */
   verifierLlm?: LLMProvider;
+  /** Optional fail-closed arbiter for verifier contradictions. */
+  arbiterLlm?: LLMProvider;
+  /** Sends every non-duplicate verifier candidate to the arbiter when enabled. */
+  arbiterAllFindings?: boolean;
   /** Enables the independent complementary discovery pass. */
   dualDiscovery?: boolean;
   /** Enables the uncertain-only focused verifier recheck. */
   focusedVerification?: boolean;
-  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 4000. */
+  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 6000. */
   discoveryMaxOutput?: number;
   /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
   chatLlm: LLMProvider;
@@ -176,6 +180,8 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           llm: deps.llm,
           escalationLlm: deps.escalationLlm,
           verifierLlm: deps.verifierLlm,
+          arbiterLlm: deps.arbiterLlm,
+          arbiterAllFindings: deps.arbiterAllFindings,
           dualDiscovery: deps.dualDiscovery,
           focusedVerification: deps.focusedVerification,
           discoveryMaxOutput: deps.discoveryMaxOutput,

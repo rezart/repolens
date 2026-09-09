@@ -43,8 +43,12 @@ Set `REPOLENS_API_TOKEN` to a random secret before starting (for example, genera
 ```env
 LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-...
-LLM_MODEL=qwen/qwen3-coder
-REVIEW_FALLBACK_MODELS=qwen/qwen3-coder-next
+LLM_MODEL=openai/gpt-5-mini
+LLM_REASONING_EFFORT=medium
+REVIEW_VERIFIER_MODEL=google/gemini-3.1-flash-lite
+REVIEW_VERIFIER_REASONING_EFFORT=medium
+REVIEW_ARBITER_MODEL=openai/gpt-6-astra
+REVIEW_ARBITER_REASONING_EFFORT=low
 EMBEDDING_API_KEY=sk-or-...               # optional, enables vector search
 EMBEDDING_MODEL=openai/text-embedding-3-small   # or qwen/qwen3-embedding-8b, etc.
 ```
@@ -97,17 +101,17 @@ Prefer the authoritative `message` over concatenating deltas. The dashboard stre
 
 ## Using it
 
-With `LLM_PROVIDER=openrouter`, a review uses one request for all files and the summary, regardless of model ID. Shared context is sent once, and retrieval uses the local lexical index without paid query embeddings. CLI providers keep the per-file pipeline.
+With `LLM_PROVIDER=openrouter`, discovery uses one request for all files and the summary. Production uses `openai/gpt-5-mini` at medium reasoning, verifies proposed findings with `google/gemini-3.1-flash-lite` at medium reasoning, and sends only verifier disagreements to `openai/gpt-6-astra` at low reasoning. Shared context is sent once; retrieval combines the configured embedding model with the local lexical index. CLI providers keep the per-file pipeline.
 
 When retries are enabled, optional context is admitted only while the request reserves at most half the review budget, leaving room for one retry. All file diffs remain complete. A core prompt that already exceeds half the budget can still receive one review attempt, but optional context is omitted and a retry may not fit.
 
-Set `LLM_MODEL=qwen/qwen3-coder` and `REVIEW_FALLBACK_MODELS=qwen/qwen3-coder-next` to try the current model first, then Coder Next when it fails. The fallback setting accepts a comma-separated list of OpenRouter model IDs in priority order; blank disables model fallback. Chat keeps its separate configuration.
+`REVIEW_FALLBACK_MODELS` accepts a comma-separated list of OpenRouter model IDs in priority order; production leaves it blank. Chat keeps its separate configuration.
 
-HTTP 408/429/5xx, transport failures (including `LLM_TIMEOUT_MS` expiry), and malformed, truncated, or incomplete review responses advance to the next model. The final model is retried if attempts remain. `REVIEW_MAX_RETRIES` limits **all** extra attempts (default 3; 0 disables retries and fallback). Each review starts at the primary again; there is no persistent health score or quality-based routing. Authentication, credit, and configuration errors stop immediately.
+When retries are configured, HTTP 408/429/5xx, transport failures (including `LLM_TIMEOUT_MS` expiry), and malformed, truncated, or incomplete review responses advance to the next model. The final model is retried if attempts remain. `REVIEW_MAX_RETRIES` limits **all** extra attempts and defaults to `0`. Each review starts at the primary again; authentication, credit, and configuration errors stop immediately.
 
-Before each attempt, the review reserves its full conservative cost bound against the same $0.25 ceiling. When every usage event for that attempt reports a finite, nonnegative cost, its reservation is reconciled to the reported total, even if the response is malformed or incomplete. Missing or invalid billing keeps the full reservation. An exhausted-budget error retains the last retry reason and the used/reserved amount plus the next attempt’s reservation. OpenRouter routing is restricted to endpoints at or below $0.40/M input and $2/M output with no per-request fee; models without an eligible endpoint fail closed. Hidden provider retries and routing fallbacks stay disabled, so model fallback cannot reset the budget. Logs and review warnings include retry reasons and model choices. Usage is attributed per model, and saved reviews retain the successful model for later posting.
+Before each call, the review reserves its full conservative cost bound against the same $0.495 ceiling. When every usage event for that call reports a finite, nonnegative cost, its reservation is reconciled to the reported total. Missing or invalid billing keeps the full reservation. Each stage has its own routing price ceiling, and OpenRouter provider fallbacks are disabled so a hidden route cannot bypass the tested model or reset the budget. Logs and review warnings include retry reasons and model choices. Usage is attributed per model, and saved reviews retain the successful discovery model for later posting.
 
-Review attempts together reserve at most **$0.245**, below the $0.25 per-run limit. UTF-8 bytes conservatively bound input tokens (plus message overhead); primary and verification output is limited to 8,000 tokens per attempt, while high-risk escalation allows up to 16,000 tokens for thinking plus JSON and up to 10 minutes for the provider response. This covers review inference, not separate repository indexing jobs.
+Review calls together reserve at most **$0.495**, below the $0.50 per-run limit. UTF-8 bytes conservatively bound input tokens (plus message overhead); discovery output is limited to 8,000 tokens by default, verification to 6,000, arbitration to 600, and optional escalation to 16,000. This covers review inference, not separate repository indexing jobs.
 
 The dashboard’s past-review list shows the reported inference cost for each new review, summed across its calls. Historical reviews and reviews with missing cost reports show “Cost unavailable”; cached reviews retain their original cost. This excludes chat and repository indexing costs.
 
@@ -192,10 +196,13 @@ See `.env.example` for every variable. The important ones:
 | `REPOLENS_PORT` | `3000` | |
 | `REPOLENS_HOST` | `127.0.0.1` | Interface to listen on; Docker Compose binds all container interfaces but publishes only host loopback |
 | `LLM_PROVIDER` | `openrouter` | `openrouter`, `claude-cli`; `codex-cli` is temporarily disabled |
-| `LLM_MODEL` | | Model id (OpenRouter) or model name (CLIs, optional) |
+| `LLM_MODEL` | | Discovery model id (OpenRouter) or model name (CLIs, optional); production uses `openai/gpt-5-mini` at medium reasoning |
 | `REVIEW_FALLBACK_MODELS` | blank | Ordered, comma-separated OpenRouter review alternatives; shares the retry limit and total budget |
-| `REVIEW_DISCOVERY_MAX_OUTPUT` | `8000` | Maximum output tokens for budgeted discovery; bounded to `16000`. Verification remains `4000` |
-| `REVIEW_ESCALATION_MODEL` | `moonshotai/kimi-k2.7-code` | OpenRouter model for security/high-risk hunk rechecks; blank disables escalation. Initial, escalation, verification, and retries share the $0.25 review cap |
+| `REVIEW_DISCOVERY_MAX_OUTPUT` | `8000` | Maximum output tokens for budgeted discovery; bounded to `16000` |
+| `REVIEW_ESCALATION_MODEL` | blank | Optional OpenRouter model for security/high-risk hunk rechecks |
+| `REVIEW_VERIFIER_MODEL` | `google/gemini-3.1-flash-lite` | Independent model that verifies proposed findings |
+| `REVIEW_ARBITER_MODEL` | `openai/gpt-6-astra` | Resolves verifier disagreements; `REVIEW_ARBITER_ALL_FINDINGS=false` keeps it off the agreement path |
+| `REVIEW_MAX_RETRIES` | `0` | Extra failed-review attempts; all stages share the $0.495 review cap |
 | `LLM_TIMEOUT_MS` | `300000` | Per-completion timeout |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | OpenRouter / empty / empty | OpenAI-compatible embeddings. Blank model = lexical only |
 | `GITHUB_TOKEN` | | Clone private repos, read PRs, post reviews (PAT fallback) |

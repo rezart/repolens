@@ -10,9 +10,10 @@ import type {
   PathCommit,
   HistoricalPullRequest,
 } from '../../src/review/github.js';
-import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from '../../src/review/prompts.js';
-import { reviewCostUpperBound, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_MAX_OUTPUT, REVIEW_MAX_USD } from '../../src/review/budget.js';
+import { FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, focusedVerifierSystemPrompt } from '../../src/review/prompts.js';
+import { reviewCostUpperBound, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_MAX_OUTPUT, REVIEW_MAX_USD, REVIEW_VERIFIER_MAX_OUTPUT } from '../../src/review/budget.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
+import { reviewCallCost } from '../../src/usage/review-cost.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
 import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
@@ -34,10 +35,93 @@ import {
   renderRepositoryRules,
   statusForFindings,
   selectPostedFindings,
+  selectArbitrationCandidates,
+  restoreArbitratedFindings,
+  compactArbitrationFiles,
+  buildArbiterJsonSchema,
+  suppressDuplicateFindings,
   parseFindings,
   type ReviewDeps,
   type Finding,
 } from '../../src/review/reviewer.js';
+
+describe('arbiter filtering', () => {
+  it('defines the strict decisions-only arbiter schema', () => {
+    const schema = buildArbiterJsonSchema([0, 1]);
+    expect(schema.required).toEqual(['decisions']);
+    expect(schema.properties).not.toHaveProperty('summary');
+    expect((schema.properties as any).decisions.items.required).toEqual(['id', 'decision', 'explanation', 'evidence']);
+    expect((schema.properties as any).decisions.items.properties.decision.enum).toEqual(['supported', 'contradicted']);
+    expect((schema.properties as any).decisions.items.properties).not.toHaveProperty('duplicateOf');
+  });
+  const finding = (confidence: Finding['confidence'] = 'high', severity: Finding['severity'] = 'warning'): Finding => ({
+    path: 'src/a.ts', line: 2, severity, title: 'issue', body: 'details', category: 'correctness', confidence,
+    rootCause: 'cause', evidence: { path: 'src/a.ts', line: 2, trigger: 'input', consequence: 'failure' },
+  });
+  it('sends only verifier-disputed IDs and restores supported findings while promoting verified nits', () => {
+    const all = [finding(), finding(), finding('low'), finding('high', 'nit')];
+    const candidates = selectArbitrationCandidates(all, [{ id: 0, decision: 'supported' }, { id: 1, decision: 'contradicted' }, { id: 2, decision: 'uncertain' }, { id: 3, decision: 'contradicted' }]);
+    expect(candidates.map(({ id }) => id)).toEqual([1, 2, 3]);
+    const restored = restoreArbitratedFindings([], candidates, [{ id: 1, decision: 'supported' }, { id: 2, decision: 'supported' }, { id: 3, decision: 'supported' }]);
+    expect(restored).toHaveLength(3);
+    expect(restored[2]!.severity).toBe('warning');
+  });
+  it('opts into all-findings arbitration while excluding verifier-declared duplicates', () => {
+    const all = [finding(), finding(), finding(), finding()];
+    const candidates = selectArbitrationCandidates(all, [
+      { id: 0, decision: 'supported' }, { id: 1, decision: 'uncertain' },
+      { id: 2, decision: 'contradicted' }, { id: 3, decision: 'supported' },
+    ], true, new Set([3]));
+    expect(candidates.map(({ id }) => id)).toEqual([0, 1, 2]);
+  });
+  it('keeps disputed findings dropped when Astra contradicts them', () => {
+    const candidates = [{ id: 0, finding: finding() }];
+    expect(restoreArbitratedFindings([], candidates, [{ id: 0, decision: 'contradicted' }])).toEqual([]);
+  });
+  it('compacts arbitration context to disputed-file evidence windows', () => {
+    const files = [{ path: 'src/a.ts', currentEvidence: [{ line: 2 }, { line: 8 }, { line: 13 }], headEvidence: [{ path: 'src/a.ts', revision: 'head' as const, lines: [{ line: 2, text: 'target' }, { line: 8, text: 'six lines away' }, { line: 13, text: 'unrelated' }] }], headContext: 'full context', diff: 'hidden diff', removedEvidence: [{ line: 99 }] }, { path: 'src/other.ts', currentEvidence: [{ line: 1 }] }];
+    const compact = compactArbitrationFiles(files, [finding()]);
+    expect(compact).toHaveLength(1);
+    expect(compact[0]!.headContext).toBeUndefined();
+    expect((compact[0] as any).diff).toBeUndefined();
+    expect((compact[0] as any).removedEvidence).toBeUndefined();
+    expect(compact[0]!.currentEvidence).toEqual([{ line: 2 }, { line: 8 }]);
+    expect(compact[0]!.headEvidence?.[0]?.lines).toEqual([{ line: 2, text: 'target' }, { line: 8, text: 'six lines away' }]);
+  });
+  it('keeps bounded cross-file identifier evidence and caps it at 8KB', () => {
+    const owner = finding();
+    owner.path = 'src/paginator.py';
+    owner.evidence = { ...owner.evidence!, path: owner.path };
+    owner.line = 840;
+    owner.evidence = { ...owner.evidence, line: 840 };
+    owner.title = 'OptimizedCursorPaginator issue';
+    const files = [{ path: 'src/paginator.py', headEvidence: [
+      { path: 'src/paginator.py', revision: 'head' as const, lines: [{ line: 830, text: 'before' }, { line: 835, text: 'before' }, { line: 840, text: 'class OptimizedCursorPaginator:' }, { line: 846, text: 'after' }, { line: 850, text: 'after' }, { line: 851, text: 'outside' }] },
+      { path: 'src/controller.py', revision: 'head' as const, lines: [{ line: 79, text: 'OptimizedCursorPaginator()' }, { line: 80, text: 'order_by = -datetime' }, { line: 82, text: 'config = true' }] },
+      { path: 'src/controller.py', revision: 'head' as const, lines: [{ line: 90, text: 'the issue is unrelated' }] },
+      { path: 'src/large-caller.py', revision: 'head' as const, lines: Array.from({ length: 40 }, (_, index) => ({ line: index + 1, text: `OptimizedCursorPaginator ${'x'.repeat(300)}` })) },
+    ] }];
+    const compact = compactArbitrationFiles(files, [owner]);
+    expect(compact.map((file) => file.path)).toEqual(['src/paginator.py']);
+    expect(compact[0]!.headEvidence?.[0]?.lines.map(({ line }) => line)).toEqual([830, 835, 840, 846, 850]);
+    expect(compact[0]!.headEvidence?.find((snippet) => snippet.path === 'src/controller.py')?.lines.map(({ line }) => line)).toEqual([79, 80, 82]);
+    expect(compact[0]!.headEvidence?.some((snippet) => snippet.path === 'src/large-caller.py')).toBe(false);
+    expect(JSON.stringify(compact).length).toBeLessThanOrEqual(8_000);
+  });
+  it('suppresses supported downstream duplicates but keeps distinct findings', () => {
+    const first = finding();
+    const duplicate = { ...finding(), line: 113, evidence: { ...finding().evidence!, line: 113 } };
+    const distinct = { ...finding(), line: 120, rootCause: 'different', evidence: { ...finding().evidence!, line: 120 } };
+    expect(suppressDuplicateFindings([first, duplicate, distinct], [
+      { id: 0, decision: 'supported' }, { id: 1, decision: 'supported', duplicateOf: 0 }, { id: 2, decision: 'supported' },
+    ])).toEqual([first, distinct]);
+  });
+  it('fails closed on invalid duplicate links', () => {
+    expect(() => suppressDuplicateFindings([finding()], [{ id: 0, decision: 'supported', duplicateOf: 0 }])).toThrow();
+    expect(() => suppressDuplicateFindings([finding(), finding()], [{ id: 0, decision: 'supported', duplicateOf: 1 }, { id: 1, decision: 'supported', duplicateOf: 0 }])).toThrow();
+    expect(() => suppressDuplicateFindings([finding(), finding()], [{ id: 0, decision: 'supported', duplicateOf: 1 }, { id: 1, decision: 'uncertain' }])).toThrow();
+  });
+});
 
 describe('review finding posting', () => {
   it('keeps one representative per root cause and folds related locations into the strongest comment', () => {
@@ -86,6 +170,17 @@ describe('fresh finding evidence validation', () => {
 
   it('rejects an unknown category', () => {
     expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'style' }] }), file)).toThrow('category');
+  });
+
+  it('normalizes only known severity aliases', () => {
+    const aliases = ['critical', 'blocker', 'error', 'high', 'warning', 'medium', 'moderate', 'nit', 'low', 'info', 'informational'];
+    expect(aliases.map((severity) => parseFindings(JSON.stringify({ findings: [{ ...base, severity }] }), file)[0]!.severity))
+      .toEqual(['critical', 'critical', 'critical', 'critical', 'warning', 'warning', 'warning', 'nit', 'nit', 'nit', 'nit']);
+  });
+
+  it('rejects unknown severity aliases and includes the raw value', () => {
+    expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, severity: 'style' }] }), file))
+      .toThrow('invalid finding severity "style"');
   });
 
   it('rejects evidence that does not cite the changed finding line', () => {
@@ -206,6 +301,17 @@ describe('review context selection', () => {
       'spec/serializers/user_serializer_spec.rb',
       'app/views/users/show.html.erb',
     ]);
+  });
+
+  it('pulls a changed caller when the added class declaration names it', () => {
+    const snippets = buildHeadEvidence({
+      path: 'src/paginator.ts', addedText: 'export class OptimizedCursorPaginator {}',
+      headContents: new Map([
+        ['src/paginator.ts', 'export class OptimizedCursorPaginator {}'],
+        ['src/controller.ts', 'const paginator = new OptimizedCursorPaginator();'],
+      ]),
+    });
+    expect(snippets.map((snippet) => snippet.path)).toContain('src/controller.ts');
   });
 
   it('ignores validation symbols before line-start serializer attributes', () => {
@@ -354,6 +460,7 @@ describe('verifier decision citations', () => {
     expect(hasValidVerifierCitation({ evidence: { path: 'src/my file.ts', line: '7' } }, files)).toBe(false);
     expect(VERIFIER_SYSTEM_PROMPT).toContain('Supported and contradicted decisions must include evidence:{path:string,line:number}');
   });
+
 });
 
 const REPO_ID = 'github:o/r';
@@ -674,6 +781,12 @@ describe('reviewPullRequest', () => {
     const result = await reviewPullRequest({ db, llm, retrieve, github: gh.github }, { repoId: REPO_ID, prNumber: 42, post: false });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.reviewBudget).toBe(true);
+    expect(calls[0]!.jsonSchema).toMatchObject({
+      required: expect.arrayContaining(['reviewedPaths', 'findings', 'summary', 'verdict']),
+    });
+    const findingSchema = (calls[0]!.jsonSchema as Record<string, any>).properties.findings.items;
+    expect(findingSchema.properties.severity.enum).toEqual(['critical', 'warning', 'nit']);
+    expect(findingSchema.properties.line.enum).toEqual([1]);
     expect(reviewCostUpperBound(calls[0]!)).toBeGreaterThan(0.045);
     expect(reviewCostUpperBound(calls[0]!)).toBeLessThanOrEqual(REVIEW_MAX_USD);
     expect(calls[0]!.messages[0]!.content.split(CHUNK.content)).toHaveLength(1);
@@ -1187,7 +1300,7 @@ describe('reviewPullRequest', () => {
       expect(sent[1]!.messages).toEqual(sent[0]!.messages);
     }
     expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
-    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === true)).toBe(true);
+    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
     expect(db.getReview(result.reviewId)?.model).toBe('qwen/qwen3-coder-next');
     if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {
@@ -2627,7 +2740,8 @@ describe('staged review', () => {
     } };
     const verifierLlm: LLMProvider = { ...initial, async complete(req) {
       expect(req.reviewStage).toBe('verification');
-      expect(req.maxTokens).toBe(4000);
+      expect(req.maxTokens).toBe(REVIEW_VERIFIER_MAX_OUTPUT);
+      expect(req.jsonSchema).toBeUndefined();
       const payload = JSON.parse(req.messages[0]!.content) as { findings: Array<{ id: number; finding: { title: string; path: string; line: number } }> };
       expect(payload.findings.map((item) => item.finding.title)).toEqual(['Strong risky finding', 'Keep low-risk finding']);
       return JSON.stringify({ decisions: payload.findings.map(({ id, finding: item }) => ({ id, decision: 'supported', explanation: 'The supplied code demonstrates it.', evidence: { path: item.path, line: item.line } })), summary: 'Two supported issues remain.', verdict: 'approve' });
@@ -3026,7 +3140,7 @@ describe('staged review', () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
-    const oversized = { ...finding(1, 'Uncertain'), body: 'x'.repeat(600_000) };
+    const oversized = { ...finding(1, 'Uncertain'), body: 'x'.repeat(400_000) };
     const calls: CompleteRequest[] = [];
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
       calls.push(req);
@@ -3202,25 +3316,8 @@ describe('staged review', () => {
       ] });
     } };
     try {
-      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, focusedVerification: true, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true, fresh: true, experimentTrace: true });
+      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, focusedVerification: true, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true, fresh: true });
       expect(result.findings.map((item) => item.title)).toEqual(['Supported', 'Uncertain zero']);
-      expect(result.trace?.experiment).toMatchObject({
-        verificationCandidates: [
-          { id: 0, finding: { title: 'Uncertain zero' } },
-          { id: 1, finding: { title: 'Supported' } },
-          { id: 2, finding: { title: 'Contradicted' } },
-          { id: 3, finding: { title: 'Uncertain three' } },
-        ],
-        verificationDecisions: expect.arrayContaining([
-          expect.objectContaining({ id: 0, decision: 'uncertain', explanation: 'Needs focus.' }),
-          expect.objectContaining({ id: 1, decision: 'supported', evidence: { path: 'src/mixed.ts', line: 1 } }),
-        ]),
-        focusedDecisions: expect.arrayContaining([
-          expect.objectContaining({ id: 0, decision: 'supported', explanation: 'Focused evidence supports it.' }),
-          expect.objectContaining({ id: 3, decision: 'contradicted', evidence: { path: 'src/mixed.ts', line: 20 } }),
-        ]),
-      });
-      expect(result.trace?.experiment?.publishedFindings.map((item) => item.id)).toEqual([1, 0]);
       expect(result.trace?.stages.flatMap((stage) => stage.calls).every((call) => (call.elapsedMs ?? -1) >= 0)).toBe(true);
       expect(result.trace!.stages.find((item) => item.stage === 'verification')!.focusedDecisions).toEqual([
         { id: 0, decision: 'supported' }, { id: 3, decision: 'contradicted' },
@@ -3289,27 +3386,10 @@ describe('staged review', () => {
       const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, focusedVerification: false, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       expect(verifierCalls).toBe(1);
       expect(result.findings).toEqual([]);
-      expect(result.trace?.experiment).toBeUndefined();
       const stage = result.trace!.stages.find((item) => item.stage === 'verification')!;
       expect(stage.focusedSkipped).toBe('disabled');
       expect(stage.calls).toHaveLength(1);
       expect(stage.calls.every((call) => (call.elapsedMs ?? -1) >= 0)).toBe(true);
-    } finally { testDb.close(); }
-  });
-
-  it('keeps experiment provenance private when fresh mode is not enabled', async () => {
-    const testDb = openDb(':memory:');
-    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
-    testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
-    const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'comment', findings: [finding(20, 'Uncertain')] });
-    } };
-    const verifierLlm: LLMProvider = { ...initial, async complete() {
-      return JSON.stringify({ decisions: [{ id: 0, decision: 'uncertain', explanation: 'Still uncertain.' }] });
-    } };
-    try {
-      const result = await reviewPullRequest({ db: testDb, llm: initial, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true, experimentTrace: true });
-      expect(result.trace?.experiment).toBeUndefined();
     } finally { testDb.close(); }
   });
 
@@ -3407,7 +3487,7 @@ describe('staged review', () => {
     let escalationCalls = 0;
     let verifierRequest: CompleteRequest | undefined;
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.37 });
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.30 });
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Finding')] });
     } };
     const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
@@ -3423,7 +3503,7 @@ describe('staged review', () => {
     try {
       await reviewPullRequest({
         db: testDb, llm: initial, escalationLlm, verifierLlm,
-        retrieve: async () => [{ ...CHUNK, content: 'request token context ' + 'x'.repeat(290_000) }],
+        retrieve: async () => [{ ...CHUNK, content: 'request token context ' + 'x'.repeat(180_000) }],
         github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       const payload = JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<Record<string, unknown>> };
@@ -3441,7 +3521,7 @@ describe('staged review', () => {
     const calls: CompleteRequest[] = [];
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
       calls.push(req);
-      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.29 });
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.20 });
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [large] });
     } };
     const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
@@ -3458,7 +3538,7 @@ describe('staged review', () => {
     try {
       const result = await reviewPullRequest({
         db: testDb, llm: initial, escalationLlm, verifierLlm,
-        retrieve: async () => [{ ...CHUNK, path: 'src/callee.ts', content: 'request token context ' + 'x'.repeat(500_000) }],
+        retrieve: async () => [{ ...CHUNK, path: 'src/callee.ts', content: 'request token context ' + 'x'.repeat(300_000) }],
         github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();', 'src/callee.ts': 'guard();' } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
       expect(calls.filter((call) => call.reviewStage === 'verification')).toHaveLength(2);
@@ -3475,7 +3555,7 @@ describe('staged review', () => {
     const calls: CompleteRequest[] = [];
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete(req) {
       calls.push(req);
-      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.32 });
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.20 });
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Uncertain')] });
     } };
     const escalationLlm: LLMProvider = { ...initial, model: 'strong', async complete(req) {
@@ -3542,6 +3622,98 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
+  it('does not call verifier or arbiter when discovery returns no findings', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const primary: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'No issues.', verdict: 'approve', findings: [] });
+    } };
+    const unused: LLMProvider = { ...primary, async complete() { throw new Error('staged model must not run'); } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: unused, arbiterLlm: unused,
+        retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings).toEqual([]);
+      expect(result.trace?.stages.map((stage) => stage.stage)).not.toContain('verification');
+      expect(result.trace?.stages.map((stage) => stage.stage)).not.toContain('arbitration');
+    } finally { testDb.close(); }
+  });
+
+  it('uses strict binary verification when an arbiter handles disagreements', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    let verifierRequest: CompleteRequest | undefined;
+    const primary: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'comment', findings: [finding(20, 'Finding')] });
+    } };
+    const verifier: LLMProvider = { ...primary, async complete(req) {
+      verifierRequest = req;
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Current evidence proves it.', evidence: { path: 'src/mixed.ts', line: 20 } }] });
+    } };
+    const arbiter: LLMProvider = { ...primary, async complete() { throw new Error('arbiter must not run for agreement'); } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, arbiterLlm: arbiter,
+        retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(verifierRequest?.system).toBe(focusedVerifierSystemPrompt());
+      expect((JSON.parse(verifierRequest!.messages[0]!.content) as { files: Array<{ relevantContext?: string }> }).files.every((file) => file.relevantContext === undefined)).toBe(true);
+      expect(result.trace?.stages.find((stage) => stage.stage === 'verification')?.omittedContext).toBe(1);
+      expect(result.findings).toHaveLength(1);
+    } finally { testDb.close(); }
+  });
+
+  it.each([
+    ['provider failure', async () => { throw new ProviderError('openrouter', 'unavailable', 503); }],
+    ['malformed response', async () => JSON.stringify({ decisions: [] })],
+  ])('fails closed on arbiter %s', async (_case, complete) => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const primary: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'comment', findings: [finding(20, 'Disputed')] });
+    } };
+    const verifier: LLMProvider = { ...primary, async complete() {
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'Not established.', evidence: { path: 'src/mixed.ts', line: 20 } }] });
+    } };
+    const arbiter: LLMProvider = { ...primary, model: 'openai/gpt-6-astra', complete };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, arbiterLlm: arbiter,
+        retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(result.findings).toEqual([]);
+      expect(result.warnings).toContain('Arbitration failed; suppressed 1 disputed finding.');
+      expect(result.trace?.stages.find((stage) => stage.stage === 'arbitration')?.findingCount).toBe(0);
+    } finally { testDb.close(); }
+  });
+
+  it('suppresses a disagreement when arbitration cannot fit the remaining review budget', async () => {
+    const testDb = openDb(':memory:');
+    testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    const reportCost = () => {
+      const call = reviewCallCost.getStore();
+      if (call) { call.reported = true; call.costUsd = 0.23; }
+    };
+    const primary: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
+      reportCost();
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'comment', findings: [finding(20, 'Disputed')] });
+    } };
+    const verifier: LLMProvider = { ...primary, async complete() {
+      reportCost();
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'contradicted', explanation: 'Not established.', evidence: { path: 'src/mixed.ts', line: 20 } }] });
+    } };
+    let arbiterCalls = 0;
+    const arbiter: LLMProvider = { ...primary, model: 'openai/gpt-6-astra', async complete() { arbiterCalls++; return '{}'; } };
+    try {
+      const result = await reviewPullRequest({ db: testDb, llm: primary, verifierLlm: verifier, arbiterLlm: arbiter,
+        retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(arbiterCalls).toBe(0);
+      expect(result.findings).toEqual([]);
+      expect(testDb.getReview(result.reviewId)?.cost_usd).toBeCloseTo(0.46);
+      expect(result.warnings).toContain('Arbitration failed; suppressed 1 disputed finding.');
+      const calls = result.trace!.stages.flatMap((stage) => stage.calls);
+      const billed = calls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0);
+      const arbitration = result.trace!.stages.find((stage) => stage.stage === 'arbitration')!.calls[0]!;
+      expect(billed).toBeLessThanOrEqual(REVIEW_MAX_USD);
+      expect(billed + arbitration.estimatedCostUsd).toBeGreaterThan(REVIEW_MAX_USD);
+    } finally { testDb.close(); }
+  });
+
   it('fails closed when verification omits a finding decision', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
@@ -3555,7 +3727,7 @@ describe('staged review', () => {
     } finally { testDb.close(); }
   });
 
-  it('suppresses contradicted and marginal findings and uses the verifier summary', async () => {
+  it('suppresses contradicted findings and accepts verifier-supported medium-confidence findings', async () => {
     const testDb = openDb(':memory:');
     testDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
@@ -3578,9 +3750,8 @@ describe('staged review', () => {
     } };
     try {
       const result = await reviewPullRequest({ db: testDb, llm: initial, escalationLlm, verifierLlm, retrieve: retrieveOne, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
-      expect(result.findings).toEqual([]);
-      expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
-      expect(result.verdict).toBe('approve');
+      expect(result.findings.map((item) => item.title)).toEqual(['Marginal']);
+      expect(result.verdict).toBe('comment');
     } finally { testDb.close(); }
   });
 
@@ -3698,7 +3869,7 @@ describe('staged review', () => {
     testDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
     const tracker = new UsageTracker({ db: testDb, pricing: null });
     const initial: LLMProvider = { name: 'openrouter', model: 'cheap', concurrency: 1, supportsBatchReview: true, async complete() {
-      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.33 });
+      tracker.sinkFor('review')({ provider: 'openrouter', model: 'cheap', inputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1, costUsd: 0.20 });
       return JSON.stringify({ reviewedPaths: paths, summary: 'Initial.', verdict: 'request_changes', findings: [finding(1, 'Primary')] });
     } };
     let escalationCalls = 0;
@@ -3713,7 +3884,7 @@ describe('staged review', () => {
     try {
       await expect(reviewPullRequest({
         db: testDb, llm: initial, escalationLlm: escalation, verifierLlm: verifier,
-        retrieve: async () => [{ ...CHUNK, content: 'request token context ' + 'x'.repeat(36_000) }],
+        retrieve: async () => [{ ...CHUNK, content: 'request token context ' + 'x'.repeat(10_000) }],
         github: fakeGithub(diff, PR, { headFiles: { 'src/mixed.ts': 'const token = request.token;\nnewCall();' } }).github,
       }, { repoId: REPO_ID, prNumber: 42, post: false, force: true })).rejects.toThrow(/budget/i);
       expect(escalationCalls).toBe(1);

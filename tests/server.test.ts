@@ -756,6 +756,7 @@ describe('buildDeps', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
       REVIEW_FALLBACK_MODELS: 'qwen/qwen3-coder-next',
+      REVIEW_ESCALATION_MODEL: 'openai/gpt-5-mini',
       REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
     });
     const deps = buildDeps(config, () => {});
@@ -796,7 +797,7 @@ describe('buildDeps', () => {
     try { expect(deps.dualDiscovery).toBe(true); } finally { deps.db.close(); }
   });
 
-  it('propagates discovery output bounds and leaves the verifier at provider default effort', () => {
+  it('propagates discovery output bounds and the verifier effort default', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
       LLM_REASONING_EFFORT: 'high', REVIEW_DISCOVERY_MAX_OUTPUT: '16000',
@@ -807,8 +808,51 @@ describe('buildDeps', () => {
     try {
       expect(deps.discoveryMaxOutput).toBe(16000);
       expect(effortOf(deps.llm)).toBe('high');
-      expect(effortOf(deps.verifierLlm!)).toBeUndefined();
+      expect(effortOf(deps.verifierLlm!)).toBe('medium');
     } finally { deps.db.close(); }
+  });
+
+  it('configures verifier reasoning independently when requested', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      LLM_REASONING_EFFORT: 'high', REVIEW_VERIFIER_REASONING_EFFORT: 'low',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(effortOf(deps.llm)).toBe('high');
+      expect(effortOf(deps.verifierLlm!)).toBe('low');
+    } finally { deps.db.close(); }
+  });
+
+  it('configures escalation reasoning independently while preserving inheritance and blank disablement', () => {
+    const make = (escalationReasoningEffort?: string) => {
+      const config = loadConfig({
+        LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+        LLM_REASONING_EFFORT: 'high',
+        REVIEW_ESCALATION_MODEL: 'openai/gpt-5-mini',
+        ...(escalationReasoningEffort === undefined ? {} : { REVIEW_ESCALATION_REASONING_EFFORT: escalationReasoningEffort }),
+        REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+      });
+      const deps = buildDeps(config, () => {});
+      return { deps };
+    };
+    const inherited = make();
+    const explicit = make('low');
+    const disabled = make('');
+    try {
+      expect(effortOf(inherited.deps.llm)).toBe('high');
+      expect(effortOf(inherited.deps.escalationLlm!)).toBe('high');
+      expect(effortOf(explicit.deps.llm)).toBe('high');
+      expect(effortOf(explicit.deps.escalationLlm!)).toBe('low');
+      expect(effortOf(disabled.deps.llm)).toBe('high');
+      expect(effortOf(disabled.deps.escalationLlm!)).toBeUndefined();
+      expect(effortOf(inherited.deps.verifierLlm!)).toBe('medium');
+    } finally {
+      inherited.deps.db.close();
+      explicit.deps.db.close();
+      disabled.deps.db.close();
+    }
   });
 
   it('always gives chat its own low-effort provider, even without CHAT_PROVIDER/CHAT_MODEL', () => {
@@ -838,5 +882,20 @@ describe('buildDeps', () => {
     });
     const deps = buildDeps(config, () => {});
     try { expect(deps.verifierLlm).toBe(deps.llm); } finally { deps.db.close(); }
+  });
+
+  it('creates an optional OpenRouter arbiter with low reasoning by default', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_ARBITER_MODEL: 'openai/gpt-6-astra',
+      REVIEW_ARBITER_ALL_FINDINGS: 'true',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.arbiterLlm?.model).toBe('openai/gpt-6-astra');
+      expect(effortOf(deps.arbiterLlm!)).toBe('low');
+      expect(deps.arbiterAllFindings).toBe(true);
+    } finally { deps.db.close(); }
   });
 });

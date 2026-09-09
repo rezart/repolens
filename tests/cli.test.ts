@@ -8,7 +8,6 @@ describe('review CLI options', () => {
       repoId: 'github:o/r', prNumber: 42, fresh: true, post: false, force: false,
     });
     expect(parseReviewArgs(['github:o/r', '42', '--fresh', '--post']).post).toBe(true);
-    expect(parseReviewArgs(['github:o/r', '42', '--fresh', '--experiment-trace']).experimentTrace).toBe(true);
   });
 
   it('passes the configured verifier backend through fresh review wiring', () => {

@@ -42,17 +42,24 @@ const envSchema = z.object({
   REVIEW_FALLBACK_MODELS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((m) => m.trim()) : [])
     .pipe(z.array(z.string().regex(/^[^\s,]+$/))),
   /** Extra attempts for failed batch reviews, within the total review budget. */
-  REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(3),
-  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 4000. */
+  REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(0),
+  /** Maximum output tokens for budgeted discovery. */
   REVIEW_DISCOVERY_MAX_OUTPUT: z.coerce.number().int().min(1).max(16000).default(8000),
-  /** Strong model for high-risk hunk re-review; OpenRouter defaults to GPT-5 Mini. */
-  REVIEW_ESCALATION_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('openai/gpt-5-mini'),
+  /** Optional strong model for high-risk hunk re-review. */
+  REVIEW_ESCALATION_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default(''),
+  /** Reasoning effort for escalation; unset inherits LLM_REASONING_EFFORT, blank disables it. */
+  REVIEW_ESCALATION_REASONING_EFFORT: z.enum(['low', 'medium', 'high', '']).optional(),
   /** Independent model for finding verification; blank disables verification. */
-  REVIEW_VERIFIER_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('openai/gpt-5-mini'),
+  REVIEW_VERIFIER_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('google/gemini-3.1-flash-lite'),
+  /** Reasoning effort for verifier; unset preserves provider default. */
+  REVIEW_VERIFIER_REASONING_EFFORT: z.enum(['low', 'medium', 'high', '']).default('medium'),
   /** Run the complementary contract/concurrency discovery pass. */
   REVIEW_DUAL_DISCOVERY: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   /** Recheck verifier-uncertain findings with a focused verifier call. */
   REVIEW_FOCUSED_VERIFICATION: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
+  REVIEW_ARBITER_MODEL: z.string().trim().regex(/^$|^[^\s,]+$/).default('openai/gpt-6-astra'),
+  REVIEW_ARBITER_REASONING_EFFORT: z.enum(['low', 'medium', 'high', '']).default('low'),
+  REVIEW_ARBITER_ALL_FINDINGS: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   /** Comma-separated repository-relative globs excluded from PR review. */
   REVIEW_IGNORE_PATTERNS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((p) => p.trim()) : [])
     .pipe(z.array(z.string().min(1).max(200).regex(/^[^,[\]]+$/))),
@@ -85,7 +92,7 @@ export interface Config {
   /** Provider/model for chat answers ('' = same as llm). */
   chatProvider: LLMProviderName | '';
   chatModel: string;
-  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; discoveryMaxOutput?: number; escalationModel?: string; verifierModel?: string; dualDiscovery?: boolean; focusedVerification?: boolean; fallbackModels?: string[]; ignorePatterns?: string[] };
+  review: { statusContext: string; failOn: 'critical' | 'warning' | 'never'; settleSeconds: number; maxRetries: number; discoveryMaxOutput?: number; escalationModel?: string; escalationReasoningEffort?: 'low' | 'medium' | 'high' | ''; verifierModel?: string; verifierReasoningEffort?: 'low' | 'medium' | 'high' | ''; dualDiscovery?: boolean; focusedVerification?: boolean; arbiterModel?: string; arbiterReasoningEffort?: 'low' | 'medium' | 'high' | ''; arbiterAllFindings?: boolean; fallbackModels?: string[]; ignorePatterns?: string[] };
 }
 
 export class ConfigError extends Error {}
@@ -143,7 +150,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     pollIntervalSeconds: e.REPOLENS_POLL_INTERVAL,
     chatProvider: e.CHAT_PROVIDER,
     chatModel: e.CHAT_MODEL,
-    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, discoveryMaxOutput: e.REVIEW_DISCOVERY_MAX_OUTPUT, escalationModel: e.REVIEW_ESCALATION_MODEL, verifierModel: e.REVIEW_VERIFIER_MODEL, dualDiscovery: e.REVIEW_DUAL_DISCOVERY, focusedVerification: e.REVIEW_FOCUSED_VERIFICATION, fallbackModels: e.REVIEW_FALLBACK_MODELS, ignorePatterns: e.REVIEW_IGNORE_PATTERNS },
+    review: { statusContext: e.REVIEW_STATUS_CONTEXT, failOn: e.REVIEW_FAIL_ON, settleSeconds: e.REVIEW_SETTLE_SECONDS, maxRetries: e.REVIEW_MAX_RETRIES, discoveryMaxOutput: e.REVIEW_DISCOVERY_MAX_OUTPUT, escalationModel: e.REVIEW_ESCALATION_MODEL, escalationReasoningEffort: e.REVIEW_ESCALATION_REASONING_EFFORT, verifierModel: e.REVIEW_VERIFIER_MODEL, verifierReasoningEffort: e.REVIEW_VERIFIER_REASONING_EFFORT, dualDiscovery: e.REVIEW_DUAL_DISCOVERY, focusedVerification: e.REVIEW_FOCUSED_VERIFICATION, arbiterModel: e.REVIEW_ARBITER_MODEL, arbiterReasoningEffort: e.REVIEW_ARBITER_REASONING_EFFORT, arbiterAllFindings: e.REVIEW_ARBITER_ALL_FINDINGS, fallbackModels: e.REVIEW_FALLBACK_MODELS, ignorePatterns: e.REVIEW_IGNORE_PATTERNS },
     github: {
       token: e.GITHUB_TOKEN,
       app: e.GITHUB_APP_ID ? { appId: e.GITHUB_APP_ID, installationId: e.GITHUB_APP_INSTALLATION_ID, privateKeyPath: e.GITHUB_APP_PRIVATE_KEY_PATH } : undefined,
