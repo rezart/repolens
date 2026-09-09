@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT, focusedVerifierSystemPrompt } from '../../src/review/prompts.js';
+import { buildFileReviewMessage, buildSummaryMessage, FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, FOLLOWUP_SUMMARY_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT, focusedVerifierSystemPrompt } from '../../src/review/prompts.js';
 import type { Lineage } from '../../src/review/lineage.js';
 import type { HistoricalPr } from '../../src/review/history.js';
 
@@ -107,6 +107,11 @@ describe('system prompts', () => {
     expect(CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT).not.toMatch(/provisionalFindings|primary finding prose/i);
   });
 
+  it('requires demonstrated contract mismatches for changed declarations', () => {
+    expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/changed API or callback declarations.*callers, registration sites, and sibling conventions/i);
+    expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/demonstrated contract mismatch/i);
+  });
+
   it('tell the model how to treat the previous review', () => {
     expect(FILE_REVIEW_SYSTEM_PROMPT).toMatch(/previous RepoLens review/i);
     expect(FOLLOWUP_SUMMARY_SYSTEM_PROMPT).toMatch(/previous review/i);
@@ -139,6 +144,30 @@ describe('system prompts', () => {
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/generic.*(?:security|performance|limit)/i);
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/exhaustive whole-program proof/i);
     expect(VERIFIER_SYSTEM_PROMPT).toMatch(/trigger.*consequence/i);
+  });
+
+  it('rejects failures that the pull request did not introduce or worsen', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/removedEvidence.*equivalent.*predates.*contradicted/i);
+    expect(focusedVerifierSystemPrompt()).toMatch(/removedEvidence.*equivalent.*predates.*contradicted/i);
+  });
+
+  it('rejects intended feature behavior and hypothetical nullability without a violated contract', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/explicit feature mode.*violated contract/i);
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/DOM lookup.*nullable.*authoritative evidence/i);
+    expect(focusedVerifierSystemPrompt()).toMatch(/explicit feature mode.*violated contract/i);
+    expect(focusedVerifierSystemPrompt()).toMatch(/DOM lookup.*nullable.*authoritative evidence/i);
+  });
+
+  it('requires repository evidence for compatibility and attacker-control claims', () => {
+    for (const prompt of [BATCH_REVIEW_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, focusedVerifierSystemPrompt()]) {
+      expect(prompt).toMatch(/compatibility.*repository-declared supported version/i);
+      expect(prompt).toMatch(/security.*attacker-controlled input.*protection/i);
+    }
+  });
+
+  it('requires callee evidence for claimed throws and rejections', () => {
+    expect(VERIFIER_SYSTEM_PROMPT).toMatch(/(?:throws|rejects).*callee.*contract evidence.*call site/i);
+    expect(focusedVerifierSystemPrompt()).toMatch(/(?:throws|rejects).*callee.*contract evidence.*call site/i);
   });
 
   it('keeps focused verification evidence safeguards in its binary contract', () => {

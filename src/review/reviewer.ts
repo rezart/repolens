@@ -3,7 +3,7 @@ import { matchesGlob } from 'node:path';
 import { createHash } from 'node:crypto';
 import { reviewCallCost } from '../usage/review-cost.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT } from './budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT } from './budget.js';
 import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
 import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
@@ -31,7 +31,7 @@ export type Verdict = 'approve' | 'comment' | 'request_changes';
 export type FindingCategory = 'correctness' | 'edge_case' | 'security' | 'test_gap' | 'repository_rule';
 export type FindingConfidence = 'high' | 'medium' | 'low';
 
-export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] = []): Record<string, unknown> {
+function buildStructuredReviewJsonSchema(paths: string[], primaryIds?: string[], allowedLines?: number[]): Record<string, unknown> {
   const stringEnum = (values: readonly string[]) => ({ type: 'string', enum: [...values] });
   const evidence = {
     type: 'object',
@@ -39,7 +39,7 @@ export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] 
     required: ['path', 'line', 'trigger', 'consequence', 'rule'],
     properties: {
       path: stringEnum(paths),
-      line: { type: 'integer' },
+      line: allowedLines ? { type: 'integer', enum: allowedLines } : { type: 'integer' },
       trigger: { type: 'string' },
       consequence: { type: 'string' },
       rule: {
@@ -61,7 +61,7 @@ export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] 
     required: ['path', 'line', 'severity', 'title', 'body', 'category', 'confidence', 'rootCause', 'evidence'],
     properties: {
       path: stringEnum(paths),
-      line: { type: 'integer' },
+      line: allowedLines ? { type: 'integer', enum: allowedLines } : { type: 'integer' },
       severity: stringEnum(['critical', 'warning', 'nit']),
       title: { type: 'string' },
       body: { type: 'string' },
@@ -71,25 +71,58 @@ export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] 
       evidence,
     },
   };
-  return {
-    type: 'object',
-    additionalProperties: false,
-    required: ['reviewedPaths', 'decisions', 'findings'],
-    properties: {
+  const properties: Record<string, unknown> = {
       reviewedPaths: {
         type: 'array', minItems: paths.length, maxItems: paths.length,
         items: stringEnum(paths),
       },
-      decisions: {
-        type: 'array', minItems: primaryIds.length, maxItems: primaryIds.length,
-        items: {
-          type: 'object', additionalProperties: false, required: ['id', 'decision'],
-          properties: { id: stringEnum(primaryIds), decision: stringEnum(['retain', 'reject', 'uncertain']) },
-        },
-      },
       findings: { type: 'array', items: finding },
+  };
+  const required = ['reviewedPaths'];
+  if (primaryIds) {
+    properties.decisions = {
+      type: 'array', minItems: primaryIds.length, maxItems: primaryIds.length,
+      items: {
+        type: 'object', additionalProperties: false, required: ['id', 'decision'],
+        properties: { id: stringEnum(primaryIds), decision: stringEnum(['retain', 'reject', 'uncertain']) },
+      },
+    };
+    required.push('decisions', 'findings');
+  } else {
+    required.push('findings');
+    properties.summary = { type: 'string' };
+    properties.verdict = stringEnum(['approve', 'comment', 'request_changes']);
+    required.push('summary', 'verdict');
+  }
+  return {
+    type: 'object', additionalProperties: false, required, properties,
+  };
+}
+
+export function buildEscalationJsonSchema(paths: string[], primaryIds: string[] = []): Record<string, unknown> {
+  return buildStructuredReviewJsonSchema(paths, primaryIds);
+}
+
+export function buildBatchReviewJsonSchema(files: Array<{ path: string; allowedFindingLines: number[] }>): Record<string, unknown> {
+  const paths = files.map((file) => file.path);
+  const allowedLines = [...new Set(files.flatMap((file) => file.allowedFindingLines))].sort((a, b) => a - b);
+  return buildStructuredReviewJsonSchema(paths, undefined, allowedLines);
+}
+
+export function buildArbiterJsonSchema(ids: number[]): Record<string, unknown> {
+  const decision = {
+    type: 'object', additionalProperties: false,
+    required: ['id', 'decision', 'explanation', 'evidence'],
+    properties: {
+      id: { type: 'integer', enum: ids },
+      decision: { type: 'string', enum: ['supported', 'contradicted'] },
+      explanation: { type: 'string' },
+      evidence: { type: 'object', additionalProperties: false, required: ['path', 'line'], properties: { path: { type: 'string' }, line: { type: 'integer' } } },
     },
   };
+  return { type: 'object', additionalProperties: false, required: ['decisions'], properties: {
+    decisions: { type: 'array', minItems: ids.length, maxItems: ids.length, items: decision },
+  } };
 }
 
 export interface FindingEvidence {
@@ -174,16 +207,23 @@ export interface ReviewTrace {
   version: 1;
   identity: { repoId: string; prNumber: number; headSha: string; baseSha: string; provider: string; model: string; config: { maxRetries: number; maxFiles: number } };
   stages: Array<{
-    stage: 'initial' | 'escalation' | 'verification' | 'final';
+    stage: 'initial' | 'escalation' | 'verification' | 'arbitration' | 'final';
     selectedPaths: string[];
     hunks: Array<{ path: string; lines: number[] }>;
     omittedContext: number;
-    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass?: 'normal' | 'focused' }>;
+    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass?: 'normal' | 'focused' | 'evidence'; elapsedMs?: number }>;
     findingCount: number;
     primaryFindings?: ReviewTraceFinding[];
     decisions?: Array<{ id: string | number; decision: string }>;
     focusedDecisions?: Array<{ id: string | number; decision: string }>;
-    focusedSkipped?: 'budget';
+    evidenceDecisions?: Array<{ id: string | number; decision: string }>;
+    focusedSkipped?: 'budget' | 'disabled';
+    missingEvidence?: {
+      requested: Array<{ path?: string; symbol: string; question: string }>;
+      acquired: Array<{ path: string; lines: number[] }>;
+      authoritativeEvidenceAdded: boolean;
+      unresolved: Array<{ id: number; reason: string }>;
+    };
     findings?: ReviewTraceFinding[];
   }>;
   finalFindings: ReviewTraceFinding[];
@@ -196,8 +236,16 @@ export interface ReviewDeps {
   escalationLlm?: LLMProvider;
   /** Optional cheap backend used to verify provisional findings. */
   verifierLlm?: LLMProvider;
+  /** Optional fail-closed arbiter for verifier contradictions. */
+  arbiterLlm?: LLMProvider;
+  /** When enabled, send every non-duplicate verifier candidate to the arbiter. */
+  arbiterAllFindings?: boolean;
   /** Run the independent contract/concurrency discovery view when true. */
   dualDiscovery?: boolean;
+  /** Recheck verifier-uncertain findings with a focused call. */
+  focusedVerification?: boolean;
+  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 6000. */
+  discoveryMaxOutput?: number;
   retrieve: RetrieveFn;
   github: Pick<
     GitHubClient,
@@ -244,6 +292,17 @@ export interface ReviewOptions {
 }
 
 const SEVERITIES: readonly Severity[] = ['critical', 'warning', 'nit'];
+const SEVERITY_ALIASES: Readonly<Record<string, Severity>> = {
+  blocker: 'critical', error: 'critical', high: 'critical',
+  medium: 'warning', moderate: 'warning',
+  low: 'nit', info: 'nit', informational: 'nit',
+};
+
+function normalizeSeverity(raw: unknown): Severity | null {
+  if (typeof raw !== 'string') return null;
+  const value = raw.toLowerCase().trim();
+  return SEVERITIES.includes(value as Severity) ? value as Severity : SEVERITY_ALIASES[value] ?? null;
+}
 
 const LOCKFILES = new Set([
   'package-lock.json',
@@ -365,15 +424,36 @@ export function selectRelevantChunks(chunks: RetrievedChunk[], identifiers: stri
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map((item) => item.chunk);
 }
 
+function changedSymbolNames(path: string, text: string): string[] {
+  const names: string[] = [];
+  const add = (name: string) => {
+    if (name.length >= 2 && !CONTEXT_KEYWORDS.has(name.toLowerCase()) && !names.includes(name)) names.push(name);
+  };
+  for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:def|function)\s+([A-Za-z_$][\w$]*[!?]?)(?=\s*\()/g)) add(match[1]!);
+  for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/g)) add(match[1]!);
+  if (/\.(?:rb|rake)$/i.test(path)) {
+    for (const match of text.matchAll(/(?:^|\n)\s*def\s+([A-Za-z_][\w]*[!?]?)(?=\s*(?:\([^)]*\))?\s*(?:#.*)?(?:\r?\n|$))/g)) add(match[1]!);
+  }
+  for (const match of text.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)) add(match[1]!);
+  if (/\.(?:rb|rake)$/i.test(path)) {
+    for (const line of text.split(/\r?\n/)) {
+      const args = line.match(/^\s*attributes?\s+((?::[A-Za-z_][\w!?]*)(?:\s*,\s*:[A-Za-z_][\w!?]*)*)/)?.[1];
+      for (const match of args?.matchAll(/:([A-Za-z_][\w!?]*)/g) ?? []) add(match[1]!);
+    }
+  }
+  return names.slice(0, 2);
+}
+
 export function contextQuery(path: string, changedText: string, identifiers: (text: string) => string[]): { stem: string; symbols: string[] } {
   const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
   const pathTerms = path.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? [];
+  const declarations = changedSymbolNames(path, changedText);
   const raw = [...new Set([...identifiers(changedText), ...(changedText.match(IDENTIFIER_RE) ?? [])])];
   const precise = raw.filter((term) => isCodeLikeTerm(term, changedText));
   const strong = precise.filter((term) => /[a-z][A-Z]/.test(term) || /^[A-Z]{2,}$/.test(term) || term.includes('_') || term.includes('$'));
   const ordinary = precise.filter((term) => !strong.includes(term) && !/^[A-Z][a-z]+$/.test(term));
   const weak = precise.filter((term) => !strong.includes(term) && !ordinary.includes(term));
-  const symbols = [...new Set([...strong, ...ordinary, ...pathTerms, ...weak])]
+  const symbols = [...new Set([...declarations, ...strong, ...ordinary, ...pathTerms, ...weak])]
     .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()));
   return { stem, symbols };
 }
@@ -601,12 +681,33 @@ function headSnippet(path: string, content: string, relevantLines: number[]): He
   return { path, revision: 'head', lines: numberedHeadLines(content, relevantLines, HEAD_SNIPPET_CHARS_MAX) };
 }
 
-function matchingHeadLines(content: string, terms: Set<string>): number[] {
+function matchingHeadLines(content: string, terms: Set<string>, fallback = true): number[] {
   const lowerTerms = [...terms].map((term) => term.toLowerCase());
-  if (!lowerTerms.length) return [1];
+  if (!lowerTerms.length) return fallback ? [1] : [];
   const lines = content.split(/\r?\n/);
-  const matches = lines.flatMap((line, index) => lowerTerms.some((term) => line.toLowerCase().includes(term)) ? [index + 1] : []);
-  return matches.length ? matches : [1];
+  const matches = lines.flatMap((line, index) => lowerTerms.some((term) =>
+    new RegExp(`(?:^|[^a-z0-9_$])${escapedTerm(term)}(?:$|[^a-z0-9_$])`, 'i').test(line)) ? [index + 1] : []);
+  return matches.length ? matches : fallback ? [1] : [];
+}
+
+function relatedChangedHeadPaths(path: string, addedText: string, headContents: Map<string, string>): Array<{ path: string; lines: number[] }> {
+  const names = changedSymbolNames(path, addedText);
+  if (!names.length) return [];
+  const exact = (line: string, name: string) => new RegExp(
+    `(?<![A-Za-z0-9_$?!])${escapedTerm(name)}(?![A-Za-z0-9_$?!])`, 'i',
+  ).test(line);
+  return [...headContents].flatMap(([other, content], index) => {
+    if (other === path) return [];
+    const lines = content.split(/\r?\n/).flatMap((line, lineIndex) =>
+      names.some((name) => exact(line, name)) ? [lineIndex + 1] : []);
+    return lines.length ? [{
+      path: other,
+      lines,
+      index,
+      preferred: /(^|\/)(?:test|tests|spec|specs)(\/|$)|(?:\.|_)(?:test|spec)\b/i.test(other),
+    }] : [];
+  }).sort((a, b) => Number(b.preferred) - Number(a.preferred) || a.index - b.index)
+    .slice(0, 2).map(({ path: related, lines }) => ({ path: related, lines }));
 }
 
 /**
@@ -682,16 +783,20 @@ function collectHeadEvidence(input: {
 
   const snippets: HeadEvidence[] = [];
   let used = 0;
-  for (const referenced of [...imported, ...byExport]) {
+  const related = relatedChangedHeadPaths(path, addedText, headContents);
+  const addChangedSnippet = (referenced: string, lines?: number[]) => {
+    if (referenced === path || snippets.some((snippet) => snippet.path === referenced)) return;
     const content = headContents.get(referenced);
-    if (content === undefined) continue;
+    if (content === undefined) return;
     const terms = new Set([...mentioned, referenced.slice(referenced.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '')]);
-    const snippet = headSnippet(referenced, content, matchingHeadLines(content, terms));
+    const snippet = headSnippet(referenced, content, lines ?? matchingHeadLines(content, terms));
     const block = renderHeadEvidence(snippet, 'content after this pull request; bounded snippet');
-    if (used + block.length > HEAD_CONTEXT_CHARS_MAX) break;
+    if (used + block.length > HEAD_CONTEXT_CHARS_MAX) return;
     snippets.push(snippet);
     used += block.length + 2;
-  }
+  };
+  for (const { path: referenced, lines } of related) addChangedSnippet(referenced, lines);
+  for (const referenced of [...imported, ...byExport]) addChangedSnippet(referenced);
   for (const [referenced, content] of input.referencedHeadContents ?? []) {
     if (referenced === path || headContents.has(referenced) || snippets.some((snippet) => snippet.path === referenced)) continue;
     const snippet = headSnippet(referenced, content, input.referencedHeadLines?.get(referenced) ?? [1]);
@@ -834,10 +939,79 @@ function headRelevantLines(file: DiffFile, hunks = file.hunks): number[] {
 
 type VerifierContextFile = {
   path: string;
+  diff?: string;
   currentEvidence?: Array<{ line?: number }>;
+  removedEvidence?: Array<{ line?: number }>;
   headContext?: string;
   headEvidence?: HeadEvidence[];
 };
+
+export function compactArbitrationFiles(files: VerifierContextFile[], findings: Finding[]): VerifierContextFile[] {
+  const ownerPaths = new Set(findings.map((finding) => finding.path));
+  const findingText = findings.map((finding) => `${finding.title} ${finding.body} ${finding.rootCause} ${finding.evidence?.trigger ?? ''}`).join(' ');
+  const terms = new Set([
+    ...(findingText.match(/[A-Za-z_$][\w$]*/g) ?? []),
+    ...[...findingText.matchAll(/`([^`]+)`/g)].map((match) => match[1]!),
+  ].filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()) &&
+    (term.includes('_') || term.includes('$') || /[a-z][A-Z]/.test(term) || /^[A-Z][a-z]+$/.test(term))));
+  const matchesTerm = (text: string) => [...terms].some((term) =>
+    new RegExp(`(?:^|[^A-Za-z0-9_$])${escapedTerm(term)}(?:$|[^A-Za-z0-9_$])`, 'i').test(text));
+  const compacted: VerifierContextFile[] = [];
+  let used = 0;
+  for (const file of files) {
+    const owner = ownerPaths.has(file.path);
+    if (!owner) continue;
+    const lines = findings.filter((finding) => finding.path === file.path).map(findingLine);
+    const near = (line: number) => lines.some((anchor) => Math.abs(anchor - line) <= 10);
+    const headEvidence = file.headEvidence?.map((snippet) => ({
+      ...snippet,
+      lines: snippet.path === file.path
+        ? snippet.lines.filter((item) => near(item.line))
+        : snippet.lines.some((item) => matchesTerm(item.text)) ? snippet.lines : [],
+    })).filter((snippet) => snippet.lines.length > 0);
+    const ownerEvidence = headEvidence?.filter((snippet) => snippet.path === file.path) ?? [];
+    const relatedEvidence = headEvidence?.filter((snippet) => snippet.path !== file.path) ?? [];
+    const compact: VerifierContextFile = {
+      path: file.path,
+      ...(owner && file.currentEvidence ? { currentEvidence: file.currentEvidence.filter((item) => item.line === undefined || near(item.line)) } : {}),
+      ...(ownerEvidence.length || relatedEvidence.length ? { headEvidence: ownerEvidence } : {}),
+    };
+    const size = JSON.stringify(compact).length;
+    if (used + size > 8_000) continue;
+    for (const snippet of relatedEvidence) {
+      const candidate = { ...compact, headEvidence: [...(compact.headEvidence ?? []), snippet] };
+      if (used + JSON.stringify(candidate).length > 8_000) continue;
+      compact.headEvidence = candidate.headEvidence;
+    }
+    compacted.push(compact);
+    used += JSON.stringify(compact).length;
+  }
+  return compacted;
+}
+
+const MISSING_EVIDENCE_REQUESTS_MAX = 4;
+const MISSING_EVIDENCE_FILES_MAX = 4;
+const MISSING_EVIDENCE_STRING_MAX = 180;
+
+type MissingEvidenceRequest = { path?: string; symbol: string; question: string };
+
+function parseMissingEvidenceRequests(value: unknown, changedPaths: string[]): MissingEvidenceRequest[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return [];
+  const changed = new Set(changedPaths);
+  return value.slice(0, MISSING_EVIDENCE_REQUESTS_MAX).flatMap((item): MissingEvidenceRequest[] => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    if (Object.keys(record).some((key) => !['path', 'symbol', 'question'].includes(key))) return [];
+    const path = typeof record.path === 'string' ? record.path.trim() : undefined;
+    const symbol = typeof record.symbol === 'string' ? record.symbol.trim() : undefined;
+    const question = typeof record.question === 'string' ? record.question.replace(/\s+/g, ' ').trim() : '';
+    if (!symbol || !question || question.length > MISSING_EVIDENCE_STRING_MAX ||
+        (path !== undefined && (path.length > MISSING_EVIDENCE_STRING_MAX || path.startsWith('/') || /[\\:\0]/.test(path) || path !== normalizeRepoPath(path) || path.split('/').includes('..') || !isReviewablePath(path) || changed.has(path))) ||
+        symbol.length > MISSING_EVIDENCE_STRING_MAX || !/^[A-Za-z_$][\w$?!]*(?:[./][A-Za-z_$][\w$?!]*)*$/.test(symbol)) return [];
+    return [{ ...(path ? { path } : {}), symbol, question }];
+  });
+}
 
 function verifierCitationLines(file: VerifierContextFile): Set<string> {
   const cited = new Set<string>();
@@ -895,9 +1069,11 @@ export function parseFindings(raw: string, file: DiffFile): Finding[] {
     const title = typeof e.title === 'string' ? e.title.trim() : '';
     const body = typeof e.body === 'string' ? e.body.trim() : '';
     if (!title && !body) throw new Error(`model output contains an empty finding for ${path}`);
-    const sevRaw = typeof e.severity === 'string' ? e.severity.toLowerCase().trim() : '';
-    if (!(SEVERITIES as readonly string[]).includes(sevRaw)) throw new Error(`model output contains an invalid finding severity for ${path}`);
-    const severity = sevRaw as Severity;
+    const severity = normalizeSeverity(e.severity);
+    if (!severity) {
+      const rawSeverity = typeof e.severity === 'string' ? JSON.stringify(e.severity) : String(e.severity);
+      throw new Error(`model output contains an invalid finding severity ${rawSeverity} for ${path}`);
+    }
     const category = typeof e.category === 'string' ? e.category.trim() : '';
     if (!(['correctness', 'edge_case', 'security', 'test_gap', 'repository_rule'] as const).includes(category as FindingCategory)) {
       throw new Error(`model output contains an invalid finding category for ${path}`);
@@ -1004,6 +1180,37 @@ function primaryFindingIds(findings: Finding[]): string[] {
     counts.set(base, count + 1);
     return count ? `${base}:${count}` : base;
   });
+}
+
+export function selectArbitrationCandidates(findings: Finding[], decisions: Array<{ id: number; decision: string }>, allFindings = false, duplicateIds: Set<number> = new Set()): Array<{ id: number; finding: Finding }> {
+  return decisions.filter((decision) => (allFindings || decision.decision !== 'supported') && !duplicateIds.has(decision.id) && findings[decision.id])
+    .map((decision) => ({ id: decision.id, finding: findings[decision.id]! }));
+}
+
+export function restoreArbitratedFindings(findings: Finding[], candidates: Array<{ id: number; finding: Finding }>, decisions: Array<{ id: number; decision: string }>): Finding[] {
+  const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id));
+  return [...findings, ...candidates.filter(({ id }) => supported.has(id)).map(({ finding }) => verifiedFinding(finding))];
+}
+
+function verifiedFinding(finding: Finding): Finding {
+  return finding.severity === 'nit' ? { ...finding, severity: 'warning' } : finding;
+}
+
+export function suppressDuplicateFindings(findings: Finding[], decisions: Array<{ id: number; decision: string; duplicateOf?: number | null }>): Finding[] {
+  const byId = new Map(decisions.map((decision) => [decision.id, decision]));
+  const links = new Map(decisions.filter((decision) => decision.duplicateOf !== undefined && decision.duplicateOf !== null).map((decision) => [decision.id, decision.duplicateOf!]));
+  for (const [id, target] of links) {
+    if (byId.get(id)?.decision !== 'supported' || byId.get(target)?.decision !== 'supported') throw new Error('duplicate finding links require supported findings');
+    const seen = new Set<number>([id]);
+    let current = target;
+    while (links.has(current)) {
+      if (seen.has(current)) throw new Error('invalid duplicate finding cycle');
+      seen.add(current);
+      current = links.get(current)!;
+    }
+    if (current < 0 || current >= findings.length || current === id) throw new Error('invalid duplicate finding reference');
+  }
+  return findings.filter((_, id) => !links.has(id));
 }
 
 function verdictForFindings(findings: Finding[]): Verdict {
@@ -1184,13 +1391,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   let costUsd: number | null = 0;
   let reservedUsd = 0;
   let usedUsd = 0;
-  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' }> = [];
-  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' = 'normal'): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
+  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification' | 'arbitration'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' | 'evidence'; elapsedMs: number }> = [];
+  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
-    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass } : undefined;
+    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass, elapsedMs: 0 } : undefined;
     if (traceCall) traceCalls.push(traceCall);
     const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
-    if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > REVIEW_MAX_USD) {
+    const started = Date.now();
+    if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > ceiling) {
+      if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
     if (req.reviewBudget && !alreadyReserved) reservedUsd += estimate;
@@ -1204,6 +1413,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       threw = true;
       error = err;
     } finally {
+      if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       const next = costUsd !== null && call.reported && call.costUsd !== null ? costUsd + call.costUsd : null;
       costUsd = next !== null && Number.isFinite(next) ? next : null;
     }
@@ -1229,9 +1439,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const trace = traceCalls[traceIndex];
     if (trace) { trace.outcome = 'validation_error'; trace.failure = errMessage(error); }
   };
-  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean): Promise<T> => {
+  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<T> => {
     const run = async (request: CompleteRequest) => {
-      const call = await completeCall(request, provider);
+      const call = await completeCall(request, provider, false, pass, ceiling);
       if (call.failed) {
         if (call.error instanceof JsonExtractError || call.error instanceof IncompleteResponseError) markTraceValidation(call.traceIndex, call.error);
         throw call.error;
@@ -1422,6 +1632,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     }
 
     const budgeted = llm.supportsBatchReview === true;
+    const discoveryMaxOutput = Math.min(
+      REVIEW_ESCALATION_MAX_OUTPUT,
+      Math.max(1, Number.isInteger(deps.discoveryMaxOutput) ? deps.discoveryMaxOutput! : REVIEW_MAX_OUTPUT),
+    );
     // Read head files before final filtering so an unchanged generated header
     // outside the diff still suppresses the review.
     const headContents = new Map<string, string>();
@@ -1460,9 +1674,16 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let primaryTrace: Finding[] = [];
     let escalationDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
     let escalationFindingsTrace: Finding[] | undefined;
-    let verifierDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let verifierDecisionsTrace: Array<{ id: string | number; decision: string; duplicateOf?: number | null }> | undefined;
     let verifierFocusedDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
-    let verifierFocusedSkipped: 'budget' | undefined;
+    let verifierEvidenceDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let arbitrationDecisionsTrace: Array<{ id: string | number; decision: string }> | undefined;
+    let arbitrationFiles: DiffFile[] = [];
+    let arbitrationExecuted = false;
+    let verifierFocusedSkipped: 'budget' | 'disabled' | undefined;
+    let verifierMissingEvidenceTrace: ReviewTrace['stages'][number]['missingEvidence'];
+    let evidenceRoundEnabled = true;
+    let evidenceRoundDisabledReason: string | undefined;
     let verifierSelectedPaths = new Set<string>();
     let verifierExecuted = false;
     let verifierFindingsTrace: Finding[] = [];
@@ -1610,7 +1831,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             delta: lineage.previous ? deltaForFile(lineage.previous, f.newPath ?? f.oldPath!) : undefined,
           })),
         }) }],
-        json: true, maxTokens: REVIEW_MAX_OUTPUT, reviewBudget: true, reviewStage: 'initial',
+        json: true, jsonSchema: buildBatchReviewJsonSchema(files.map((f) => ({ path: f.newPath ?? f.oldPath!, allowedFindingLines: [...allowedFindingLines(f)] }))),
+        maxTokens: discoveryMaxOutput, reviewBudget: true, reviewStage: 'initial',
       };
       // Reject the core prompt before the retrieval loop or any inference call.
       const coreCost = reviewCostUpperBound(req);
@@ -1845,7 +2067,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         const scopedReferencedHeadContents = referencedHeadContentsByVerifierPath.get(path);
         const scopedReferencedHeadLines = referencedHeadLinesByVerifierPath.get(path);
         const headEvidence = buildHeadEvidence({
-          path, addedText: hunkText({ ...file, hunks }, Infinity),
+          path, addedText: hunks.flatMap((hunk) => hunk.lines.filter((line) => line.type === 'add').map((line) => line.content)).join('\n'),
           relevantLines: [...headRelevantLines(file, hunks), ...lines], headContents,
           referencedHeadContents: scopedReferencedHeadContents, referencedHeadLines: scopedReferencedHeadLines, exportsByPath,
         });
@@ -1859,19 +2081,20 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
             line: line.oldLine, kind: 'removed', content: line.content,
           }])),
-          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => snippet.path === path) : headEvidence,
+          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => headContents.has(snippet.path) || scopedReferencedHeadContents?.has(snippet.path)) : headEvidence,
           ...(!trimOptionalContext && packedContext ? { relevantContext: packedContext } : {}),
         }];
       });
     };
     const verifierRequest = (candidateFindings: Finding[], trimOptionalContext = false, system = VERIFIER_SYSTEM_PROMPT, candidateIds?: number[]): CompleteRequest => ({
-      system,
+      system: system === VERIFIER_SYSTEM_PROMPT ? `${system} Every decision must include evidence (use null only for uncertain decisions) and duplicateOf (use null unless it is a supported downstream duplicate). Always include missingEvidence (an array of {symbol,path,question}), summary, and verdict.` : system,
       messages: [{ role: 'user', content: JSON.stringify({
         rules, files: buildVerifierFiles(candidateFindings, trimOptionalContext),
         ...(!trimOptionalContext && staticEvidence.length ? { staticEvidence: verifierStaticEvidence(candidateFindings) } : {}),
         findings: candidateFindings.map((finding, id) => ({ id: candidateIds?.[id] ?? id, finding })),
       }) }],
-      json: true, maxTokens: 4000, reviewBudget: budgeted, reviewStage: 'verification',
+      json: true,
+      maxTokens: REVIEW_VERIFIER_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'verification',
     });
     if (escalationLlm && riskyFiles.length) {
       await assertHeadUnchanged();
@@ -1921,23 +2144,42 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const primaryIds = primaryFindingIds(primaryFindings);
       const primaryById = new Map(primaryIds.map((id, index) => [id, primaryFindings[index]!]));
       escalationPayload.provisionalFindings = primaryFindings.map((finding, index) => ({ id: primaryIds[index]!, finding }));
-      const escalationRequest = () => ({
+      const escalationRequest = (payload = escalationPayload) => ({
         system: ESCALATION_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
+        messages: [{ role: 'user', content: JSON.stringify(payload) }],
         json: true, jsonSchema: buildEscalationJsonSchema(paths, primaryIds), maxTokens: REVIEW_ESCALATION_MAX_OUTPUT,
         reviewBudget: budgeted, reviewStage: 'escalation',
       } satisfies CompleteRequest);
-      const verifierReserve = budgeted && verifierLlm ? (() => {
-        const full = verifierRequest(findings);
-        const trimmed = verifierRequest(findings, true);
+      const reserveRequest = (request: CompleteRequest) => ({
+        ...request,
         // ponytail: reserve four UTF-8 bytes per possible escalation output token;
         // replace with provider tokenization if added-finding payloads need tighter packing.
-        full.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
-        trimmed.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
-        const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
+        messages: [{ ...request.messages[0]!, content: `${request.messages[0]!.content}\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}` }, ...request.messages.slice(1)],
+      });
+      const requiredEscalationPayload = {
+        ...escalationPayload,
+        rules: undefined,
+        files: escalationPayload.files.map(({ headContext, relevantContext, historical, ...file }) => file),
+      };
+      const escalationBaseEstimate = reviewCostUpperBound(escalationRequest(requiredEscalationPayload));
+      const verifierReserve = budgeted && verifierLlm ? (() => {
+        const full = reserveRequest(verifierRequest(findings));
+        const trimmed = reserveRequest(verifierRequest(findings, true));
+        const reserve = reviewCostUpperBound(full) + escalationBaseEstimate <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
         return reviewCostUpperBound(reserve);
       })() : 0;
-      const remaining = budgeted ? REVIEW_MAX_USD - reservedUsd - verifierReserve : Number.POSITIVE_INFINITY;
+      const evidenceReserve = budgeted && verifierLlm ? reviewCostUpperBound(reserveRequest(verifierRequest(findings, true))) : 0;
+      if (budgeted && reservedUsd + escalationBaseEstimate + verifierReserve + evidenceReserve > REVIEW_MAX_USD) {
+        evidenceRoundEnabled = false;
+        evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
+      }
+      const enabledEvidenceReserve = evidenceRoundEnabled ? evidenceReserve : 0;
+      const escalationCeiling = budgeted
+        ? REVIEW_MAX_USD - verifierReserve - enabledEvidenceReserve
+        : REVIEW_MAX_USD;
+      const remaining = budgeted
+        ? escalationCeiling - reservedUsd
+        : Number.POSITIVE_INFINITY;
       const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
       let omitted = 0;
       let req = escalationRequest();
@@ -1985,7 +2227,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       const escalationResult = await completeStructured(req, escalationLlm, parseEscalation,
         riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })),
-        () => consumeRetryAllowance(true));
+        () => consumeRetryAllowance(true), 'normal', escalationCeiling);
       const { decisions, escalated } = escalationResult;
       escalationDecisionsTrace = decisions.map((decision) => ({ id: decision.id as string, decision: String(decision.decision) }));
       escalationFindingsTrace = escalated.slice();
@@ -1998,7 +2240,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     findings = deduplicateProvisionalCandidates(findings);
     findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
-    if (verifierLlm && findings.length) {
+    if (verifierLlm && findings.length > 0) {
       await assertHeadUnchanged();
       // The initial retrieval only knows the diff. Refresh each finding's
       // context with its implicated identifiers/callees before verification.
@@ -2047,9 +2289,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         }
       }
       await assertHeadUnchanged();
-      const fullVerifierReq = verifierRequest(findings);
-      const verifierReq = !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd
-        ? fullVerifierReq : verifierRequest(findings, true);
+      const verifierSystem = deps.arbiterLlm ? focusedVerifierSystemPrompt() : VERIFIER_SYSTEM_PROMPT;
+      const fullVerifierReq = verifierRequest(findings, false, verifierSystem);
+      const verifierReq = deps.arbiterLlm ? verifierRequest(findings, true, verifierSystem)
+        : !budgeted || reviewCostUpperBound(fullVerifierReq) <= REVIEW_MAX_USD - reservedUsd ? fullVerifierReq : verifierRequest(findings, true, verifierSystem);
+      const evidenceReserveReq = verifierRequest(findings, true, verifierSystem);
+      if (budgeted && reservedUsd + reviewCostUpperBound(verifierReq) + reviewCostUpperBound(evidenceReserveReq) > REVIEW_MAX_USD) {
+        evidenceRoundEnabled = false;
+        evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
+      }
       verifierOmittedContext = verifierReq === fullVerifierReq ? 0 : 1;
       const verifierPayload = JSON.parse(verifierReq.messages[0]!.content) as { files: VerifierContextFile[] };
       const verifierFiles = verifierPayload.files;
@@ -2068,31 +2316,180 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const allowedVerifierLines = [...allowedByPath].map(([path, lines]) => ({ path, lines: [...lines].sort((a, b) => a - b) }));
       verifierExecuted = true;
       verifierFindingsTrace = findings.slice();
-      const parseVerification = (raw: string) => {
+      const parseVerification = (raw: string, expectedIds: number[], expectedFiles: VerifierContextFile[]) => {
         const obj = extractJson(raw) as Record<string, unknown>;
         const decisions = Array.isArray(obj?.decisions) ? obj.decisions as Array<Record<string, unknown>> : [];
         const ids = decisions.map((decision) => decision && typeof decision === 'object' && !Array.isArray(decision) ? decision.id : undefined);
         if (decisions.some((decision) => !decision || typeof decision !== 'object' || Array.isArray(decision)) ||
-            decisions.length !== findings.length || new Set(ids).size !== findings.length ||
-            ids.some((id) => !Number.isInteger(id) || (id as number) < 0 || (id as number) >= findings.length) ||
+            decisions.length !== expectedIds.length || new Set(ids).size !== expectedIds.length ||
+            ids.some((id) => !Number.isInteger(id) || !expectedIds.includes(id as number)) ||
             decisions.some((decision) => !['supported', 'contradicted', 'uncertain'].includes(String(decision.decision)) ||
               typeof decision.explanation !== 'string' || !decision.explanation.trim() ||
-              (decision.decision === 'supported' || decision.decision === 'contradicted') && !hasValidVerifierCitation(decision, verifierFiles))) {
+              (decision.duplicateOf !== undefined && decision.duplicateOf !== null && (!Number.isInteger(decision.duplicateOf) || (decision.duplicateOf as number) < 0 || (decision.duplicateOf as number) >= expectedIds.length || decision.duplicateOf === decision.id)) ||
+              (decision.decision === 'supported' || decision.decision === 'contradicted') && !hasValidVerifierCitation(decision, expectedFiles))) {
           throw new IncompleteResponseError(verifierLlm.name, 'Invalid verification response; no review was published.');
         }
-        return decisions;
+        return {
+          decisions,
+          missingEvidence: parseMissingEvidenceRequests(obj?.missingEvidence, changedPaths),
+          missingEvidenceRequested: Object.prototype.hasOwnProperty.call(obj, 'missingEvidence'),
+        };
       };
-      const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines,
+      const initialVerification = await completeStructured(verifierReq, verifierLlm, (raw) => parseVerification(raw, findings.map((_, id) => id), verifierFiles), allowedVerifierLines,
         () => consumeRetryAllowance(true));
+      const decisions = initialVerification.decisions;
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
-      const uncertainCandidates = decisions.filter((decision) => decision.decision === 'uncertain')
-        .map((decision) => ({ id: decision.id as number, finding: findings[decision.id as number] }))
-        .filter((candidate): candidate is { id: number; finding: Finding } => Boolean(candidate.finding));
+      const duplicateIds = new Set(decisions.filter((decision) => decision.duplicateOf !== undefined && decision.duplicateOf !== null).map((decision) => decision.id as number));
+      const allFindingsArbitration = Boolean(deps.arbiterLlm && deps.arbiterAllFindings);
+      const arbitrationCandidates = selectArbitrationCandidates(findings, decisions as Array<{ id: number; decision: string }>, allFindingsArbitration, duplicateIds);
+      const arbitrationIds = new Set(arbitrationCandidates.map(({ id }) => id));
+      const uncertainCandidates = decisions.filter((decision) => decision.decision === 'uncertain' && (!deps.arbiterLlm || !arbitrationIds.has(decision.id as number)))
+        .map((decision) => ({ id: decision.id as number, finding: findings[decision.id as number], reason: String(decision.explanation) }))
+        .filter((candidate): candidate is { id: number; finding: Finding; reason: string } => Boolean(candidate.finding));
       const uncertainFindings = uncertainCandidates.map(({ finding }) => finding);
-      verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
-      findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');
+      verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision), ...(decision.duplicateOf !== undefined ? { duplicateOf: decision.duplicateOf as number | null } : {}) }));
+      try { suppressDuplicateFindings(findings, decisions as Array<{ id: number; decision: string; duplicateOf?: number | null }>); }
+      catch (err) { throw new IncompleteResponseError(verifierLlm.name, errMessage(err)); }
+      const preArbitrationFindings = findings.filter((_, id) => supported.has(id) && !duplicateIds.has(id)).map(verifiedFinding);
+      findings = allFindingsArbitration && arbitrationCandidates.length ? [] : preArbitrationFindings;
 
-      if (uncertainFindings.length) {
+      if (deps.arbiterLlm && arbitrationCandidates.length) {
+        arbitrationExecuted = true;
+        arbitrationFiles = files.filter((file) => arbitrationCandidates.some(({ finding }) => (file.newPath ?? file.oldPath) === finding.path));
+        const arbiterIds = arbitrationCandidates.map(({ id }) => id);
+        const arbiterFindings = arbitrationCandidates.map(({ finding }) => finding);
+        const compactFiles = compactArbitrationFiles(verifierFiles, arbiterFindings);
+        const arbiterReq: CompleteRequest = {
+            system: `${focusedVerifierSystemPrompt()} You are arbitrating prior verifier decisions. Decide supported or contradicted for every candidate; do not return uncertain.`,
+          messages: [{ role: 'user', content: JSON.stringify({ rules, files: compactFiles, findings: arbiterFindings.map((finding, index) => ({ id: arbiterIds[index], finding })) }) }],
+          json: true, jsonSchema: buildArbiterJsonSchema(arbiterIds), maxTokens: REVIEW_ARBITRATION_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'arbitration',
+        };
+        try {
+          const arbiterCall = await completeCall(arbiterReq, deps.arbiterLlm, false, 'normal');
+          if (arbiterCall.failed) throw arbiterCall.error;
+          const arbiterPayload = JSON.parse(arbiterReq.messages[0]!.content) as { files: VerifierContextFile[] };
+          const arbiterResult = parseVerification(arbiterCall.raw!, arbiterIds, arbiterPayload.files);
+          const arbiterDecisions = arbiterResult.decisions;
+          arbitrationDecisionsTrace = arbiterDecisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
+          findings = restoreArbitratedFindings(findings, arbitrationCandidates, arbiterDecisions as Array<{ id: number; decision: string }>);
+        } catch (err) {
+          // Fail closed: disputed findings stay suppressed when arbitration is unavailable.
+          const traceCall = traceCalls.at(-1);
+          if (traceCall?.stage === 'arbitration' && traceCall.outcome === 'success') {
+            traceCall.outcome = 'validation_error';
+            traceCall.failure = errMessage(err);
+          }
+          warnings.push(`Arbitration failed; suppressed ${arbitrationCandidates.length} disputed finding${arbitrationCandidates.length === 1 ? '' : 's'}.`);
+        }
+      }
+
+      const missingEvidenceRequests = initialVerification.missingEvidence;
+      if (uncertainFindings.length && (initialVerification.missingEvidenceRequested || missingEvidenceRequests.length)) {
+        if (!evidenceRoundEnabled) {
+          verifierMissingEvidenceTrace = {
+            requested: missingEvidenceRequests,
+            acquired: [],
+            authoritativeEvidenceAdded: false,
+            unresolved: uncertainCandidates.map(({ id }) => ({ id, reason: evidenceRoundDisabledReason ?? 'Evidence round disabled.' })),
+          };
+        } else {
+        const acquired: Array<{ path: string; lines: number[] }> = [];
+        let authoritativeEvidenceAdded = false;
+        const evidenceOwnerPaths = new Set(uncertainCandidates.map(({ finding }) => finding.path));
+        const evidenceCandidates = new Set<string>();
+        const changedTextByPath = new Map(files.map((file) => [file.newPath ?? file.oldPath!, file.hunks
+          .flatMap((hunk) => hunk.lines.filter((line) => line.type === 'add' || line.type === 'del').map((line) => line.content)).join('\n')]));
+        for (const request of missingEvidenceRequests) {
+          let candidates = request.path ? [request.path] : [];
+          try {
+            const indexed = await retrieve({ repoIds: [opts.repoId], query: [request.path, request.symbol, request.question].filter(Boolean).join(' '), limit: 8, excludePaths: changedPaths });
+            const indexedPaths = new Set(indexed.map((chunk) => chunk.path));
+            if (request.path && !indexedPaths.has(request.path)) candidates = [];
+            if (!request.path) candidates = indexed.map((chunk) => chunk.path);
+          } catch (err) {
+            warnings.push(`missing evidence retrieval failed: ${errMessage(err)}`);
+            candidates = [];
+          }
+          if (!candidates.length && !request.path) {
+            const owner = uncertainCandidates[0]?.finding;
+            if (owner) {
+              const ownerFile = files.find((file) => (file.newPath ?? file.oldPath) === owner.path);
+              if (ownerFile) {
+                try {
+                  const chunks = await retrieveTargetedChunks(retrieve, opts.repoId, owner.path, changedTextByPath.get(owner.path) ?? '', identifiers, changedPaths, [request.symbol, request.question].filter(Boolean).join(' '));
+                  candidates = chunks.map((chunk) => chunk.path);
+                } catch (err) {
+                  warnings.push(`missing evidence retrieval failed: ${errMessage(err)}`);
+                }
+              }
+            }
+          }
+          for (const path of candidates) {
+            if (evidenceCandidates.has(path) || changedPaths.includes(path) || !isReviewablePath(path) || /[\\:\0]/.test(path) || path !== normalizeRepoPath(path) || path.split('/').includes('..')) continue;
+            evidenceCandidates.add(path);
+            if (evidenceCandidates.size > MISSING_EVIDENCE_FILES_MAX) break;
+            if (referencedHeadContents.has(path)) continue;
+            referencedHeadFetched.add(path);
+            try {
+              const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
+              if (content === null) continue;
+              const lines = matchingHeadLines(content, new Set([request.symbol]), false);
+              if (!lines.length) continue;
+              referencedHeadContents.set(path, content);
+              authoritativeEvidenceAdded = true;
+              acquired.push({ path, lines });
+              for (const ownerPath of evidenceOwnerPaths) {
+                const scopedContents = referencedHeadContentsByVerifierPath.get(ownerPath) ?? new Map<string, string>();
+                const scopedLines = referencedHeadLinesByVerifierPath.get(ownerPath) ?? new Map<string, number[]>();
+                scopedContents.set(path, content);
+                scopedLines.set(path, lines);
+                referencedHeadContentsByVerifierPath.set(ownerPath, scopedContents);
+                referencedHeadLinesByVerifierPath.set(ownerPath, scopedLines);
+              }
+            } catch (err) {
+              warnings.push(`${path}: fetching requested head content failed: ${errMessage(err)}`);
+            }
+          }
+          if (evidenceCandidates.size >= MISSING_EVIDENCE_FILES_MAX) break;
+        }
+        const unresolved = uncertainCandidates.map(({ id, reason }) => ({ id, reason }));
+        verifierMissingEvidenceTrace = { requested: missingEvidenceRequests, acquired, authoritativeEvidenceAdded, unresolved };
+        if (authoritativeEvidenceAdded) {
+          await assertHeadUnchanged();
+          const uncertainIds = uncertainCandidates.map(({ id }) => id);
+          const fullEvidenceReq = verifierRequest(uncertainFindings, false, VERIFIER_SYSTEM_PROMPT, uncertainIds);
+          const trimmedEvidenceReq = verifierRequest(uncertainFindings, true, VERIFIER_SYSTEM_PROMPT, uncertainIds);
+          const evidenceReq = !budgeted || reviewCostUpperBound(fullEvidenceReq) <= REVIEW_MAX_USD - reservedUsd
+            ? fullEvidenceReq : trimmedEvidenceReq;
+          if (!budgeted || reviewCostUpperBound(evidenceReq) <= REVIEW_MAX_USD - reservedUsd) {
+            const evidencePayload = JSON.parse(evidenceReq.messages[0]!.content) as { files: VerifierContextFile[] };
+            const evidenceFiles = evidencePayload.files;
+            verifierSelectedPaths = new Set([...verifierSelectedPaths, ...evidenceFiles.map((file) => file.path)]);
+            const evidenceAllowedByPath = new Map<string, Set<number>>();
+            for (const file of evidenceFiles) for (const citation of verifierCitationLines(file)) {
+              const split = citation.lastIndexOf(':');
+              if (split <= 0) continue;
+              const citationPath = citation.slice(0, split);
+              const line = Number(citation.slice(split + 1));
+              if (!Number.isInteger(line) || line <= 0) continue;
+              const lines = evidenceAllowedByPath.get(citationPath) ?? new Set<number>();
+              lines.add(line);
+              evidenceAllowedByPath.set(citationPath, lines);
+            }
+            const evidenceAllowed = [...evidenceAllowedByPath].map(([path, lines]) => ({ path, lines: [...lines].sort((a, b) => a - b) }));
+            const evidenceResult = await completeStructured(evidenceReq, verifierLlm, (raw) => parseVerification(raw, uncertainCandidates.map(({ id }) => id), evidenceFiles), evidenceAllowed,
+              () => consumeRetryAllowance(true), 'evidence');
+            const evidenceDecisions = evidenceResult.decisions;
+            verifierEvidenceDecisionsTrace = evidenceDecisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
+            const evidenceSupported = new Set(evidenceDecisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
+            findings.push(...uncertainCandidates.filter(({ id }) => evidenceSupported.has(id)).map(({ finding }) => verifiedFinding(finding)));
+            verifierMissingEvidenceTrace.unresolved = evidenceDecisions.filter((decision) => decision.decision === 'uncertain').map((decision) => ({ id: decision.id as number, reason: String(decision.explanation) }));
+          } else verifierMissingEvidenceTrace.unresolved = uncertainCandidates.map(({ id }) => ({ id, reason: 'Evidence verifier round exceeds the remaining review budget.' }));
+        }
+        }
+      } else if (uncertainFindings.length && !deps.focusedVerification) {
+        verifierFocusedSkipped = 'disabled';
+      } else if (uncertainFindings.length) {
         const focusedSystem = focusedVerifierSystemPrompt();
         const uncertainIds = uncertainCandidates.map(({ id }) => id);
         const fullFocusedReq = verifierRequest(uncertainFindings, false, focusedSystem, uncertainIds);
@@ -2129,7 +2526,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           }
           verifierFocusedDecisionsTrace = focusedDecisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
           const focusedSupported = new Set(focusedDecisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
-          findings.push(...uncertainCandidates.filter(({ id, finding }) => focusedSupported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit').map(({ finding }) => finding));
+          findings.push(...uncertainCandidates.filter(({ id }) => focusedSupported.has(id)).map(({ finding }) => verifiedFinding(finding)));
         }
       }
     }
@@ -2138,7 +2535,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     await assertHeadUnchanged();
     const summary = buildFindingSummary(findings);
     const verdict = verdictForFindings(findings);
-    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget'; findings?: Finding[] } = {}) => ({
+    const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'arbitration' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; evidenceDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget' | 'disabled'; missingEvidence?: ReviewTrace['stages'][number]['missingEvidence']; findings?: Finding[] } = {}) => ({
       stage,
       selectedPaths: selected.map((file) => file.newPath ?? file.oldPath ?? ''),
       hunks: traceHunks(selected),
@@ -2148,7 +2545,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       ...(extra.primaryFindings ? { primaryFindings: extra.primaryFindings.map(traceFinding) } : {}),
       ...(extra.decisions ? { decisions: extra.decisions } : {}),
       ...(extra.focusedDecisions ? { focusedDecisions: extra.focusedDecisions } : {}),
+      ...(extra.evidenceDecisions ? { evidenceDecisions: extra.evidenceDecisions } : {}),
       ...(extra.focusedSkipped ? { focusedSkipped: extra.focusedSkipped } : {}),
+      ...(extra.missingEvidence ? { missingEvidence: extra.missingEvidence } : {}),
       ...(extra.findings ? { findings: extra.findings.map(traceFinding) } : {}),
     });
     const trace: ReviewTrace = {
@@ -2157,7 +2556,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       stages: [
         traceStage('initial', files, initialOmittedContext, { primaryFindings: primaryTrace }),
         ...(escalationLlm && riskyFiles.length ? [traceStage('escalation', riskyFiles, escalationOmittedContext, { primaryFindings: primaryTrace.filter((finding) => riskyFiles.some((file) => (file.newPath ?? file.oldPath) === finding.path)), decisions: escalationDecisionsTrace, findings: escalationFindingsTrace })] : []),
-        ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, focusedDecisions: verifierFocusedDecisionsTrace, focusedSkipped: verifierFocusedSkipped, findings: verifierFindingsTrace })] : []),
+        ...(verifierExecuted ? [traceStage('verification', files.filter((file) => verifierSelectedPaths.has(file.newPath ?? file.oldPath ?? '')), verifierOmittedContext, { decisions: verifierDecisionsTrace, focusedDecisions: verifierFocusedDecisionsTrace, evidenceDecisions: verifierEvidenceDecisionsTrace, focusedSkipped: verifierFocusedSkipped, missingEvidence: verifierMissingEvidenceTrace, findings: verifierFindingsTrace })] : []),
+        ...(arbitrationExecuted ? [traceStage('arbitration', arbitrationFiles, 1, { decisions: arbitrationDecisionsTrace })] : []),
         traceStage('final', files, 0, { findings: findings.slice() }),
       ],
       finalFindings: findings.map(traceFinding),

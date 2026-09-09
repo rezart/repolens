@@ -213,6 +213,7 @@ export function collectStaticEvidence(path: string, source: string): StaticEvide
   const lines = masked.split(/\r?\n/);
   const sourceLines = bounded.split(/\r?\n/);
   const slashSensitive = JS_EXTENSIONS.has(extension(path)) || ['.rb', '.rake'].includes(extension(path));
+  const supportsAsyncCallFacts = JS_EXTENSIONS.has(extension(path));
   const slashLines = new Set(slashSensitive ? sourceLines.flatMap((line, index) => line.includes('/') ? [index] : []) : []);
   const declarations = new Map<string, { arity: ArityBounds; line: number }>();
   const calls: Array<{ name: string; args: string; line: number; text: string; awaited: boolean }> = [];
@@ -254,8 +255,10 @@ export function collectStaticEvidence(path: string, source: string): StaticEvide
       const awaited = /\bawait\s*$/.test(before);
       const text = `${name}(${match[2]!.trim()})`;
       calls.push({ name: simpleName, args: match[2]!, line: index + 1, text, awaited });
-      if (awaited) add(index + 1, 'awaited-call', text);
-      else if (!/\b(?:return|void|new)\s*$/.test(before)) add(index + 1, 'unawaited-call', text);
+      if (supportsAsyncCallFacts) {
+        if (awaited) add(index + 1, 'awaited-call', text);
+        else if (!/\b(?:return|void|new)\s*$/.test(before)) add(index + 1, 'unawaited-call', text);
+      }
     }
   }
 

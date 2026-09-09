@@ -27,6 +27,13 @@ describe('review CLI options', () => {
     expect(wired.dualDiscovery).toBe(true);
   });
 
+  it('passes focused verification through fresh review wiring', () => {
+    const wired = freshReviewDeps({
+      llm: { name: 'qwen' }, config: { review: { statusContext: '', failOn: 'critical', maxRetries: 3, focusedVerification: true, ignorePatterns: [] } },
+    } as never);
+    expect(wired.focusedVerification).toBe(true);
+  });
+
   it('renders terminal fresh-review failures as structured telemetry', () => {
     const trace = {
       version: 1 as const,

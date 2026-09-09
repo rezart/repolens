@@ -31,8 +31,10 @@ type FreshReviewDeps = ReturnType<typeof buildDeps> & { verifierLlm?: ReturnType
 
 export function freshReviewDeps(deps: FreshReviewDeps) {
   return {
-    db: deps.db, llm: deps.llm, escalationLlm: deps.escalationLlm, verifierLlm: deps.verifierLlm,
+    db: deps.db, llm: deps.llm, escalationLlm: deps.escalationLlm, verifierLlm: deps.verifierLlm, arbiterLlm: deps.arbiterLlm, arbiterAllFindings: deps.arbiterAllFindings,
     dualDiscovery: deps.config.review.dualDiscovery,
+    focusedVerification: deps.config.review.focusedVerification,
+    discoveryMaxOutput: deps.config.review.discoveryMaxOutput,
     retrieve: deps.retrieve, github: deps.github, identifiers: identifiersFromCode,
     formatContext: (chunks: Parameters<typeof formatContext>[0]) => formatContext(chunks, 16000),
     statusContext: deps.config.review.statusContext, failOn: deps.config.review.failOn,
