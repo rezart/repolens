@@ -90,6 +90,13 @@ describe('API', () => {
     expect(res.status).toBe(401);
   });
 
+  it('requires API authentication before returning the Traceway browser configuration', async () => {
+    const traced = createApp(makeDeps({}, { TRACEWAY_WEB_CONNECTION_STRING: 'public-browser-value' }));
+    expect((await traced.request('/api/traceway/config')).status).toBe(401);
+    const res = await traced.request('/api/traceway/config', { headers: auth });
+    expect(await res.json()).toEqual({ connectionString: 'public-browser-value', version: '0.1.0' });
+  });
+
   it('does not accept the token from the query string', async () => {
     const res = await app.request('/api/repositories?token=secret');
     expect(res.status).toBe(401);

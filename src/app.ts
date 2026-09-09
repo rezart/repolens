@@ -293,6 +293,7 @@ export function createApp(deps: AppDeps): Hono {
       embeddings: deps.embeddings?.model ?? null,
     }),
   );
+  app.get('/api/traceway/config', (c) => c.json({ connectionString: config.tracewayWebConnectionString ?? '', version: config.revision ?? VERSION }));
 
   // ---- repositories ----
   app.get('/api/repositories', (c) => c.json({ repositories: db.listRepos() }));
@@ -483,10 +484,6 @@ export function createApp(deps: AppDeps): Hono {
   app.get('/vendor/traceway.js', async (c) => {
     c.header('Content-Type', 'text/javascript');
     return c.body(await readFile(join(process.cwd(), 'node_modules/@tracewayapp/frontend/dist/traceway.iife.global.js')));
-  });
-  app.get('/vendor/traceway-config.js', (c) => {
-    c.header('Content-Type', 'text/javascript');
-    return c.body(config.tracewayWebConnectionString ? `Traceway.init(${JSON.stringify(config.tracewayWebConnectionString)}, { version: ${JSON.stringify(config.revision ?? VERSION)} });` : '');
   });
   // The dashboard has no build step or hashed filenames, so browsers must
   // revalidate on every load; otherwise heuristic caching keeps serving a
