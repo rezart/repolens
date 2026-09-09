@@ -13,6 +13,7 @@ import { createApp, type AppDeps } from './app.js';
 import { OpenRouterPricing } from './usage/pricing.js';
 import { UsageTracker } from './usage/tracker.js';
 import { startPoller } from './poller.js';
+import { startTelemetry } from './telemetry.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
   const token = config.github.app
@@ -48,6 +49,7 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {
+  startTelemetry(process.env.TRACEWAY_URL ?? '', process.env.TRACEWAY_BACKEND_TOKEN ?? '');
   const deps = buildDeps(config, log);
   const app = createApp(deps);
 
