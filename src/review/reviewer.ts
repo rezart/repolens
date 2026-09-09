@@ -202,7 +202,7 @@ export interface ReviewTrace {
     evidenceDecisions?: Array<{ id: string | number; decision: string }>;
     focusedSkipped?: 'budget' | 'disabled';
     missingEvidence?: {
-      requested: Array<{ path?: string; symbol?: string; question: string }>;
+      requested: Array<{ path?: string; symbol: string; question: string }>;
       acquired: Array<{ path: string; lines: number[] }>;
       authoritativeEvidenceAdded: boolean;
       unresolved: Array<{ id: number; reason: string }>;
@@ -918,7 +918,7 @@ const MISSING_EVIDENCE_REQUESTS_MAX = 4;
 const MISSING_EVIDENCE_FILES_MAX = 4;
 const MISSING_EVIDENCE_STRING_MAX = 180;
 
-type MissingEvidenceRequest = { path?: string; symbol?: string; question: string };
+type MissingEvidenceRequest = { path?: string; symbol: string; question: string };
 
 function parseMissingEvidenceRequests(value: unknown, changedPaths: string[]): MissingEvidenceRequest[] {
   if (value === undefined) return [];
@@ -931,10 +931,10 @@ function parseMissingEvidenceRequests(value: unknown, changedPaths: string[]): M
     const path = typeof record.path === 'string' ? record.path.trim() : undefined;
     const symbol = typeof record.symbol === 'string' ? record.symbol.trim() : undefined;
     const question = typeof record.question === 'string' ? record.question.replace(/\s+/g, ' ').trim() : '';
-    if ((!path && !symbol) || !question || question.length > MISSING_EVIDENCE_STRING_MAX ||
+    if (!symbol || !question || question.length > MISSING_EVIDENCE_STRING_MAX ||
         (path !== undefined && (path.length > MISSING_EVIDENCE_STRING_MAX || path.startsWith('/') || /[\\:\0]/.test(path) || path !== normalizeRepoPath(path) || path.split('/').includes('..') || !isReviewablePath(path) || changed.has(path))) ||
-        (symbol !== undefined && (symbol.length > MISSING_EVIDENCE_STRING_MAX || !/^[A-Za-z_$][\w$?!]*(?:[./][A-Za-z_$][\w$?!]*)*$/.test(symbol)))) return [];
-    return [{ ...(path ? { path } : {}), ...(symbol ? { symbol } : {}), question }];
+        symbol.length > MISSING_EVIDENCE_STRING_MAX || !/^[A-Za-z_$][\w$?!]*(?:[./][A-Za-z_$][\w$?!]*)*$/.test(symbol)) return [];
+    return [{ ...(path ? { path } : {}), symbol, question }];
   });
 }
 
@@ -1285,13 +1285,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   let reservedUsd = 0;
   let usedUsd = 0;
   const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' | 'evidence'; elapsedMs: number }> = [];
-  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' | 'evidence' = 'normal'): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
+  const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
     const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass, elapsedMs: 0 } : undefined;
     if (traceCall) traceCalls.push(traceCall);
     const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
     const started = Date.now();
-    if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > REVIEW_MAX_USD) {
+    if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > ceiling) {
       if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
@@ -1332,9 +1332,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const trace = traceCalls[traceIndex];
     if (trace) { trace.outcome = 'validation_error'; trace.failure = errMessage(error); }
   };
-  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean, pass: 'normal' | 'focused' | 'evidence' = 'normal'): Promise<T> => {
+  const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<T> => {
     const run = async (request: CompleteRequest) => {
-      const call = await completeCall(request, provider, false, pass);
+      const call = await completeCall(request, provider, false, pass, ceiling);
       if (call.failed) {
         if (call.error instanceof JsonExtractError || call.error instanceof IncompleteResponseError) markTraceValidation(call.traceIndex, call.error);
         throw call.error;
@@ -2057,8 +2057,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         evidenceRoundEnabled = false;
         evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
       }
+      const enabledEvidenceReserve = evidenceRoundEnabled ? evidenceReserve : 0;
+      const escalationCeiling = budgeted
+        ? REVIEW_MAX_USD - verifierReserve - enabledEvidenceReserve
+        : REVIEW_MAX_USD;
       const remaining = budgeted
-        ? REVIEW_MAX_USD - reservedUsd - verifierReserve - (evidenceRoundEnabled ? evidenceReserve : 0)
+        ? escalationCeiling - reservedUsd
         : Number.POSITIVE_INFINITY;
       const optionalFields: Array<'relevantContext' | 'historical' | 'headContext' | 'rules'> = ['relevantContext', 'historical', 'headContext', 'rules'];
       let omitted = 0;
@@ -2107,7 +2111,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       const escalationResult = await completeStructured(req, escalationLlm, parseEscalation,
         riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })),
-        () => consumeRetryAllowance(true));
+        () => consumeRetryAllowance(true), 'normal', escalationCeiling);
       const { decisions, escalated } = escalationResult;
       escalationDecisionsTrace = decisions.map((decision) => ({ id: decision.id as string, decision: String(decision.decision) }));
       escalationFindingsTrace = escalated.slice();
@@ -2283,19 +2287,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             try {
               const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
               if (content === null) continue;
-              const basename = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
-              const anchorText = `${request.question} ${basename}`;
-              const proseTerms = new Set(['a', 'an', 'and', 'does', 'how', 'in', 'is', 'of', 'on', 'the', 'this', 'to', 'what', 'where']);
-              const rawTerms = [...new Set([...identifiers(anchorText), ...(anchorText.match(IDENTIFIER_RE) ?? [])])]
-                .filter((term) => term.length >= 2 && !CONTEXT_KEYWORDS.has(term.toLowerCase()) && !proseTerms.has(term.toLowerCase()));
-              const codeLikeTerms = rawTerms.filter((term) => isCodeLikeTerm(term, anchorText));
-              const anchorTerms = new Set([
-                ...(request.symbol ? [request.symbol] : []),
-                ...codeLikeTerms,
-                basename,
-                ...rawTerms.filter((term) => !codeLikeTerms.includes(term)),
-              ].filter((term, index, all) => term.length >= 2 && all.indexOf(term) === index).slice(0, 12));
-              const lines = matchingHeadLines(content, anchorTerms);
+              const lines = matchingHeadLines(content, new Set([request.symbol]));
               referencedHeadContents.set(path, content);
               authoritativeEvidenceAdded = true;
               acquired.push({ path, lines });
