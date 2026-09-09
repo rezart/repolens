@@ -35,7 +35,7 @@ function maskSource(path: string, source: string): string {
   const ext = extension(path);
   if (!JS_EXTENSIONS.has(ext) && !HASH_COMMENT_EXTENSIONS.has(ext)) return '';
   const hashComments = HASH_COMMENT_EXTENSIONS.has(ext);
-  let mode: 'code' | 'line-comment' | 'block-comment' | 'ruby-block-comment' | 'string' | 'regex' | 'triple' = 'code';
+  let mode: 'code' | 'line-comment' | 'block-comment' | 'ruby-block-comment' | 'ruby-heredoc' | 'string' | 'regex' | 'triple' = 'code';
   let quote = '';
   let escaped = false;
   let regexClass = false;
@@ -67,6 +67,24 @@ function maskSource(path: string, source: string): string {
       } else out += char === '\n' || char === '\r' ? char : ' ';
       continue;
     }
+    if (mode === 'ruby-heredoc') {
+      const lineStart = i === 0 || source[i - 1] === '\n' || source[i - 1] === '\r';
+      if (lineStart) {
+        let cursor = i;
+        while (source[cursor] === ' ' || source[cursor] === '\t') cursor++;
+        if (source.startsWith(quote, cursor)) {
+          const after = source[cursor + quote.length] ?? '';
+          if (!after || after === '\n' || after === '\r') {
+            out += ' '.repeat(cursor - i + quote.length);
+            i = cursor + quote.length - 1;
+            mode = 'code';
+            continue;
+          }
+        }
+      }
+      out += char === '\n' || char === '\r' ? char : ' ';
+      continue;
+    }
     if (mode === 'triple') {
       if (source.startsWith(quote, i)) { out += ' '.repeat(quote.length); i += quote.length - 1; mode = 'code'; } else out += char === '\n' || char === '\r' ? char : ' ';
       continue;
@@ -96,6 +114,19 @@ function maskSource(path: string, source: string): string {
     if (hashComments && char === '#') { out += ' '; mode = 'line-comment'; continue; }
     if (hashComments && (char === '"' || char === "'") && source.startsWith(char.repeat(3), i)) {
       quote = char.repeat(3); out += '   '; i += 2; mode = 'triple'; continue;
+    }
+    if (hashComments && char === '<' && next === '<') {
+      const before = currentLine().trimEnd();
+      let cursor = i + 2;
+      if (source[cursor] === '-' || source[cursor] === '~') cursor++;
+      const terminator = source.slice(cursor).match(/^[A-Za-z_][\w]*/)?.[0];
+      if (terminator && (!before || /(?:=|[(:,\[\{])\s*$/.test(before) || /\b(?:return|yield)\s*$/.test(before))) {
+        quote = terminator;
+        out += ' '.repeat(cursor + terminator.length - i);
+        i = cursor + terminator.length - 1;
+        mode = 'ruby-heredoc';
+        continue;
+      }
     }
     if (char === '"' || char === "'" || char === '`') { quote = char; out += char; mode = 'string'; escaped = false; continue; }
     if (char === '/' && regexStart()) { out += ' '; mode = 'regex'; regexClass = false; escaped = false; continue; }
@@ -211,11 +242,20 @@ function rubySerializerHookFacts(path: string, masked: string): Array<{ line: nu
   const methods = new Map<string, { predicate: boolean; line: number }>();
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
-    const call = /^\s*attributes?\s+(.+)/.exec(line);
+    const call = /^\s*attributes?\b(.*)/.exec(line);
     if (call) {
       let args = call[1]!;
-      for (let next = index + 1; next < lines.length && /^\s*,?\s*:[A-Za-z_][\w!?]*(?:\s*,)?\s*$/.test(lines[next]!); next++) {
-        args += ` ${lines[next]!.trim()}`;
+      if (/^\s*\(/.test(args)) {
+        args = args.replace(/^\s*\(/, '');
+        for (let next = index + 1; next < lines.length; next++) {
+          const closing = lines[next]!.indexOf(')');
+          args += ` ${closing < 0 ? lines[next]! : lines[next]!.slice(0, closing)}`;
+          if (closing >= 0) break;
+        }
+      } else {
+        for (let next = index + 1; next < lines.length && /^\s*,?\s*:[A-Za-z_][\w!?]*(?:\s*,)?\s*$/.test(lines[next]!); next++) {
+          args += ` ${lines[next]!.trim()}`;
+        }
       }
       const symbols = /^\s*((?::[A-Za-z_][\w!?]*)(?:\s*,\s*:[A-Za-z_][\w!?]*)*)/.exec(args)?.[1];
       for (const match of symbols?.matchAll(/:([A-Za-z_][\w!?]*)/g) ?? []) attributes.add(match[1]!);

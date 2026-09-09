@@ -99,6 +99,23 @@ describe('collectStaticEvidence', () => {
     ]));
   });
 
+  it('spots the same mismatch in parenthesized multiline attributes', () => {
+    const facts = collectStaticEvidence('app/serializers/user_serializer.rb', [
+      'class UserSerializer < ActiveModel::Serializer',
+      '  attributes(',
+      '    :name,',
+      '    :website_name',
+      '  )',
+      '  def include_name?',
+      '  end',
+      '  def include_website_name',
+      '  end',
+    ].join('\n'));
+    expect(facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'ruby-serializer-hook', line: 8, detail: expect.stringContaining('include_website_name') }),
+    ]));
+  });
+
   it('does not infer serializer hooks from generic Ruby, comments, strings, or undeclared attributes', () => {
     const source = [
       '# def include_name',
@@ -118,6 +135,21 @@ describe('collectStaticEvidence', () => {
       'def include_website_name?',
       'end',
     ].join('\n')).some((fact) => fact.kind === 'ruby-serializer-hook')).toBe(false);
+  });
+
+  it('does not infer serializer hooks from Ruby heredoc contents', () => {
+    for (const marker of ['<<TEXT', '<<-TEXT', '<<~TEXT']) {
+      const facts = collectStaticEvidence('app/serializers/user_serializer.rb', [
+        'attributes :website_name',
+        'def include_name?',
+        'end',
+        `text = ${marker}`,
+        'def include_website_name',
+        'end',
+        'TEXT',
+      ].join('\n'));
+      expect(facts.some((fact) => fact.kind === 'ruby-serializer-hook')).toBe(false);
+    }
   });
 
   it('does not fabricate facts from regex literals after JavaScript arrows', () => {
