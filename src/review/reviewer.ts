@@ -1062,6 +1062,29 @@ function deduplicateProvisionalCandidates(findings: Finding[]): Finding[] {
   });
 }
 
+function staticFactFinding(fact: StaticEvidenceFact): Finding | undefined {
+  if (fact.kind !== 'ruby-serializer-hook') return undefined;
+  const method = /^include_([A-Za-z_][\w]*) lacks \?/.exec(fact.detail)?.[1];
+  if (!method) return undefined;
+  const hook = `include_${method}`;
+  return {
+    path: fact.path,
+    line: fact.line,
+    severity: 'warning',
+    title: `${hook} should use the serializer predicate hook`,
+    body: `${fact.detail}. Rename the method to ${hook}? so the serializer applies the hook consistently.`,
+    category: 'correctness',
+    confidence: 'high',
+    rootCause: fact.detail,
+    evidence: {
+      path: fact.path,
+      line: fact.line,
+      trigger: `${hook} is defined without ?`,
+      consequence: `the serializer may not invoke ${hook}? for the declared attribute`,
+    },
+  };
+}
+
 function primaryFindingIds(findings: Finding[]): string[] {
   const counts = new Map<string, number>();
   return findings.map((finding) => {
@@ -2072,6 +2095,15 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
     }
 
+    if (verifierLlm) {
+      const allowedAddedLines = new Map(files.map((file) => [file.newPath ?? file.oldPath!, changedNewLines(file)]));
+      findings.push(...staticEvidence.flatMap((fact) => {
+        const line = allowedAddedLines.get(fact.path);
+        if (!line?.has(fact.line)) return [];
+        const finding = staticFactFinding(fact);
+        return finding ? [finding] : [];
+      }));
+    }
     findings = deduplicateProvisionalCandidates(findings);
     findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
