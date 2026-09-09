@@ -756,6 +756,7 @@ describe('buildDeps', () => {
     const config = loadConfig({
       LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
       REVIEW_FALLBACK_MODELS: 'qwen/qwen3-coder-next',
+      REVIEW_ESCALATION_MODEL: 'openai/gpt-5-mini',
       REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
     });
     const deps = buildDeps(config, () => {});
@@ -765,6 +766,92 @@ describe('buildDeps', () => {
       expect(deps.chatLlm.reviewFallbacks ?? []).toEqual([]);
     } finally {
       deps.db.close();
+    }
+  });
+
+  it('keeps the primary Qwen provider, creates an independent verifier, and disables escalation when blank', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_VERIFIER_MODEL: 'openai/gpt-5-mini', REVIEW_ESCALATION_MODEL: '', REVIEW_FOCUSED_VERIFICATION: 'true',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.llm.model).toBe('qwen/qwen3-coder');
+      expect(deps.verifierLlm?.model).toBe('openai/gpt-5-mini');
+      expect(deps.verifierLlm).not.toBe(deps.llm);
+      expect(deps.escalationLlm).toBeUndefined();
+      expect(deps.dualDiscovery).toBe(false);
+      expect(deps.focusedVerification).toBe(true);
+    } finally {
+      deps.db.close();
+    }
+  });
+
+  it('propagates the dual discovery configuration to app dependencies', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_DUAL_DISCOVERY: 'true', REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try { expect(deps.dualDiscovery).toBe(true); } finally { deps.db.close(); }
+  });
+
+  it('propagates discovery output bounds and the verifier effort default', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      LLM_REASONING_EFFORT: 'high', REVIEW_DISCOVERY_MAX_OUTPUT: '16000',
+      REVIEW_VERIFIER_MODEL: 'openai/gpt-5-mini', REVIEW_ESCALATION_MODEL: '',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.discoveryMaxOutput).toBe(16000);
+      expect(effortOf(deps.llm)).toBe('high');
+      expect(effortOf(deps.verifierLlm!)).toBe('medium');
+    } finally { deps.db.close(); }
+  });
+
+  it('configures verifier reasoning independently when requested', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      LLM_REASONING_EFFORT: 'high', REVIEW_VERIFIER_REASONING_EFFORT: 'low',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(effortOf(deps.llm)).toBe('high');
+      expect(effortOf(deps.verifierLlm!)).toBe('low');
+    } finally { deps.db.close(); }
+  });
+
+  it('configures escalation reasoning independently while preserving inheritance and blank disablement', () => {
+    const make = (escalationReasoningEffort?: string) => {
+      const config = loadConfig({
+        LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+        LLM_REASONING_EFFORT: 'high',
+        REVIEW_ESCALATION_MODEL: 'openai/gpt-5-mini',
+        ...(escalationReasoningEffort === undefined ? {} : { REVIEW_ESCALATION_REASONING_EFFORT: escalationReasoningEffort }),
+        REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+      });
+      const deps = buildDeps(config, () => {});
+      return { deps };
+    };
+    const inherited = make();
+    const explicit = make('low');
+    const disabled = make('');
+    try {
+      expect(effortOf(inherited.deps.llm)).toBe('high');
+      expect(effortOf(inherited.deps.escalationLlm!)).toBe('high');
+      expect(effortOf(explicit.deps.llm)).toBe('high');
+      expect(effortOf(explicit.deps.escalationLlm!)).toBe('low');
+      expect(effortOf(disabled.deps.llm)).toBe('high');
+      expect(effortOf(disabled.deps.escalationLlm!)).toBeUndefined();
+      expect(effortOf(inherited.deps.verifierLlm!)).toBe('medium');
+    } finally {
+      inherited.deps.db.close();
+      explicit.deps.db.close();
+      disabled.deps.db.close();
     }
   });
 
@@ -786,5 +873,29 @@ describe('buildDeps', () => {
     } finally {
       deps.db.close();
     }
+  });
+
+  it('retains the primary provider as verifier for Claude CLI reviews', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'claude-cli', LLM_MODEL: 'sonnet',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try { expect(deps.verifierLlm).toBe(deps.llm); } finally { deps.db.close(); }
+  });
+
+  it('creates an optional OpenRouter arbiter with low reasoning by default', () => {
+    const config = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'fake',
+      REVIEW_ARBITER_MODEL: 'openai/gpt-6-astra',
+      REVIEW_ARBITER_ALL_FINDINGS: 'true',
+      REPOLENS_DATA_DIR: mkdtempSync(join(tmpdir(), 'repolens-test-')),
+    });
+    const deps = buildDeps(config, () => {});
+    try {
+      expect(deps.arbiterLlm?.model).toBe('openai/gpt-6-astra');
+      expect(effortOf(deps.arbiterLlm!)).toBe('low');
+      expect(deps.arbiterAllFindings).toBe(true);
+    } finally { deps.db.close(); }
   });
 });

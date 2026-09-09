@@ -9,7 +9,24 @@ describe('loadConfig', () => {
     expect(c.embedding).toBeNull();
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
-    expect(c.review.escalationModel).toBe('openai/gpt-5-mini');
+    expect(c.review.maxRetries).toBe(0);
+    expect(c.review.escalationModel).toBe('');
+    expect(c.review.escalationReasoningEffort).toBeUndefined();
+    expect(c.review.verifierModel).toBe('google/gemini-3.1-flash-lite');
+    expect(c.review.verifierReasoningEffort).toBe('medium');
+    expect(c.review.discoveryMaxOutput).toBe(8000);
+    expect(c.review.dualDiscovery).toBe(false);
+    expect(c.review.focusedVerification).toBe(false);
+    expect(c.review.arbiterModel).toBe('openai/gpt-6-astra');
+    expect(c.review.arbiterAllFindings).toBe(false);
+  });
+
+  it('bounds the optional discovery output override', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig({ ...base, REVIEW_DISCOVERY_MAX_OUTPUT: '16000' }).review.discoveryMaxOutput).toBe(16000);
+    for (const value of ['0', '16001', '1.5', 'invalid']) {
+      expect(() => loadConfig({ ...base, REVIEW_DISCOVERY_MAX_OUTPUT: value })).toThrow(ConfigError);
+    }
   });
   it('trims the running image revision', () => {
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_REVISION: ' abc123 ' }).revision).toBe('abc123');
@@ -20,8 +37,8 @@ describe('loadConfig', () => {
   it('rejects an empty bind hostname', () => {
     expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_HOST: '' })).toThrow(ConfigError);
   });
-  it('defaults to three response retries and validates overrides', () => {
-    expect(loadConfig({ LLM_PROVIDER: 'claude-cli' }).review.maxRetries).toBe(3);
+  it('defaults to no response retries and validates overrides', () => {
+    expect(loadConfig({ LLM_PROVIDER: 'claude-cli' }).review.maxRetries).toBe(0);
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: '0' }).review.maxRetries).toBe(0);
     for (const value of ['-1', '1.5', 'invalid']) {
       expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: value })).toThrow(ConfigError);
@@ -41,6 +58,55 @@ describe('loadConfig', () => {
     expect(c.review.escalationModel).toBe('strong/model');
     expect(loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: '' }).review.escalationModel).toBe('');
     expect(() => loadConfig({ LLM_PROVIDER: 'openrouter', LLM_MODEL: 'cheap', OPENROUTER_API_KEY: 'k', REVIEW_ESCALATION_MODEL: 'bad model' })).toThrow(ConfigError);
+  });
+  it('distinguishes inherited, explicit, and disabled escalation reasoning effort', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.escalationReasoningEffort).toBeUndefined();
+    expect(loadConfig({ ...base, REVIEW_ESCALATION_REASONING_EFFORT: 'high' }).review.escalationReasoningEffort).toBe('high');
+    expect(loadConfig({ ...base, REVIEW_ESCALATION_REASONING_EFFORT: '' }).review.escalationReasoningEffort).toBe('');
+    expect(() => loadConfig({ ...base, REVIEW_ESCALATION_REASONING_EFFORT: 'invalid' })).toThrow(ConfigError);
+  });
+  it('configures an independent verifier model separately from escalation', () => {
+    const c = loadConfig({
+      LLM_PROVIDER: 'openrouter', LLM_MODEL: 'qwen/qwen3-coder', OPENROUTER_API_KEY: 'k',
+      REVIEW_VERIFIER_MODEL: ' openai/gpt-5-mini ', REVIEW_ESCALATION_MODEL: '',
+    });
+    expect(c.review.verifierModel).toBe('openai/gpt-5-mini');
+    expect(c.review.escalationModel).toBe('');
+  });
+  it('validates an optional independent verifier reasoning effort', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.verifierReasoningEffort).toBe('medium');
+    expect(loadConfig({ ...base, REVIEW_VERIFIER_REASONING_EFFORT: 'high' }).review.verifierReasoningEffort).toBe('high');
+    expect(loadConfig({ ...base, REVIEW_VERIFIER_REASONING_EFFORT: '' }).review.verifierReasoningEffort).toBe('');
+    expect(() => loadConfig({ ...base, REVIEW_VERIFIER_REASONING_EFFORT: 'invalid' })).toThrow(ConfigError);
+  });
+  it('parses the dual discovery switch as a strict boolean', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.dualDiscovery).toBe(false);
+    expect(loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'true' }).review.dualDiscovery).toBe(true);
+    expect(loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'false' }).review.dualDiscovery).toBe(false);
+    expect(() => loadConfig({ ...base, REVIEW_DUAL_DISCOVERY: 'yes' })).toThrow(ConfigError);
+  });
+  it('parses the focused verification switch as a strict boolean', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.focusedVerification).toBe(false);
+    expect(loadConfig({ ...base, REVIEW_FOCUSED_VERIFICATION: 'true' }).review.focusedVerification).toBe(true);
+    expect(loadConfig({ ...base, REVIEW_FOCUSED_VERIFICATION: 'false' }).review.focusedVerification).toBe(false);
+    expect(() => loadConfig({ ...base, REVIEW_FOCUSED_VERIFICATION: 'yes' })).toThrow(ConfigError);
+  });
+  it('parses the opt-in all-findings arbitration switch as a strict boolean', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig({ ...base, REVIEW_ARBITER_ALL_FINDINGS: 'true' }).review.arbiterAllFindings).toBe(true);
+    expect(loadConfig({ ...base, REVIEW_ARBITER_ALL_FINDINGS: 'false' }).review.arbiterAllFindings).toBe(false);
+    expect(() => loadConfig({ ...base, REVIEW_ARBITER_ALL_FINDINGS: 'yes' })).toThrow(ConfigError);
+  });
+  it('parses optional arbiter model and defaults its reasoning effort to low', () => {
+    const base = { LLM_PROVIDER: 'claude-cli' };
+    expect(loadConfig(base).review.arbiterModel).toBe('openai/gpt-6-astra');
+    expect(loadConfig(base).review.arbiterReasoningEffort).toBe('low');
+    expect(loadConfig({ ...base, REVIEW_ARBITER_MODEL: ' openai/gpt-6-astra ', REVIEW_ARBITER_REASONING_EFFORT: 'high' }).review)
+      .toMatchObject({ arbiterModel: 'openai/gpt-6-astra', arbiterReasoningEffort: 'high' });
   });
   it('enables embeddings when a model is set', () => {
     const c = loadConfig({ LLM_PROVIDER: 'claude-cli', EMBEDDING_MODEL: 'm', EMBEDDING_API_KEY: 'k' });

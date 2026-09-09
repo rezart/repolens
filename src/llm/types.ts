@@ -19,7 +19,7 @@ export interface CompleteRequest {
   /** Single-attempt review budget; disables retries and caps routing prices. */
   reviewBudget?: boolean;
   /** Price route used by staged review calls. */
-  reviewStage?: 'initial' | 'escalation' | 'verification';
+  reviewStage?: 'initial' | 'escalation' | 'verification' | 'arbitration';
 }
 
 /** Receives incremental text as the model produces it. */
