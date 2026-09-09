@@ -1062,46 +1062,6 @@ function deduplicateProvisionalCandidates(findings: Finding[]): Finding[] {
   });
 }
 
-function staticFactFinding(fact: StaticEvidenceFact): Finding | undefined {
-  if (fact.kind !== 'ruby-serializer-hook') return undefined;
-  const method = /^include_([A-Za-z_][\w]*) lacks \?/.exec(fact.detail)?.[1];
-  if (!method) return undefined;
-  const hook = `include_${method}`;
-  return {
-    path: fact.path,
-    line: fact.line,
-    severity: 'warning',
-    title: `${hook} should use the serializer predicate hook`,
-    body: `${fact.detail}. Rename the method to ${hook}? so the serializer applies the hook consistently.`,
-    category: 'correctness',
-    confidence: 'high',
-    rootCause: fact.detail,
-    evidence: {
-      path: fact.path,
-      line: fact.line,
-      trigger: `${hook} is defined without ?`,
-      consequence: `the serializer may not invoke ${hook}? for the declared attribute`,
-    },
-  };
-}
-
-function staticFactHook(fact: StaticEvidenceFact): string | undefined {
-  return fact.kind === 'ruby-serializer-hook' ? /^include_[A-Za-z_][\w]*/.exec(fact.detail)?.[0] : undefined;
-}
-
-function findingMentionsHook(finding: Finding, hook: string): boolean {
-  const text = [finding.title, finding.body, finding.rootCause].filter(Boolean).join(' ');
-  const match = new RegExp(`(?<![A-Za-z0-9_])${escapedTerm(hook)}(?=\\?|$|[^A-Za-z0-9_])`, 'i').exec(text);
-  if (!match) return false;
-  const context = text.slice(Math.max(0, match.index - 80), match.index + hook.length + 80);
-  const missing = /\b(?:missing|without|lacks?|omit(?:ted|s)?|does\s+not\s+(?:have|use|end)|not\s+(?:have|using|ending))\b/i;
-  return missing.test(context) && (
-    /\b(?:predicate|suffix|question[- ]mark)\b/i.test(context) ||
-    new RegExp(missing.source + '[^.!?\\n]{0,24}\\?', 'i').test(context) ||
-    /\bending?\s+with\s+\?/i.test(context)
-  );
-}
-
 function primaryFindingIds(findings: Finding[]): string[] {
   const counts = new Map<string, number>();
   return findings.map((finding) => {
@@ -1945,18 +1905,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
 
     let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     primaryTrace = findings.slice();
-    if (verifierLlm) {
-      const allowedAddedLines = new Map(files.map((file) => [file.newPath ?? file.oldPath!, changedNewLines(file)]));
-      for (const fact of staticEvidence) {
-        const line = allowedAddedLines.get(fact.path);
-        if (!line?.has(fact.line)) continue;
-        const finding = staticFactFinding(fact);
-        const hook = staticFactHook(fact);
-        if (!finding || !hook || findings.some((existing) => existing.path === finding.path && findingLine(existing) === finding.line && findingMentionsHook(existing, hook))) continue;
-        findings.push(finding);
-      }
-      findings = deduplicateProvisionalCandidates(findings);
-    }
     const riskyFiles = files.flatMap((file) => {
       const hunks = file.hunks.filter((_, index) => {
         const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });

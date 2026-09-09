@@ -4,7 +4,6 @@ export type StaticEvidenceKind =
   | 'awaited-call'
   | 'unawaited-call'
   | 'local-api-arity'
-  | 'ruby-serializer-hook'
   | 'runtime-version';
 
 export interface StaticEvidenceFact {
@@ -35,7 +34,7 @@ function maskSource(path: string, source: string): string {
   const ext = extension(path);
   if (!JS_EXTENSIONS.has(ext) && !HASH_COMMENT_EXTENSIONS.has(ext)) return '';
   const hashComments = HASH_COMMENT_EXTENSIONS.has(ext);
-  let mode: 'code' | 'line-comment' | 'block-comment' | 'ruby-block-comment' | 'ruby-heredoc' | 'string' | 'regex' | 'triple' = 'code';
+  let mode: 'code' | 'line-comment' | 'block-comment' | 'ruby-block-comment' | 'string' | 'regex' | 'triple' = 'code';
   let quote = '';
   let escaped = false;
   let regexClass = false;
@@ -67,24 +66,6 @@ function maskSource(path: string, source: string): string {
       } else out += char === '\n' || char === '\r' ? char : ' ';
       continue;
     }
-    if (mode === 'ruby-heredoc') {
-      const lineStart = i === 0 || source[i - 1] === '\n' || source[i - 1] === '\r';
-      if (lineStart) {
-        let cursor = i;
-        while (source[cursor] === ' ' || source[cursor] === '\t') cursor++;
-        if (source.startsWith(quote, cursor)) {
-          const after = source[cursor + quote.length] ?? '';
-          if (!after || after === '\n' || after === '\r') {
-            out += ' '.repeat(cursor - i + quote.length);
-            i = cursor + quote.length - 1;
-            mode = 'code';
-            continue;
-          }
-        }
-      }
-      out += char === '\n' || char === '\r' ? char : ' ';
-      continue;
-    }
     if (mode === 'triple') {
       if (source.startsWith(quote, i)) { out += ' '.repeat(quote.length); i += quote.length - 1; mode = 'code'; } else out += char === '\n' || char === '\r' ? char : ' ';
       continue;
@@ -114,19 +95,6 @@ function maskSource(path: string, source: string): string {
     if (hashComments && char === '#') { out += ' '; mode = 'line-comment'; continue; }
     if (hashComments && (char === '"' || char === "'") && source.startsWith(char.repeat(3), i)) {
       quote = char.repeat(3); out += '   '; i += 2; mode = 'triple'; continue;
-    }
-    if (hashComments && char === '<' && next === '<') {
-      const before = currentLine().trimEnd();
-      let cursor = i + 2;
-      if (source[cursor] === '-' || source[cursor] === '~') cursor++;
-      const terminator = source.slice(cursor).match(/^[A-Za-z_][\w]*/)?.[0];
-      if (terminator && (!before || /(?:=|[(:,\[\{])\s*$/.test(before) || /\b(?:return|yield)\s*$/.test(before))) {
-        quote = terminator;
-        out += ' '.repeat(cursor + terminator.length - i);
-        i = cursor + terminator.length - 1;
-        mode = 'ruby-heredoc';
-        continue;
-      }
     }
     if (char === '"' || char === "'" || char === '`') { quote = char; out += char; mode = 'string'; escaped = false; continue; }
     if (char === '/' && regexStart()) { out += ' '; mode = 'regex'; regexClass = false; escaped = false; continue; }
@@ -234,49 +202,6 @@ function runtimeFacts(path: string, source: string): StaticEvidenceFact[] {
   return facts;
 }
 
-function rubySerializerHookFacts(path: string, masked: string): Array<{ line: number; detail: string }> {
-  const serializerPath = /(?:^|\/)serializers?(?:\/|$)|(?:^|\/)[^/]*_serializer\.rb$/i.test(path);
-  if (extension(path) !== '.rb' || !serializerPath) return [];
-  const lines = masked.split(/\r?\n/);
-  const attributes = new Set<string>();
-  const methods = new Map<string, { predicate: boolean; line: number }>();
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]!;
-    const call = /^\s*attributes?\b(.*)/.exec(line);
-    if (call) {
-      let args = call[1]!;
-      if (/^\s*\(/.test(args)) {
-        args = args.replace(/^\s*\(/, '');
-        for (let next = index + 1; next < lines.length; next++) {
-          const closing = lines[next]!.indexOf(')');
-          args += ` ${closing < 0 ? lines[next]! : lines[next]!.slice(0, closing)}`;
-          if (closing >= 0) break;
-        }
-      } else {
-        for (let next = index + 1; next < lines.length && /^\s*,?\s*:[A-Za-z_][\w!?]*(?:\s*,)?\s*$/.test(lines[next]!); next++) {
-          args += ` ${lines[next]!.trim()}`;
-        }
-      }
-      const symbols = /^\s*((?::[A-Za-z_][\w!?]*)(?:\s*,\s*:[A-Za-z_][\w!?]*)*)/.exec(args)?.[1];
-      for (const match of symbols?.matchAll(/:([A-Za-z_][\w!?]*)/g) ?? []) attributes.add(match[1]!);
-    }
-    const method = /^\s*def\s+include_([A-Za-z_][\w]*)([!?]?)(?:\s*\([^)]*\))?\s*$/.exec(line);
-    if (method) {
-      const previous = methods.get(method[1]!);
-      methods.set(method[1]!, {
-        predicate: Boolean(previous?.predicate) || method[2] === '?',
-        line: previous?.predicate ? previous.line : index + 1,
-      });
-    }
-  }
-  if (![...methods.values()].some(({ predicate }) => predicate)) return [];
-  return [...attributes].flatMap((attribute) => {
-    const method = methods.get(attribute);
-    if (!method || methods.get(attribute)?.predicate) return [];
-    return [{ line: method.line, detail: `include_${attribute} lacks ? used by sibling serializer hooks` }];
-  });
-}
-
 /** Extract bounded, non-executing clues; these facts are advisory, not citations. */
 export function collectStaticEvidence(path: string, source: string): StaticEvidenceFact[] {
   const bounded = source.slice(0, MAX_SOURCE_CHARS);
@@ -295,7 +220,6 @@ export function collectStaticEvidence(path: string, source: string): StaticEvide
   const add = (line: number, kind: StaticEvidenceKind, detail: string) => {
     if (facts.length < MAX_FACTS) facts.push({ path, line, kind, detail: clip(detail) });
   };
-  for (const fact of rubySerializerHookFacts(path, masked)) add(fact.line, 'ruby-serializer-hook', fact.detail);
 
   for (let index = 0; index < lines.length && facts.length < MAX_FACTS; index++) {
     if (slashLines.has(index)) continue;
