@@ -651,13 +651,13 @@ function headSnippet(path: string, content: string, relevantLines: number[]): He
   return { path, revision: 'head', lines: numberedHeadLines(content, relevantLines, HEAD_SNIPPET_CHARS_MAX) };
 }
 
-function matchingHeadLines(content: string, terms: Set<string>): number[] {
+function matchingHeadLines(content: string, terms: Set<string>, fallback = true): number[] {
   const lowerTerms = [...terms].map((term) => term.toLowerCase());
-  if (!lowerTerms.length) return [1];
+  if (!lowerTerms.length) return fallback ? [1] : [];
   const lines = content.split(/\r?\n/);
   const matches = lines.flatMap((line, index) => lowerTerms.some((term) =>
     new RegExp(`(?:^|[^a-z0-9_$])${escapedTerm(term)}(?:$|[^a-z0-9_$])`, 'i').test(line)) ? [index + 1] : []);
-  return matches.length ? matches : [1];
+  return matches.length ? matches : fallback ? [1] : [];
 }
 
 function relatedChangedHeadPaths(path: string, addedText: string, headContents: Map<string, string>): Array<{ path: string; lines: number[] }> {
@@ -1974,7 +1974,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           removedEvidence: hunks.flatMap((hunk) => hunk.lines.flatMap((line) => line.type !== 'del' || line.oldLine === undefined ? [] : [{
             line: line.oldLine, kind: 'removed', content: line.content,
           }])),
-          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => headContents.has(snippet.path)) : headEvidence,
+          headEvidence: trimOptionalContext ? headEvidence.filter((snippet) => headContents.has(snippet.path) || scopedReferencedHeadContents?.has(snippet.path)) : headEvidence,
           ...(!trimOptionalContext && packedContext ? { relevantContext: packedContext } : {}),
         }];
       });
@@ -2036,24 +2036,32 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const primaryIds = primaryFindingIds(primaryFindings);
       const primaryById = new Map(primaryIds.map((id, index) => [id, primaryFindings[index]!]));
       escalationPayload.provisionalFindings = primaryFindings.map((finding, index) => ({ id: primaryIds[index]!, finding }));
-      const escalationRequest = () => ({
+      const escalationRequest = (payload = escalationPayload) => ({
         system: ESCALATION_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify(escalationPayload) }],
+        messages: [{ role: 'user', content: JSON.stringify(payload) }],
         json: true, jsonSchema: buildEscalationJsonSchema(paths, primaryIds), maxTokens: REVIEW_ESCALATION_MAX_OUTPUT,
         reviewBudget: budgeted, reviewStage: 'escalation',
       } satisfies CompleteRequest);
-      const verifierReserve = budgeted && verifierLlm ? (() => {
-        const full = verifierRequest(findings);
-        const trimmed = verifierRequest(findings, true);
+      const reserveRequest = (request: CompleteRequest) => ({
+        ...request,
         // ponytail: reserve four UTF-8 bytes per possible escalation output token;
         // replace with provider tokenization if added-finding payloads need tighter packing.
-        full.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
-        trimmed.messages[0]!.content += `\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}`;
-        const reserve = reviewCostUpperBound(full) <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
+        messages: [{ ...request.messages[0]!, content: `${request.messages[0]!.content}\n${' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4)}` }, ...request.messages.slice(1)],
+      });
+      const requiredEscalationPayload = {
+        ...escalationPayload,
+        rules: undefined,
+        files: escalationPayload.files.map(({ headContext, relevantContext, historical, ...file }) => file),
+      };
+      const escalationBaseEstimate = reviewCostUpperBound(escalationRequest(requiredEscalationPayload));
+      const verifierReserve = budgeted && verifierLlm ? (() => {
+        const full = reserveRequest(verifierRequest(findings));
+        const trimmed = reserveRequest(verifierRequest(findings, true));
+        const reserve = reviewCostUpperBound(full) + escalationBaseEstimate <= REVIEW_MAX_USD - reservedUsd ? full : trimmed;
         return reviewCostUpperBound(reserve);
       })() : 0;
-      const evidenceReserve = budgeted && verifierLlm ? reviewCostUpperBound(verifierRequest(findings, true)) : 0;
-      if (budgeted && reservedUsd + verifierReserve + evidenceReserve > REVIEW_MAX_USD) {
+      const evidenceReserve = budgeted && verifierLlm ? reviewCostUpperBound(reserveRequest(verifierRequest(findings, true))) : 0;
+      if (budgeted && reservedUsd + escalationBaseEstimate + verifierReserve + evidenceReserve > REVIEW_MAX_USD) {
         evidenceRoundEnabled = false;
         evidenceRoundDisabledReason = 'The first verifier and bounded evidence reverify cannot fit the remaining review budget.';
       }
@@ -2287,7 +2295,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             try {
               const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
               if (content === null) continue;
-              const lines = matchingHeadLines(content, new Set([request.symbol]));
+              const lines = matchingHeadLines(content, new Set([request.symbol]), false);
+              if (!lines.length) continue;
               referencedHeadContents.set(path, content);
               authoritativeEvidenceAdded = true;
               acquired.push({ path, lines });
