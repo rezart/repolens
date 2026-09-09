@@ -4,6 +4,7 @@ export type StaticEvidenceKind =
   | 'awaited-call'
   | 'unawaited-call'
   | 'local-api-arity'
+  | 'ruby-serializer-hook'
   | 'runtime-version';
 
 export interface StaticEvidenceFact {
@@ -202,6 +203,40 @@ function runtimeFacts(path: string, source: string): StaticEvidenceFact[] {
   return facts;
 }
 
+function rubySerializerHookFacts(path: string, masked: string): Array<{ line: number; detail: string }> {
+  const serializerPath = /(?:^|\/)serializers?(?:\/|$)|(?:^|\/)[^/]*_serializer\.rb$/i.test(path);
+  if (extension(path) !== '.rb' || !serializerPath) return [];
+  const lines = masked.split(/\r?\n/);
+  const attributes = new Set<string>();
+  const methods = new Map<string, { predicate: boolean; line: number }>();
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    const call = /^\s*attributes?\s+(.+)/.exec(line);
+    if (call) {
+      let args = call[1]!;
+      for (let next = index + 1; next < lines.length && /^\s*,?\s*:[A-Za-z_][\w!?]*(?:\s*,)?\s*$/.test(lines[next]!); next++) {
+        args += ` ${lines[next]!.trim()}`;
+      }
+      const symbols = /^\s*((?::[A-Za-z_][\w!?]*)(?:\s*,\s*:[A-Za-z_][\w!?]*)*)/.exec(args)?.[1];
+      for (const match of symbols?.matchAll(/:([A-Za-z_][\w!?]*)/g) ?? []) attributes.add(match[1]!);
+    }
+    const method = /^\s*def\s+include_([A-Za-z_][\w]*)([!?]?)(?:\s*\([^)]*\))?\s*$/.exec(line);
+    if (method) {
+      const previous = methods.get(method[1]!);
+      methods.set(method[1]!, {
+        predicate: Boolean(previous?.predicate) || method[2] === '?',
+        line: previous?.predicate ? previous.line : index + 1,
+      });
+    }
+  }
+  if (![...methods.values()].some(({ predicate }) => predicate)) return [];
+  return [...attributes].flatMap((attribute) => {
+    const method = methods.get(attribute);
+    if (!method || methods.get(attribute)?.predicate) return [];
+    return [{ line: method.line, detail: `include_${attribute} lacks ? used by sibling serializer hooks` }];
+  });
+}
+
 /** Extract bounded, non-executing clues; these facts are advisory, not citations. */
 export function collectStaticEvidence(path: string, source: string): StaticEvidenceFact[] {
   const bounded = source.slice(0, MAX_SOURCE_CHARS);
@@ -220,6 +255,7 @@ export function collectStaticEvidence(path: string, source: string): StaticEvide
   const add = (line: number, kind: StaticEvidenceKind, detail: string) => {
     if (facts.length < MAX_FACTS) facts.push({ path, line, kind, detail: clip(detail) });
   };
+  for (const fact of rubySerializerHookFacts(path, masked)) add(fact.line, 'ruby-serializer-hook', fact.detail);
 
   for (let index = 0; index < lines.length && facts.length < MAX_FACTS; index++) {
     if (slashLines.has(index)) continue;

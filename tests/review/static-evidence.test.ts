@@ -79,6 +79,47 @@ describe('collectStaticEvidence', () => {
     expect(facts.some((fact) => fact.kind === 'awaited-call' || fact.kind === 'unawaited-call')).toBe(false);
   });
 
+  it('spots a missing predicate on a declared Ruby serializer attribute', () => {
+    const facts = collectStaticEvidence('app/serializers/user_serializer.rb', [
+      'class UserSerializer < ActiveModel::Serializer',
+      '  attributes :name,',
+      '    :email,',
+      '    :website_name,',
+      '    :created_at',
+      '  def include_email?',
+      '    true',
+      '  end',
+      '  def include_website_name',
+      '    true',
+      '  end',
+      'end',
+    ].join('\n'));
+    expect(facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'ruby-serializer-hook', line: 9, detail: expect.stringContaining('include_website_name') }),
+    ]));
+  });
+
+  it('does not infer serializer hooks from generic Ruby, comments, strings, or undeclared attributes', () => {
+    const source = [
+      '# def include_name',
+      'text = "def include_name"',
+      'attributes :name',
+      'def include_name?',
+      'end',
+      'def include_website_name',
+      'end',
+    ].join('\n');
+    expect(collectStaticEvidence('lib/user.rb', source).some((fact) => fact.kind === 'ruby-serializer-hook')).toBe(false);
+    expect(collectStaticEvidence('app/serializers/user_serializer.rb', source).some((fact) => fact.kind === 'ruby-serializer-hook')).toBe(false);
+    expect(collectStaticEvidence('app/serializers/user_serializer.rb', [
+      'attributes :website_name',
+      'def include_name?',
+      'end',
+      'def include_website_name?',
+      'end',
+    ].join('\n')).some((fact) => fact.kind === 'ruby-serializer-hook')).toBe(false);
+  });
+
   it('does not fabricate facts from regex literals after JavaScript arrows', () => {
     const facts = collectStaticEvidence('src/api.ts', 'const matcher = () => /response.data/;');
     expect(facts.some((fact) => fact.kind === 'response-property' || fact.kind === 'unawaited-call')).toBe(false);
