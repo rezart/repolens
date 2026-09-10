@@ -12,6 +12,7 @@ This is a step-by-step recipe for wiring a GitHub repository to a running RepoLe
   - `success` with `RepoLens review unavailable; merge allowed: ...` if review execution fails; the job still records the error for diagnosis and retry
 - If RepoLens cannot resolve the PR head or GitHub refuses the status update, it cannot publish the merge-allowed status; service outages still require recovery or a manual bypass.
 - A branch ruleset requires that status to be `success` before merging into the base branch.
+- Review execution intentionally fails open, including failures caused by PR content (such as budget exhaustion or invalid model output). This favors merge availability over guaranteed review coverage: the required check is not a security boundary against an author who can provoke review failure. Completed reviews still block on configured findings.
 - Pushing a fix creates a new head commit, RepoLens reviews it again, and the status turns green when the blocking findings are gone.
 
 ## Prerequisites
