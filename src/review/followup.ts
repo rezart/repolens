@@ -36,7 +36,9 @@ export function reconcileFollowup(raw: string, lineage: Lineage, findings: Findi
     const currentPath = previous.delta?.find((file) => file.oldPath === old.path)?.newPath ?? old.path;
     const matches = findings.flatMap((finding, id) =>
       finding.path === currentPath && (finding.title === old.title || !!old.rootCause && finding.rootCause === old.rootCause) ? [id] : []);
-    if (matches.some((id) => item.status !== 'remaining' || item.findingIndex !== id)) return fail();
+    if (item.status === 'remaining'
+      ? item.findingIndex === null || !matches.includes(item.findingIndex)
+      : matches.length > 0) return fail();
     if (item.status === 'resolved' ? !inDelta(item.evidence) : !inHead(item.evidence)) return fail();
     if (item.status === 'remaining') {
       if (item.findingIndex === null || item.findingIndex >= findings.length || remaining.has(item.findingIndex)) return fail();

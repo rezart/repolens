@@ -55,6 +55,19 @@ describe('follow-up reconciliation', () => {
     expect(result.summary).not.toContain('New:');
   });
 
+  it('accepts an explicit remaining mapping when multiple candidates share the old title', () => {
+    const candidates = [{ ...old, rootCause: 'original' }, { ...old, rootCause: 'new regression' }];
+    const raw = JSON.stringify({ previous: [{ ...resolved, status: 'remaining', findingIndex: 0 }], candidates: [
+      decision, { id: 1, introduced: true, reason: 'The new delta introduces another failure.', evidence },
+    ] });
+    expect(reconcileFollowup(raw, lineage, candidates, head).findings).toEqual(candidates);
+  });
+
+  it('rejects a remaining mapping to an unrelated candidate', () => {
+    const raw = JSON.stringify({ previous: [{ ...resolved, status: 'remaining', findingIndex: 0 }], candidates: [decision] });
+    expect(() => reconcileFollowup(raw, lineage, [warning], head)).toThrow();
+  });
+
   it('cannot retract or resolve an issue that still has a matching current candidate', () => {
     for (const status of ['resolved', 'retracted']) {
       expect(() => reconcileFollowup(input([{ ...resolved, status }]), lineage, [old], head)).toThrow();
