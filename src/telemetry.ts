@@ -4,6 +4,9 @@ import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
 import { NodeSDK } from '@opentelemetry/sdk-node';
+import { logs, SeverityNumber } from '@opentelemetry/api-logs';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http';
+import { BatchLogRecordProcessor } from '@opentelemetry/sdk-logs';
 import { reviewCallCost } from './usage/review-cost.js';
 import type { UsageRecord, UsageRole } from './usage/types.js';
 
@@ -21,11 +24,23 @@ export function startTelemetry(url: string, token: string): void {
   const headers = { Authorization: `Bearer ${token}` };
   const sdk = new NodeSDK({
     serviceName: 'repolens',
+    logRecordProcessors: [new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: `${base}/v1/logs`, headers }) })],
     traceExporter: new OTLPTraceExporter({ url: `${base}/v1/traces`, headers }),
     metricReaders: [new PeriodicExportingMetricReader({ exporter: new OTLPMetricExporter({ url: `${base}/v1/metrics`, headers }) })],
   });
   sdk.start();
   process.once('SIGTERM', () => void sdk.shutdown());
+}
+
+export function withTelemetryLogging(output: (message: string) => void): (message: string) => void {
+  return (message) => {
+    output(message);
+    try {
+      logs.getLogger('repolens').emit({ body: message, severityNumber: SeverityNumber.INFO, severityText: 'INFO' });
+    } catch {
+      // Telemetry must never interrupt application logging or job execution.
+    }
+  };
 }
 
 export async function traceTask<T>(name: string, run: () => Promise<T>): Promise<T> {
