@@ -9,7 +9,7 @@ const LINEAGE: Lineage = {
   previous: {
     headSha: 'aaaa1111', verdict: 'request_changes', summary: 'Earlier summary.',
     findings: [
-      { path: 'src/app.ts', line: 2, severity: 'critical', title: 'Bad thing', body: 'Fix it.' },
+      { path: 'src/app.ts', line: 2, severity: 'critical', title: 'Bad thing', body: 'Fix it.', rootCause: 'assignment-in-guard' },
       { path: 'src/other.ts', line: 9, severity: 'warning', title: 'Other thing', body: 'Hm.' },
     ],
     commitsSince: 1,
@@ -35,6 +35,7 @@ describe('buildFileReviewMessage lineage', () => {
     expect(msg).toContain('- aaaa111 feat: first');
     expect(msg).toContain('## Previous RepoLens review of this pull request (review 1 at aaaa111, verdict request_changes)');
     expect(msg).toContain('- [critical] src/app.ts:2 — Bad thing');
+    expect(msg).toContain('rootCause: "assignment-in-guard"');
     expect(msg).not.toContain('Other thing');
     expect(msg).toContain('## Changes to this file since the previous review');
     expect(msg).toContain('unchanged since the previous review');
