@@ -2,6 +2,7 @@ import type { Db, RepoRow } from '../db.js';
 import { matchesGlob } from 'node:path';
 import { createHash } from 'node:crypto';
 import { reviewCallCost } from '../usage/review-cost.js';
+import { countReview, recordReviewCall, recordReviewScope } from './metrics.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT } from './budget.js';
 import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
@@ -1385,6 +1386,16 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
 }
 
 export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
+  countReview('runs', 1, { outcome: 'started' });
+  try {
+    return await runPullRequest(deps, opts);
+  } catch (error) {
+    countReview('runs', 1, { outcome: error instanceof ReviewSupersededError ? 'superseded' : 'failed' });
+    throw error;
+  }
+}
+
+async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<ReviewResult> {
   const { db, llm, retrieve, github } = deps;
   const escalationLlm = deps.escalationLlm;
   const verifierLlm = deps.verifierLlm;
@@ -1400,11 +1411,12 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
     const started = Date.now();
     if (req.reviewBudget && !alreadyReserved && reservedUsd + estimate > ceiling) {
+      countReview('budget_blocks', 1, { stage: req.reviewStage ?? 'unknown' });
       if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
     if (req.reviewBudget && !alreadyReserved) reservedUsd += estimate;
-    const call = { reported: false, costUsd: 0 as number | null };
+    const call = { reported: false, costUsd: 0 as number | null, stage: req.system === FOLLOWUP_RECONCILIATION_PROMPT ? 'reconciliation' : req.reviewStage ?? 'unknown', pass };
     let raw: string | undefined;
     let error: unknown;
     let threw = false;
@@ -1414,6 +1426,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       threw = true;
       error = err;
     } finally {
+      recordReviewCall(Math.max(0, Date.now() - started) / 1000, { stage: call.stage, pass, provider: provider.name, model: provider.model, outcome: threw ? 'error' : 'success' });
       if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
       const next = costUsd !== null && call.reported && call.costUsd !== null ? costUsd + call.costUsd : null;
       costUsd = next !== null && Number.isFinite(next) ? next : null;
@@ -1438,7 +1451,10 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
   const markTraceValidation = (traceIndex: number | undefined, error: unknown) => {
     if (traceIndex === undefined) return;
     const trace = traceCalls[traceIndex];
-    if (trace) { trace.outcome = 'validation_error'; trace.failure = errMessage(error); }
+    if (trace) {
+      countReview('llm.validation_errors', 1, { stage: trace.stage, pass: trace.pass, provider: trace.provider, model: trace.model });
+      trace.outcome = 'validation_error'; trace.failure = errMessage(error);
+    }
   };
   const completeStructured = async <T>(req: CompleteRequest, provider: LLMProvider, parse: (raw: string) => T, allowed: Array<{ path: string; lines: number[] }>, consumeRetryAllowance: () => boolean, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<T> => {
     const run = async (request: CompleteRequest) => {
@@ -1549,6 +1565,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       const cachedStatus = statusForFindings(cachedResult.findings, failOn);
       await setStatus(cachedStatus, cachedResult.reviewUrl ?? pr.htmlUrl, cachedResult.warnings);
       if (statusEnabled) cachedResult.status = cachedStatus;
+      countReview('runs', 1, { outcome: post && !cachedResult.posted ? 'publication_failed' : 'cache_hit' });
       return cachedResult;
     }
 
@@ -1556,6 +1573,13 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     const status = statusForFindings(result.findings, failOn);
     await setStatus(status, result.reviewUrl ?? pr.htmlUrl, result.warnings);
     if (statusEnabled) result.status = status;
+    const publicationFailed = post && !result.posted;
+    countReview('runs', 1, { outcome: publicationFailed ? 'publication_failed' : 'completed' });
+    if (!publicationFailed) {
+      for (const severity of ['critical', 'warning', 'nit']) {
+        countReview('findings', result.findings.filter((finding) => finding.severity === severity).length, { severity });
+      }
+    }
     return result;
   } catch (err) {
     // A superseded review is not a failure; the stale sha's status is left as is
@@ -1669,6 +1693,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       throw new Error('Review exceeds the file limit; split this pull request before reviewing.');
     }
     const files = reviewable;
+    recordReviewScope(files);
     let initialOmittedContext = 0;
     let escalationOmittedContext = 0;
     let verifierOmittedContext = 0;

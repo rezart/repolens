@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "name": "RepoLens Review Cost & Activity",
+  "description": "Reported provider cost only; missing prices are tracked separately. Selected diff scope is counted once per uncached review, not per retry and not all prompt code. Counters shown as rates, not lifetime totals. Requires the LLM dashboard metrics deployment; no historical backfill.",
+  "widgets": [
+    {
+      "id": "cost_model",
+      "title": "Reported LLM cost by model",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.llm.reported_cost_usd",
+            "aggregation": "rate",
+            "groupBy": "model"
+          }
+        ],
+        "unit": "USD/s"
+      }
+    },
+    {
+      "id": "cost_stage",
+      "title": "Reported LLM cost by operation",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.llm.reported_cost_usd",
+            "aggregation": "rate",
+            "groupBy": "stage"
+          }
+        ],
+        "unit": "USD/s"
+      }
+    },
+    {
+      "id": "tokens",
+      "title": "Token usage by type (tokens/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.llm.tokens",
+            "aggregation": "rate",
+            "groupBy": "token_type"
+          }
+        ]
+      }
+    },
+    {
+      "id": "runs",
+      "title": "Review executions by outcome (runs/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.runs",
+            "aggregation": "rate",
+            "groupBy": "outcome"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lines",
+      "title": "Selected diff lines by add/del/context (lines/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.diff_lines",
+            "aggregation": "rate",
+            "groupBy": "change"
+          }
+        ]
+      }
+    },
+    {
+      "id": "files",
+      "title": "Files selected for review (files/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.files",
+            "aggregation": "rate"
+          }
+        ]
+      }
+    },
+    {
+      "id": "findings",
+      "title": "Final findings by severity (findings/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.findings",
+            "aggregation": "rate",
+            "groupBy": "severity"
+          }
+        ]
+      }
+    },
+    {
+      "id": "unpriced",
+      "title": "Usage records with unknown cost (records/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.llm.unpriced_records",
+            "aggregation": "rate",
+            "groupBy": "role"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -3,6 +3,7 @@ import type { Db, UsageDayRow } from '../db.js';
 import { OpenRouterPricing } from './pricing.js';
 import type { PriceList } from './pricing.js';
 import type { UsageRole, UsageSink } from './types.js';
+import { recordUsageTelemetry } from '../telemetry.js';
 
 /** One UTC day of calls for a role/provider/model, with costs resolved. */
 export interface UsageReportRow {
@@ -73,6 +74,7 @@ export class UsageTracker {
           : null;
         cost.costUsd = next !== null && Number.isFinite(next) ? next : null;
       }
+      recordUsageTelemetry(role, record);
       try {
         this.db.insertUsage({
           role,
