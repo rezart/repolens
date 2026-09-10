@@ -26,10 +26,12 @@ describe('follow-up reconciliation', () => {
   });
 
   it('allows an unchanged caller finding only with cited evidence from the latest delta', () => {
-    const raw = JSON.stringify({ previous: [resolved], candidates: [{ ...decision, introduced: true, evidence, reason: 'The new auth requirement breaks this caller.' }] });
+    const candidate = { ...decision, introduced: true, evidence, reason: 'The new auth requirement breaks this caller.' };
+    const raw = JSON.stringify({ previous: [resolved], candidates: [candidate] });
     expect(reconcileFollowup(raw, lineage, [warning], head).findings).toEqual([warning]);
     const unrelated = { ...evidence, path: 'telemetry.ts', line: 1 };
-    expect(() => reconcileFollowup(raw.replace(JSON.stringify(evidence), JSON.stringify(unrelated)), lineage, [warning], head)).toThrow();
+    const invalid = JSON.stringify({ previous: [resolved], candidates: [{ ...candidate, evidence: unrelated }] });
+    expect(() => reconcileFollowup(invalid, lineage, [warning], head)).toThrow();
   });
 
   it('does not infer resolution from a missing previous finding', () => {
