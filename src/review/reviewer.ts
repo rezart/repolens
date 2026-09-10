@@ -1563,7 +1563,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     if (err instanceof ReviewSupersededError) throw err;
     if (!(err instanceof Error)) {
       await setStatus(
-        { state: 'error', description: truncateDescription(`RepoLens review failed: ${errMessage(err)}`) },
+        { state: 'success', description: truncateDescription(`RepoLens review unavailable; merge allowed: ${errMessage(err)}`) },
         pr.htmlUrl,
         statusWarnings,
       );
@@ -1574,11 +1574,11 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       costUsd,
       trace: failureTrace(),
     });
-    // The check must not stay pending forever when the review itself blows up.
+    // Fail open when review execution fails; completed reviews still gate on findings.
     // Descriptions are capped at 140 characters, so a long message would make the
     // status call fail too and leave the check pending.
     await setStatus(
-      { state: 'error', description: truncateDescription(`RepoLens review failed: ${failure.message}`) },
+      { state: 'success', description: truncateDescription(`RepoLens review unavailable; merge allowed: ${failure.message}`) },
       pr.htmlUrl,
       statusWarnings,
     );

@@ -32,9 +32,9 @@ Name tests `tests/**/*.test.ts`, mirroring the source path. Use Vitest `describe
 
 ## Commit & Pull Request Guidelines
 
-Follow history's Conventional Commit style, such as `feat(review): ...`, `fix(hook): ...`, or `docs: ...`. Follow `CLAUDE.md`: develop features and fixes in a separate worktree and branch, then open a PR against `main`. Describe the change and validation; link relevant issues and include screenshots for dashboard changes. RepoLens reviews are advisory: a failed, errored, pending, or missing `repolens/review` status must not block merging.
+Follow history's Conventional Commit style, such as `feat(review): ...`, `fix(hook): ...`, or `docs: ...`. Follow `CLAUDE.md`: develop features and fixes in a separate worktree and branch, then open a PR against `main`. Describe the change and validation; link relevant issues and include screenshots for dashboard changes. Before merging, require successful `repolens/review` status on the latest commit.
 
-After creating a PR, stay with it until it is approved and ready to merge. Repeatedly check for new comments, review feedback, and required check results; address actionable feedback and continue monitoring after each push. Verify that approval applies to the latest commit, all required checks pass (excluding the advisory `repolens/review` status), and no unresolved merge blockers remain. Then ping the user with the PR link and confirmation that it is ready to merge; do not merge automatically.
+After creating a PR, stay with it until it is approved and ready to merge. Repeatedly check for new comments, review feedback, and required check results; address actionable feedback and continue monitoring after each push. Verify that approval applies to the latest commit, all required checks (including `repolens/review`) pass, and no unresolved merge blockers remain. Then ping the user with the PR link and confirmation that it is ready to merge; do not merge automatically.
 
 ## Security & Configuration
 
