@@ -16,6 +16,7 @@ import { UsageTracker } from '../../src/usage/tracker.js';
 import { reviewCallCost } from '../../src/usage/review-cost.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
 import { JobQueue } from '../../src/jobs.js';
+import { FOLLOWUP_RECONCILIATION_PROMPT } from '../../src/review/followup.js';
 import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
 import {
   reviewPullRequest as runReviewPullRequest,
@@ -210,7 +211,10 @@ describe('fresh finding evidence validation', () => {
       { ...base, line: 4, title: 'Shared issue A' },
       { ...base, line: 3, title: 'Shared issue B', evidence: { ...base.evidence, line: 3 } },
     ];
-    const makeLlm = () => fakeLlm({ file: JSON.stringify({ findings }) });
+    const makeLlm = () => fakeLlm({ file: JSON.stringify({ findings }), followup: JSON.stringify({
+      previous: [{ id: 0, status: 'remaining', findingIndex: 0, reason: 'The same issue remains at the current head.', evidence: { path: 'src/app.ts', line: 3, side: 'new' } }],
+      candidates: [{ id: 0, introduced: false, reason: 'Previously reported.', evidence: null }],
+    }) });
     const ruleDb = openDb(':memory:');
     ruleDb.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
     ruleDb.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
@@ -218,7 +222,7 @@ describe('fresh finding evidence validation', () => {
     await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: firstGithub.github }, { repoId: REPO_ID, prNumber: 42 });
     const firstComment = firstGithub.reviews[0]!.input.comments[0]!;
     expect(firstComment.body).toContain('Related locations:');
-    const secondGithub = fakeGithub(DIFF, PR, { existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
+    const secondGithub = fakeGithub(DIFF, PR, { headFiles: { 'src/app.ts': 'one\ntwo\nthree\nfour\nfive' }, existingComments: [{ ...firstComment, line: firstComment.line, user: 'repolens' }] });
     const second = await reviewPullRequest({ db: ruleDb, llm: makeLlm().provider, retrieve: retrieveOne, github: secondGithub.github }, { repoId: REPO_ID, prNumber: 42, force: true });
     expect(secondGithub.reviews[0]!.input.comments).toEqual([]);
     expect(second.warnings).toContain('Skipped 1 findings already commented');
@@ -522,6 +526,7 @@ const CHUNK: RetrievedChunk = {
 };
 
 interface FakeLlmOptions {
+  followup?: string;
   file?: string | (() => string);
   summary?: string;
   allowDeleted?: boolean;
@@ -535,6 +540,7 @@ function fakeLlm(opts: FakeLlmOptions = {}) {
     concurrency: 2,
     async complete(req) {
       calls.push(req);
+      if (req.system === FOLLOWUP_RECONCILIATION_PROMPT && opts.followup) return opts.followup;
       if (req.system === FILE_REVIEW_SYSTEM_PROMPT) {
         if (!opts.allowDeleted && req.messages[0]!.content.includes('File under review: src/gone.ts')) return '{"findings":[]}';
         if (opts.allowDeleted && !req.messages[0]!.content.includes('File under review: src/gone.ts')) return '{"findings":[]}';
@@ -1972,13 +1978,58 @@ describe('reviewPullRequest lineage', () => {
     '',
   ].join('\n');
 
+  it('reserves mandatory follow-up capacity before spending on discovery', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done', summary: 'Earlier.',
+      verdict: 'approve', comments_json: '[]', posted: 1, error: null });
+    const calls: CompleteRequest[] = [];
+    const provider: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, complete: async (req) => {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], findings: [], summary: 'Clean.', verdict: 'approve' });
+    } };
+    const gh = fakeGithub(DIFF, { ...PR, body: 'x'.repeat(680_000) }, { compare: DELTA });
+    await expect(reviewPullRequest(makeDeps(db, { llm: provider, github: gh.github }), { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow(/budget/i);
+    expect(calls).toEqual([]);
+    expect(gh.reviews).toEqual([]);
+  });
+
+  it('reconciles the endpoint fix without posting unrelated telemetry warnings, including on cache reuse', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done',
+      summary: 'First pass.', verdict: 'request_changes', comments_json: JSON.stringify([
+        { path: 'src/app.ts', line: 4, severity: 'critical', title: 'Assignment in condition', body: 'Use ===.' },
+      ]), posted: 1, error: null });
+    const diff = DIFF + '\ndiff --git a/src/telemetry.ts b/src/telemetry.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/telemetry.ts\n@@ -0,0 +1 @@\n+startSdk();\n';
+    const calls: CompleteRequest[] = [];
+    const provider: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, complete: async (req) => {
+      calls.push(req);
+      if (req.system === FOLLOWUP_RECONCILIATION_PROMPT) return JSON.stringify({
+        previous: [{ id: 0, status: 'resolved', findingIndex: null, reason: 'The latest delta replaces assignment with equality.', evidence: { path: 'src/app.ts', line: 4, side: 'new' } }],
+        candidates: [{ id: 0, introduced: false, reason: 'Telemetry is unchanged and unrelated to the condition fix.', evidence: null }],
+      });
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts', 'src/telemetry.ts'], summary: 'Generic first-review summary.', verdict: 'comment', findings: [
+        { path: 'src/telemetry.ts', line: 1, severity: 'warning', title: 'Invalid SDK option', body: 'An unrelated allegation.' },
+      ] });
+    } };
+    const gh = fakeGithub(diff, PR, { compare: DELTA, headFiles: { 'src/app.ts': 'a\nb\nc\nif (n === 0) return;', 'src/telemetry.ts': 'startSdk();' } });
+    const deps = makeDeps(db, { llm: provider, github: gh.github });
+    const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42 });
+    expect(result.findings).toEqual([]);
+    expect(result.summary).toContain('Resolved: Assignment in condition');
+    expect(gh.reviews[0]!.input.body).toContain('Follow-up review 2');
+    expect(gh.reviews[0]!.input.body).not.toContain('Invalid SDK option');
+    expect(calls.some((req) => req.system === FOLLOWUP_RECONCILIATION_PROMPT)).toBe(true);
+    expect(result.trace!.stages.flatMap((stage) => stage.calls)).toHaveLength(calls.length);
+    const cached = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42 });
+    expect(cached.summary).toBe(result.summary);
+  });
+
   it('feeds the previous review, the delta and the commits to the prompts and notes the review number in the body', async () => {
     db.insertReview({
       repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done', summary: 'First pass.', verdict: 'request_changes',
       comments_json: JSON.stringify([{ path: 'src/app.ts', line: 5, severity: 'critical', title: 'Assignment in condition', body: 'Use ===.' }]),
       posted: 1, error: null,
     });
-    const llm = fakeLlm();
+    const llm = fakeLlm({ followup: JSON.stringify({ previous: [{ id: 0, status: 'resolved', findingIndex: null,
+      reason: 'The delta replaces assignment with equality.', evidence: { path: 'src/app.ts', line: 4, side: 'new' } }], candidates: [] }) });
     const gh = fakeGithub(DIFF, PR, {
       commits: [{ sha: 'head-sha-0', message: 'feat: run' }, { sha: 'head-sha-1', message: 'fix: compare' }],
       compare: DELTA,
@@ -1991,7 +2042,7 @@ describe('reviewPullRequest lineage', () => {
     expect(file).toContain('- [critical] src/app.ts:5 — Assignment in condition');
     expect(file).toMatch(/\+\s+if \(n === 0\) return;/);
     expect(file).toContain('- head-sh fix: compare');
-    expect(result.summary).toBe('The review found no actionable issues in the supplied changes.');
+    expect(result.summary).toContain('Resolved: Assignment in condition');
     expect(gh.reviews[0]!.input.body).toContain('Review 2 of this pull request; 1 commit since head-sh');
     expect(result.warnings).toEqual([]);
   });
@@ -2011,7 +2062,7 @@ describe('reviewPullRequest lineage', () => {
     expect(calls[0]!.system).not.toContain('what the pull request changes');
     expect(calls[0]!.messages[0]!.content).not.toContain('Original PR overview.');
     expect(calls[0]!.messages[0]!.content).toContain('if (n === 0) return;');
-    expect(gh.reviews[0]!.input.body).toContain('The review found no actionable issues in the supplied changes.');
+    expect(gh.reviews[0]!.input.body).toContain('Follow-up review 2');
   });
 
   it('reads overview docs at the base sha and puts them in the file prompt', async () => {
@@ -2237,7 +2288,7 @@ describe('reviewPullRequest commit statuses', () => {
     const strict = fakeGithub();
     const res = await reviewPullRequest(
       deps(strict, fakeLlm({ file: warningFinding }), { failOn: 'warning' }),
-      { repoId: REPO_ID, prNumber: 42, force: true },
+      { repoId: REPO_ID, prNumber: 42, fresh: true },
     );
     expect(strict.statuses[1]!.input).toMatchObject({ state: 'failure', description: '1 warning' });
     expect(res.status!.state).toBe('failure');

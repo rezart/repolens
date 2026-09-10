@@ -10,6 +10,7 @@ import type { RetrieveFn, RetrievedChunk } from '../search/types.js';
 import { truncateDescription } from './github.js';
 import type { CommitStatusState, GitHubClient, PullRequest } from './github.js';
 import { parseUnifiedDiff, changedNewLines, hunkText, type DiffFile } from './diff.js';
+import { FOLLOWUP_RECONCILIATION_PROMPT, reconcileFollowup } from './followup.js';
 import { buildLineage, deltaForFile, type Lineage } from './lineage.js';
 import { buildHistoricalContext, type HistoricalPr } from './history.js';
 import { assessChange, selectReviewCandidates, type ChangeRisk } from './selection.js';
@@ -826,7 +827,7 @@ export function buildReviewBody(input: {
   const findings = selectPostedFindings(input.findings);
   const counts = { critical: 0, warning: 0, nit: 0 };
   for (const f of findings) counts[f.severity]++;
-  const parts: string[] = ['## RepoLens review', '', input.summary.trim(), ''];
+  const parts: string[] = [input.summary.startsWith('Follow-up review ') ? '## RepoLens follow-up review' : '## RepoLens review', '', input.summary.trim(), ''];
   parts.push(
     `**Verdict:** ${input.verdict} · **Findings:** ${findings.length} (${counts.critical} critical, ${counts.warning} warnings, ${counts.nit} nits)`,
   );
@@ -1531,7 +1532,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         reviewId: cached.id,
         prNumber: cached.pr_number,
         headSha: cached.head_sha,
-        summary: buildFindingSummary(findings),
+        summary: cached.summary?.startsWith('Follow-up review ') ? cached.summary : buildFindingSummary(findings),
         verdict: verdictForFindings(findings),
         findings,
         posted: cached.posted === 1,
@@ -1818,13 +1819,26 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     // independent verifier; keep older staged/non-Qwen callers unchanged.
     const complementaryDiscovery = Boolean(deps.dualDiscovery) && budgeted && Boolean(verifierLlm) && !escalationLlm && /qwen/i.test(llm.model);
     let batch: { findings: Finding[] } | undefined;
+    let followupReserve = 0;
+    if (budgeted && lineage.previous) {
+      // ponytail: reserve four bytes per possible finding-output token plus a
+      // bounded head context; use provider tokenization if this becomes restrictive.
+      const reserve = reviewCostUpperBound({
+        system: FOLLOWUP_RECONCILIATION_PROMPT,
+        messages: [{ role: 'user', content: JSON.stringify({ previous: lineage.previous.findings, delta: lineage.previous.delta }) +
+          ' '.repeat(REVIEW_ESCALATION_MAX_OUTPUT * 4 + HEAD_CONTEXT_CHARS_MAX) }],
+        maxTokens: REVIEW_VERIFIER_MAX_OUTPUT, reviewStage: 'verification',
+      });
+      followupReserve = reserve * (maxRetries > 0 ? 2 : 1);
+      reservedUsd += followupReserve;
+    }
     if (budgeted) {
       const req: CompleteRequest = {
         system: lineage.previous ? FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT : BATCH_REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
           prTitle: pr.title, prBody: pr.body, instructions: repo.instructions,
           overview: lineage.overview, commits: lineage.commits,
-          previous: lineage.previous ? { ...lineage.previous, summary: undefined, delta: undefined } : undefined,
+          previous: lineage.previous ? { ...lineage.previous, summary: undefined } : undefined,
           files: files.map((f) => ({
             path: f.newPath ?? f.oldPath!, status: f.status, diff: hunkText(f, Infinity),
             allowedFindingLines: [...allowedFindingLines(f)].sort((a, b) => a - b),
@@ -1836,7 +1850,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       // Reject the core prompt before the retrieval loop or any inference call.
       const coreCost = reviewCostUpperBound(req);
-      if (coreCost > REVIEW_MAX_USD) {
+      const discoveryBudget = REVIEW_MAX_USD - reservedUsd;
+      if (coreCost > discoveryBudget) {
         throw new Error('Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       // Reserve half the ceiling for one retry while keeping the full core diff.
@@ -1846,8 +1861,8 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         ? reviewCostUpperBound({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) - coreCost
         : 0;
       const optionalContextBudget = complementaryDiscovery
-        ? (REVIEW_MAX_USD - complementaryOverhead) / 2
-        : maxRetries > 0 ? Math.max(coreCost, REVIEW_MAX_USD / 2) : REVIEW_MAX_USD;
+        ? (discoveryBudget - complementaryOverhead) / 2
+        : maxRetries > 0 ? Math.max(coreCost, discoveryBudget / 2) : discoveryBudget;
       // Share each context block once across all files; changed code always gets
       // its full diff before optional context consumes any of the budget.
       let omitted = 0;
@@ -1918,7 +1933,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         await assertHeadUnchanged();
         const complementaryReq: CompleteRequest = { ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT };
         const combinedEstimate = reviewCostUpperBound(req) + reviewCostUpperBound(complementaryReq);
-        if (combinedEstimate > REVIEW_MAX_USD) {
+        if (combinedEstimate > discoveryBudget) {
           throw new Error(`Combined discovery passes exceed the $0.50 review budget; estimated $${combinedEstimate.toFixed(6)}; no review was published.`);
         }
         // Reserve both worst-case calls before either provider starts.
@@ -2533,7 +2548,54 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     findings = selectPostedFindings(findings);
 
     await assertHeadUnchanged();
-    const summary = buildFindingSummary(findings);
+    let summary = buildFindingSummary(findings);
+    if (lineage.previous) {
+      reservedUsd -= followupReserve;
+      const previous = lineage.previous;
+      if (previous.findings.length || findings.length) {
+        const relevantPaths = new Set([...previous.findings, ...findings].map((finding) => finding.path));
+        for (const file of previous.delta ?? []) if (file.newPath) relevantPaths.add(file.newPath);
+        for (const path of relevantPaths) {
+          if (headContents.has(path) || headFetched.has(path)) continue;
+          const content = await github.getFileContent(repo.owner, repo.name, path, pr.headSha);
+          if (content !== null) headContents.set(path, content);
+        }
+        let headBytes = 0;
+        const head = [...relevantPaths].flatMap((path) => {
+          const content = headContents.get(path);
+          if (content === undefined) return [];
+          const anchors = [...previous.findings, ...findings].filter((finding) => finding.path === path).map((finding) => finding.line);
+          const delta = previous.delta?.find((file) => file.newPath === path);
+          if (delta) anchors.push(...headRelevantLines(delta));
+          const evidence = { path, lines: numberedHeadLines(content, anchors, OWN_HEAD_CHARS_MAX) };
+          const bytes = Buffer.byteLength(JSON.stringify(evidence));
+          if (headBytes + bytes > HEAD_CONTEXT_CHARS_MAX) return [];
+          headBytes += bytes;
+          return [evidence];
+        });
+        const req: CompleteRequest = {
+          system: FOLLOWUP_RECONCILIATION_PROMPT,
+          messages: [{ role: 'user', content: JSON.stringify({
+            previous: previous.findings.map((finding, id) => ({ id, finding })),
+            candidates: findings.map((finding, id) => ({ id, finding })),
+            delta: previous.delta, head,
+          }) }],
+          json: true, maxTokens: REVIEW_VERIFIER_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'verification',
+        };
+        verifierExecuted = true;
+        for (const path of relevantPaths) verifierSelectedPaths.add(path);
+        const reconciled = await completeStructured(req, verifierLlm ?? activeLlm,
+          (raw) => reconcileFollowup(raw, lineage, findings, head),
+          head.map((file) => ({ path: file.path, lines: file.lines.map((line) => line.line) })),
+          () => consumeRetryAllowance(true));
+        findings = reconciled.findings;
+        verifierFindingsTrace = findings.slice();
+        summary = reconciled.summary;
+      } else {
+        summary = reconcileFollowup('{"previous":[],"candidates":[]}', lineage, [], []).summary;
+      }
+      await assertHeadUnchanged();
+    }
     const verdict = verdictForFindings(findings);
     const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'arbitration' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; evidenceDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget' | 'disabled'; missingEvidence?: ReviewTrace['stages'][number]['missingEvidence']; findings?: Finding[] } = {}) => ({
       stage,
