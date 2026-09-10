@@ -190,6 +190,23 @@ describe('fresh finding evidence validation', () => {
     expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, evidence: { ...base.evidence, line: 3 } }] }), file)).toThrow('evidence');
   });
 
+  it.each([
+    { evidence: { path: 'private-model-output' }, reason: 'evidence.path must match finding.path' },
+    { evidence: { line: 3 }, reason: 'evidence.line must match finding.line' },
+    { evidence: { line: 'private-model-output' }, reason: 'evidence.line must be an integer' },
+    { evidence: { trigger: ' ' }, reason: 'evidence.trigger must be non-empty' },
+    { evidence: { consequence: null }, reason: 'evidence.consequence must be non-empty' },
+    { evidence: { rule: null }, category: 'repository_rule', reason: 'evidence.rule.path must be non-empty' },
+    { evidence: { rule: { path: 'CLAUDE.md', line: 0, quote: 'private-model-output' } }, category: 'repository_rule', reason: 'evidence.rule.line must be a positive integer' },
+    { evidence: { rule: { path: 'CLAUDE.md', line: 1, quote: '' } }, category: 'repository_rule', reason: 'evidence.rule.quote must be non-empty' },
+  ])('identifies $reason without exposing model prose', ({ evidence, category, reason }) => {
+    const parse = () => parseFindings(JSON.stringify({ findings: [{ ...base, category: category ?? base.category,
+      evidence: { ...base.evidence, ...evidence } }] }), file);
+    expect(parse).toThrow(reason);
+    expect(parse).toThrow('src/app.ts:4');
+    expect(parse).not.toThrow('private-model-output');
+  });
+
   it('requires an exact repository rule citation', () => {
     expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'repository_rule' }] }), file)).toThrow('evidence');
     expect(() => parseFindings(JSON.stringify({ findings: [{ ...base, category: 'repository_rule', evidence: { ...base.evidence, rule: { path: 'CLAUDE.md', line: 0, quote: '' } } }] }), file)).toThrow('evidence');
@@ -1042,6 +1059,26 @@ describe('reviewPullRequest', () => {
     expect(calls).toBe(2);
     expect(result.posted).toBe(true);
     expect(gh.reviews).toHaveLength(1);
+  });
+
+  it('passes evidence diagnostics to the corrective retry and records them in the review trace', async () => {
+    const requests: CompleteRequest[] = [];
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, async complete(req) {
+      requests.push(req);
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Reviewed.', verdict: 'approve',
+        findings: requests.length === 1 ? [{ path: 'src/app.ts', line: 4, severity: 'warning', title: 'Bad guard', body: 'Use ===.',
+          category: 'correctness', confidence: 'high', rootCause: 'bad guard',
+          evidence: { path: 'src/app.ts', line: 3, trigger: '', consequence: 'private-model-output' } }] : [] });
+    } };
+    const result = await runReviewPullRequest({ db, llm, retrieve: retrieveOne, github: fakeGithub().github },
+      { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(requests).toHaveLength(2);
+    const correction = JSON.parse(requests[1]!.messages[0]!.content).validationError;
+    expect(correction).toContain('evidence.line must match finding.line');
+    expect(correction).toContain('evidence.trigger must be non-empty');
+    expect(correction).not.toContain('private-model-output');
+    expect(result.trace!.stages[0]!.calls[0]).toMatchObject({ outcome: 'validation_error', failure: correction });
+    expect(result.findings).toEqual([]);
   });
 
   it.each([undefined, 1])('stops malformed response retries after one correction %s', async (maxRetries) => {

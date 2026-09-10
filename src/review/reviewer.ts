@@ -1099,9 +1099,17 @@ export function parseFindings(raw: string, file: DiffFile): Finding[] {
     const rulePath = typeof rule?.path === 'string' ? rule.path.trim() : '';
     const ruleLine = typeof rule?.line === 'number' ? rule.line : typeof rule?.line === 'string' ? Number(rule.line) : NaN;
     const ruleQuote = typeof rule?.quote === 'string' ? rule.quote.trim() : '';
-    if (evidencePath !== path || evidenceLine !== line || !Number.isInteger(evidenceLine) || !trigger || !consequence ||
-        (category === 'repository_rule' && (!rulePath || !Number.isInteger(ruleLine) || ruleLine < 1 || !ruleQuote))) {
-      throw new Error(`model output contains invalid finding evidence for ${path}`);
+    const evidenceErrors = [
+      evidencePath !== path && 'evidence.path must match finding.path',
+      (!Number.isInteger(evidenceLine) ? 'evidence.line must be an integer' : evidenceLine !== line && 'evidence.line must match finding.line'),
+      !trigger && 'evidence.trigger must be non-empty',
+      !consequence && 'evidence.consequence must be non-empty',
+      category === 'repository_rule' && !rulePath && 'evidence.rule.path must be non-empty',
+      category === 'repository_rule' && (!Number.isInteger(ruleLine) || ruleLine < 1) && 'evidence.rule.line must be a positive integer',
+      category === 'repository_rule' && !ruleQuote && 'evidence.rule.quote must be non-empty',
+    ].filter(Boolean);
+    if (evidenceErrors.length) {
+      throw new Error(`model output contains invalid finding evidence for ${path}:${line}: ${evidenceErrors.join('; ')}`);
     }
     out.push({ path, line: bodyOnly ? 0 : line, severity, title: title || body.slice(0, 60), body: body || title,
       category: category as FindingCategory, confidence: confidence as FindingConfidence, rootCause,
