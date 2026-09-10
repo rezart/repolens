@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { metrics } from '@opentelemetry/api';
+import { InMemoryMetricExporter, MeterProvider, PeriodicExportingMetricReader, AggregationTemporality } from '@opentelemetry/sdk-metrics';
 import { openDb, type Db } from '../../src/db.js';
 import { NetworkProviderError, ProviderError, type CompleteRequest, type LLMProvider } from '../../src/llm/types.js';
 import type { RetrieveFn, RetrievedChunk } from '../../src/search/types.js';
@@ -699,6 +701,41 @@ describe('reviewPullRequest', () => {
     db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
   });
   afterEach(() => db.close());
+
+  it('exports review scope once, distinguishes cached runs, and counts real provider calls', async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const meter = new MeterProvider({ readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })] });
+    metrics.setGlobalMeterProvider(meter);
+    try {
+      const llm = fakeLlm();
+      const deps = makeDeps(db, { llm: llm.provider });
+      await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42 });
+      await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42 });
+      await expect(reviewPullRequest(makeDeps(db, { github: fakeGithub(DIFF, PR, { diffError: new Error('offline') }).github }), { repoId: REPO_ID, prNumber: 42, force: true })).rejects.toThrow('offline');
+      const unposted = await reviewPullRequest({ ...deps, github: fakeGithub(DIFF, PR, { createReviewError: () => new Error('GitHub unavailable') }).github }, { repoId: REPO_ID, prNumber: 42, force: true });
+      expect(unposted.posted).toBe(false);
+      await meter.forceFlush();
+      const all = exporter.getMetrics().flatMap((r) => r.scopeMetrics.flatMap((s) => s.metrics));
+      const points = (name: string) => all.find((m) => m.descriptor.name === name)?.dataPoints;
+      expect(points('repolens.review.runs')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ attributes: { outcome: 'started' }, value: 4 }),
+        expect.objectContaining({ attributes: { outcome: 'completed' }, value: 1 }),
+        expect.objectContaining({ attributes: { outcome: 'cache_hit' }, value: 1 }),
+        expect.objectContaining({ attributes: { outcome: 'failed' }, value: 1 }),
+        expect.objectContaining({ attributes: { outcome: 'publication_failed' }, value: 1 }),
+      ]));
+      expect(points('repolens.review.files')).toEqual([expect.objectContaining({ value: 4 })]);
+      expect(points('repolens.review.diff_lines')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ attributes: { change: 'add' }, value: 4 }),
+        expect.objectContaining({ attributes: { change: 'del' }, value: 4 }),
+        expect.objectContaining({ attributes: { change: 'ctx' }, value: 8 }),
+      ]));
+      expect(points('repolens.review.llm.calls')?.reduce((sum, p) => sum + Number(p.value), 0)).toBe(llm.calls.length);
+    } finally {
+      await meter.shutdown();
+      metrics.disable();
+    }
+  });
 
   it('fresh reviews ignore prior review lineage and existing GitHub comments while keeping full findings', async () => {
     db.insertReview({

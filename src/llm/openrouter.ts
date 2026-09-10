@@ -150,11 +150,13 @@ export class OpenRouterProvider implements LLMProvider {
 
   async complete(req: CompleteRequest): Promise<string> {
     const timeoutMs = req.reviewStage === 'escalation' ? Math.max(this.timeoutMs, ESCALATION_TIMEOUT_MS) : this.timeoutMs;
-    const { content, finishReason } = await traceAi(this.model, async () => this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs)));
-    if (req.reviewBudget && finishReason !== 'stop') {
-      throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
-    }
-    return content;
+    return traceAi(this.model, async () => {
+      const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs));
+      if (req.reviewBudget && finishReason !== 'stop') {
+        throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
+      }
+      return content;
+    }, { provider: this.name });
   }
 
   /**
@@ -163,7 +165,7 @@ export class OpenRouterProvider implements LLMProvider {
    * because deltas have already been handed out.
    */
   async stream(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
-    return traceAi(this.model, () => this.streamResult(req, onDelta));
+    return traceAi(this.model, () => this.streamResult(req, onDelta), { provider: this.name });
   }
 
   private async streamResult(req: CompleteRequest, onDelta: OnDelta): Promise<string> {

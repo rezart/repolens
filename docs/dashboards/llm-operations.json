@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "name": "RepoLens LLM Operations",
+  "description": "PR review provider calls by pipeline stage. Provider success means a response returned; validation errors are tracked separately. Requires the LLM dashboard metrics deployment. Counters shown as rates; latency is an average, not a percentile.",
+  "widgets": [
+    {
+      "id": "llm_calls_stage",
+      "title": "Review LLM calls by stage (calls/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.llm.calls",
+            "aggregation": "rate",
+            "groupBy": "stage"
+          }
+        ]
+      }
+    },
+    {
+      "id": "llm_duration_stage",
+      "title": "Average review LLM duration by stage",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.llm.duration.avg",
+            "aggregation": "avg",
+            "groupBy": "stage"
+          }
+        ],
+        "unit": "s"
+      }
+    },
+    {
+      "id": "llm_calls_outcome",
+      "title": "Review provider call outcomes (calls/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.llm.calls",
+            "aggregation": "rate",
+            "groupBy": "outcome"
+          }
+        ]
+      }
+    },
+    {
+      "id": "llm_validation",
+      "title": "Invalid review responses by stage (events/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.llm.validation_errors",
+            "aggregation": "rate",
+            "groupBy": "stage"
+          }
+        ]
+      }
+    },
+    {
+      "id": "llm_budget",
+      "title": "Calls blocked before execution by budget (events/s)",
+      "widgetType": "line_chart",
+      "config": {
+        "sources": [
+          {
+            "type": "metric",
+            "name": "repolens.review.budget_blocks",
+            "aggregation": "rate",
+            "groupBy": "stage"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import type { RunProcess, Semaphore } from './spawn.js';
 import { ProviderError } from './types.js';
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { UsageRecord, UsageSink } from '../usage/types.js';
+import { traceAi } from '../telemetry.js';
 
 export const JSON_INSTRUCTION = 'Respond with a single JSON object and nothing else.';
 
@@ -204,11 +205,11 @@ export class ClaudeCliProvider implements LLMProvider {
   }
 
   complete(req: CompleteRequest): Promise<string> {
-    return this.gate.run(() => this.runOnce(req));
+    return this.gate.run(() => traceAi(this.model, () => this.runOnce(req), { provider: this.name }));
   }
 
   stream(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
-    return this.gate.run(() => this.runStreaming(req, onDelta));
+    return this.gate.run(() => traceAi(this.model, () => this.runStreaming(req, onDelta), { provider: this.name }));
   }
 
   /**
