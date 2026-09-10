@@ -58,7 +58,7 @@ Tests never touch the network or real CLIs: providers take an injected `fetch` o
   cd ../repolens-<feature> && npm install
   ```
   The worktree gets its own `node_modules`; copy `.env` in if you need to run the server from it (it is gitignored).
-- When the work is done and `npm test` plus `npm run typecheck` pass, push the branch and open a pull request against `main`. RepoLens reviews the PR and sets the `repolens/review` status; `main` requires it, so fix any critical findings and push again until the status is green, then merge (`gh pr merge --merge --delete-branch`). A PreToolUse hook (`.claude/settings.json` → `scripts/require-review.sh`) refuses `gh pr merge` while the PR head's `repolens/review` status is anything but `success`, so every pushed commit must be reviewed before it can be merged; pass the PR number explicitly.
+- When the work is done and `npm test` plus `npm run typecheck` pass, push the branch and open a pull request against `main`. RepoLens reviews are advisory: a failed, errored, pending, or missing `repolens/review` status must not block merging. Address actionable findings, verify any other required checks, and report when the PR is ready; do not merge automatically.
 - Remove the worktree after the merge: `git worktree remove ../repolens-<feature>`.
 
 ## Operational notes
@@ -66,4 +66,4 @@ Tests never touch the network or real CLIs: providers take an injected `fetch` o
 - `data/` holds the database and clones and is gitignored. `.env` is gitignored; `.env.example` documents every variable.
 - `docs/INTEGRATION.md` is the recipe for making the review a required check on another repository (ruleset JSON, verification, security caveat that a PAT-set status is settable by any writer). `docs/plans/` holds the original design and plan.
 - `deploy/com.repolens.server.plist` contains absolute paths for this checkout; regenerate it if the directory moves.
-- The repository's own PRs are reviewed by a RepoLens instance and gated by the `repolens/review` status on `main`.
+- The repository's own PRs are reviewed by a RepoLens instance. Its `repolens/review` status is advisory and is not required on `main`.
