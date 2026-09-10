@@ -3,6 +3,7 @@ import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE, REVIEW_VERIFIER_INPUT_PRICE, REVIEW_VERIFIER_OUTPUT_PRICE, REVIEW_ESCALATION_INPUT_PRICE, REVIEW_ESCALATION_OUTPUT_PRICE, REVIEW_ARBITRATION_INPUT_PRICE, REVIEW_ARBITRATION_OUTPUT_PRICE } from '../review/budget.js';
+import { traceAi } from '../telemetry.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -149,7 +150,7 @@ export class OpenRouterProvider implements LLMProvider {
 
   async complete(req: CompleteRequest): Promise<string> {
     const timeoutMs = req.reviewStage === 'escalation' ? Math.max(this.timeoutMs, ESCALATION_TIMEOUT_MS) : this.timeoutMs;
-    const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs));
+    const { content, finishReason } = await traceAi(this.model, async () => this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs)));
     if (req.reviewBudget && finishReason !== 'stop') {
       throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
     }
@@ -162,6 +163,10 @@ export class OpenRouterProvider implements LLMProvider {
    * because deltas have already been handed out.
    */
   async stream(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
+    return traceAi(this.model, () => this.streamResult(req, onDelta));
+  }
+
+  private async streamResult(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
     const res = await this.post(this.buildPayload(req, true));
     const body = res.body;
     if (!body) throw new ProviderError('openrouter', 'streaming response had no body', res.status);

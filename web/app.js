@@ -113,6 +113,14 @@ async function api(path, options = {}) {
   return data;
 }
 
+async function initTraceway() {
+  if (!state.token || !window.Traceway) return;
+  try {
+    const config = await api('/api/traceway/config');
+    if (config.connectionString) window.Traceway.init(config.connectionString, { version: config.version });
+  } catch { /* Observability must not block the dashboard. */ }
+}
+
 /**
  * POST that consumes a text/event-stream response. `onEvent(name, data)` is
  * called per SSE frame. Returns false when the server answered with plain JSON
@@ -1357,6 +1365,7 @@ function init() {
     dom.tokenHint.classList.remove('hint-error');
     loadHealth();
     loadRepos();
+    initTraceway();
   });
   dom.tokenInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('token-save').click(); });
 
@@ -1393,6 +1402,7 @@ function init() {
 
   loadHealth();
   loadRepos();
+  initTraceway();
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

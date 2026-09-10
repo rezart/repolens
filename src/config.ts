@@ -7,6 +7,7 @@ const envSchema = z.object({
   REPOLENS_HOST: z.string().min(1).default('127.0.0.1'),
   REPOLENS_PUBLIC_URL: z.string().default(''),
   REPOLENS_REVISION: z.string().trim().default(''),
+  TRACEWAY_WEB_CONNECTION_STRING: z.string().default(''),
 
   LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli']).default('openrouter'),
   LLM_MODEL: z.string().default(''),
@@ -76,6 +77,7 @@ export interface Config {
   hostname?: string;
   publicUrl: string;
   revision: string | null;
+  tracewayWebConnectionString?: string;
   llm: {
     provider: LLMProviderName;
     model: string;
@@ -134,6 +136,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     hostname: e.REPOLENS_HOST,
     publicUrl: e.REPOLENS_PUBLIC_URL,
     revision: e.REPOLENS_REVISION || null,
+    tracewayWebConnectionString: e.TRACEWAY_WEB_CONNECTION_STRING,
     llm: {
       provider: e.LLM_PROVIDER,
       model: e.LLM_MODEL,
