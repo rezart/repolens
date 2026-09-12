@@ -946,7 +946,7 @@ describe('reviewPullRequest', () => {
     const retrieve: RetrieveFn = async () => { retrievals++; return [CHUNK]; };
     await expect(reviewPullRequest({ db, llm, retrieve, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('$0.50');
     expect(retrievals).toBe(0);
-    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
     expect(gh.reviews).toHaveLength(0);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
@@ -980,9 +980,9 @@ describe('reviewPullRequest', () => {
     await queue.idle();
     expect(db.getJob(failed.id)?.status).toBe('error');
     expect(db.getJob(failed.id)?.error).toContain('No JSON object found in model output');
-    expect(db.getJob(failed.id)?.progress).toContain('commit status error');
+    expect(db.getJob(failed.id)?.progress).toContain('commit status success');
     expect(db.getJob(next.id)?.status).toBe('done');
-    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
     expect(gh.reviews).toHaveLength(0);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
   });
@@ -1418,7 +1418,7 @@ describe('reviewPullRequest', () => {
     await expect(reviewPullRequest({ db, llm, maxRetries, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('503');
     expect(models).toEqual(['first/coder', 'second/coder', 'third/coder', 'third/coder'].slice(0, maxRetries + 1));
     expect(gh.reviews).toHaveLength(0);
-    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
   });
 
   it('starts each review at the primary without mutating shared providers', async () => {
@@ -1740,7 +1740,7 @@ describe('reviewPullRequest', () => {
     } });
     const gh = fakeGithub();
     await expect(reviewPullRequest({ db, llm: llm.provider, retrieve: retrieveOne, github: gh.github, statusContext: 'repolens/review' }, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('file review failed');
-    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
     expect(db.findReview(REPO_ID, 42, PR.headSha)).toBeUndefined();
     expect(gh.reviews).toEqual([]);
   });
@@ -2389,15 +2389,15 @@ describe('reviewPullRequest commit statuses', () => {
     expect(second.status).toEqual({ state: 'failure', description: '1 critical' });
   });
 
-  it('sets an error status and rethrows when the review blows up', async () => {
+  it('allows merging and rethrows when the review blows up', async () => {
     const llm = fakeLlm();
     const gh = fakeGithub(DIFF, PR, { diffError: new Error('GitHub 500 GET diff') });
     await expect(reviewPullRequest(deps(gh, llm), { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('GitHub 500 GET diff');
-    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
-    expect(gh.statuses[1]!.input.description).toBe('RepoLens review failed: GitHub 500 GET diff');
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
+    expect(gh.statuses[1]!.input.description).toBe('RepoLens review unavailable; merge allowed: GitHub 500 GET diff');
   });
 
-  it('sets an error status and rethrows when posting a cached review blows up', async () => {
+  it('allows merging and rethrows when posting a cached review blows up', async () => {
     const llm = fakeLlm({ file: criticalFinding });
     const gh = fakeGithub();
     const d = deps(gh, llm);
@@ -2409,8 +2409,8 @@ describe('reviewPullRequest commit statuses', () => {
     // the cached post; metadata now comes from the saved review, not the provider.
     db.raw.prepare('update reviews set comments_json=? where id=?').run('[null]', db.findReview(REPO_ID, 42, PR.headSha)!.id);
     await expect(reviewPullRequest(d, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow();
-    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'error']);
-    expect(gh.statuses[1]!.input.description).toContain('RepoLens review failed:');
+    expect(gh.statuses.map((s) => s.input.state)).toEqual(['pending', 'success']);
+    expect(gh.statuses[1]!.input.description).toContain('RepoLens review unavailable; merge allowed:');
   });
 
   it('truncates a long error description to the 140 characters GitHub allows', async () => {

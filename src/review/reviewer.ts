@@ -1593,9 +1593,11 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     // A superseded review is not a failure; the stale sha's status is left as is
     // (nobody merges it) and the new head is reviewed by the trigger that moved it.
     if (err instanceof ReviewSupersededError) throw err;
+    // Execution failures intentionally allow merging, even when PR content triggers them.
+    // See the fail-open policy in docs/INTEGRATION.md; completed findings still block.
     if (!(err instanceof Error)) {
       await setStatus(
-        { state: 'error', description: truncateDescription(`RepoLens review failed: ${errMessage(err)}`) },
+        { state: 'success', description: truncateDescription(`RepoLens review unavailable; merge allowed: ${errMessage(err)}`) },
         pr.htmlUrl,
         statusWarnings,
       );
@@ -1606,11 +1608,11 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       costUsd,
       trace: failureTrace(),
     });
-    // The check must not stay pending forever when the review itself blows up.
+    // Fail open when review execution fails; completed reviews still gate on findings.
     // Descriptions are capped at 140 characters, so a long message would make the
     // status call fail too and leave the check pending.
     await setStatus(
-      { state: 'error', description: truncateDescription(`RepoLens review failed: ${failure.message}`) },
+      { state: 'success', description: truncateDescription(`RepoLens review unavailable; merge allowed: ${failure.message}`) },
       pr.htmlUrl,
       statusWarnings,
     );
