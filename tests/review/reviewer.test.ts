@@ -1380,7 +1380,7 @@ describe('reviewPullRequest', () => {
       expect(sent[1]!.messages).toEqual(sent[0]!.messages);
     }
     expect(JSON.stringify(sent[1]!.messages)).toContain('Historical description');
-    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === false)).toBe(true);
+    expect(sent.every((r) => (r.provider as { allow_fallbacks: boolean }).allow_fallbacks === true)).toBe(true);
     expect(result.warnings.join(' ')).toContain('qwen/qwen3-coder-next');
     expect(db.getReview(result.reviewId)?.model).toBe('qwen/qwen3-coder-next');
     if (['invalid', 'truncated', 'missing content', 'invalid finding'].includes(failure)) {

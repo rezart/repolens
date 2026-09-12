@@ -16,7 +16,7 @@ export interface CompleteRequest {
   jsonSchema?: JsonSchema;
   maxTokens?: number;
   temperature?: number;
-  /** Single-attempt review budget; disables retries and caps routing prices. */
+  /** Single HTTP attempt per review call; permits provider fallback within routing price caps. */
   reviewBudget?: boolean;
   /** Price route used by staged review calls. */
   reviewStage?: 'initial' | 'escalation' | 'verification' | 'arbitration';
@@ -30,7 +30,7 @@ export interface LLMProvider {
   readonly model: string;
   /** How many completions may run at once. CLI providers use 1. */
   readonly concurrency: number;
-  /** Supports a whole-PR JSON review with enforced routing prices and no hidden retries. */
+  /** Supports a whole-PR JSON review with enforced routing prices and no client HTTP retries. */
   readonly supportsBatchReview?: boolean;
   /** Ordered alternatives for batch reviews; selection is local to each review. */
   readonly reviewFallbacks?: readonly LLMProvider[];
