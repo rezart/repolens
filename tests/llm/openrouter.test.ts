@@ -40,7 +40,7 @@ describe('OpenRouter review budget', () => {
     expect(reviewCostUpperBound(larger)).toBeGreaterThan(0.045);
     await p.complete(larger);
     const body = JSON.parse(String(f.calls[0]!.init.body));
-    expect(body.provider).toEqual({ require_parameters: true, allow_fallbacks: false, max_price: { prompt: 0.4, completion: 2, request: 0 } });
+    expect(body.provider).toEqual({ require_parameters: true, allow_fallbacks: true, max_price: { prompt: 0.4, completion: 2, request: 0 } });
     expect(body.provider.order).toBeUndefined();
     expect(body.reasoning).toEqual({ effort: 'high' });
     await p.complete({ ...req, messages: [{ role: 'user' as const, content: '💸'.repeat(150000) }] });
@@ -55,7 +55,7 @@ describe('OpenRouter review budget', () => {
     const p = new OpenRouterProvider({ apiKey: 'k', model: 'moonshotai/kimi-k2.7-code', fetch: f.fetch });
     await p.complete({ ...req, reviewStage: 'escalation' });
     const body = JSON.parse(String(f.calls[0]!.init.body));
-    expect(body.provider).toEqual({ require_parameters: true, allow_fallbacks: false, max_price: { prompt: 1, completion: 4, request: 0 } });
+    expect(body.provider).toEqual({ require_parameters: true, allow_fallbacks: true, max_price: { prompt: 1, completion: 4, request: 0 } });
     expect(body.provider.order).toBeUndefined();
   });
 
