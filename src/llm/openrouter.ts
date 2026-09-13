@@ -153,7 +153,8 @@ export class OpenRouterProvider implements LLMProvider {
     return traceAi(this.model, async () => {
       const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs));
       if (req.reviewBudget && finishReason !== 'stop') {
-        throw new IncompleteResponseError('openrouter', 'Review did not finish; refusing to publish an incomplete review.');
+        const reason = typeof finishReason === 'string' && finishReason.trim() ? finishReason.trim() : 'missing';
+        throw new IncompleteResponseError('openrouter', `Review did not finish (finish_reason: ${reason}); refusing to publish an incomplete review.`);
       }
       return content;
     }, { provider: this.name });
