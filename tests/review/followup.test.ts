@@ -78,4 +78,9 @@ describe('follow-up reconciliation', () => {
     expect(() => reconcileFollowup(JSON.stringify({ previous: [resolved, resolved], candidates: [decision] }), lineage, [warning], head)).toThrow();
     expect(() => reconcileFollowup(input([{ ...resolved, status: 'retracted', evidence: { ...evidence, line: 99 } }]), lineage, [warning], head)).toThrow();
   });
+
+  it('identifies the failed semantic check in reconciliation errors', () => {
+    const invalid = input([{ ...resolved, status: 'remaining', findingIndex: null }]);
+    expect(() => reconcileFollowup(invalid, lineage, [warning], head)).toThrow('previous[0] remaining status requires a findingIndex mapping');
+  });
 });

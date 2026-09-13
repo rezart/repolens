@@ -2224,6 +2224,56 @@ describe('reviewPullRequest lineage', () => {
     expect(cached.summary).toBe(result.summary);
   });
 
+  it('retries reconciliation with its own allowance and carries the validation error', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done',
+      summary: 'First pass.', verdict: 'request_changes', comments_json: JSON.stringify([
+        { path: 'src/app.ts', line: 4, severity: 'critical', title: 'Assignment in condition', body: 'Use ===.' },
+      ]), posted: 1, error: null });
+    const calls: CompleteRequest[] = [];
+    let reconciliationCalls = 0;
+    let initialCalls = 0;
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, complete: async (req) => {
+      calls.push(req);
+      if (req.system === FOLLOWUP_RECONCILIATION_PROMPT) {
+        reconciliationCalls++;
+        if (reconciliationCalls === 1) return JSON.stringify({ previous: [], candidates: [] });
+        return JSON.stringify({ previous: [{ id: 0, status: 'resolved', findingIndex: null,
+          reason: 'The delta replaces assignment with equality.', evidence: { path: 'src/app.ts', line: 4, side: 'new' } }], candidates: [] });
+      }
+      initialCalls++;
+      if (initialCalls === 1) return '{}';
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
+    } };
+    const gh = fakeGithub(DIFF, PR, { compare: DELTA, headFiles: { 'src/app.ts': 'a\nb\nc\nif (n === 0) return;' } });
+    const result = await reviewPullRequest(makeDeps(db, { llm, github: gh.github, maxRetries: 1 }), { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(initialCalls).toBe(2);
+    expect(reconciliationCalls).toBe(2);
+    expect(calls.filter((call) => call.system === FOLLOWUP_RECONCILIATION_PROMPT)[1]!.messages.at(-1)!.content).toContain('previous IDs must be exactly');
+    expect(result.findings).toEqual([]);
+  });
+
+  it('fails closed after exhausting the dedicated reconciliation allowance', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done',
+      summary: 'First pass.', verdict: 'request_changes', comments_json: JSON.stringify([
+        { path: 'src/app.ts', line: 4, severity: 'critical', title: 'Assignment in condition', body: 'Use ===.' },
+      ]), posted: 1, error: null });
+    let initialCalls = 0;
+    let reconciliationCalls = 0;
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, complete: async (req) => {
+      if (req.system === FOLLOWUP_RECONCILIATION_PROMPT) {
+        reconciliationCalls++;
+        return JSON.stringify({ previous: [], candidates: [] });
+      }
+      initialCalls++;
+      return initialCalls === 1 ? '{}' : JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Reviewed.', verdict: 'approve', findings: [] });
+    } };
+    const gh = fakeGithub(DIFF, PR, { compare: DELTA, headFiles: { 'src/app.ts': 'a\nb\nc\nif (n === 0) return;' } });
+    await expect(reviewPullRequest(makeDeps(db, { llm, github: gh.github, maxRetries: 1 }), { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('previous IDs must be exactly');
+    expect(initialCalls).toBe(2);
+    expect(reconciliationCalls).toBe(2);
+    expect(gh.reviews).toEqual([]);
+  });
+
   it('feeds the previous review, the delta and the commits to the prompts and notes the review number in the body', async () => {
     db.insertReview({
       repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done', summary: 'First pass.', verdict: 'request_changes',
