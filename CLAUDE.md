@@ -59,6 +59,7 @@ Tests never touch the network or real CLIs: providers take an injected `fetch` o
   ```
   The worktree gets its own `node_modules`; copy `.env` in if you need to run the server from it (it is gitignored).
 - When the work is done and `npm test` plus `npm run typecheck` pass, push the branch and open a pull request against `main`. RepoLens reviews the PR and sets the `repolens/review` status; `main` requires it, so fix any critical findings and push again until the status is green, then merge (`gh pr merge --merge --delete-branch`). A PreToolUse hook (`.claude/settings.json` → `scripts/require-review.sh`) refuses `gh pr merge` while the PR head's `repolens/review` status is anything but `success`, so every pushed commit must be reviewed before it can be merged; pass the PR number explicitly.
+- If `gh` reports bad credentials while `gh auth status` shows a valid keyring login, check for stale `GH_TOKEN`/`GITHUB_TOKEN` environment variables. They override the keyring; run the command with `env -u GH_TOKEN -u GITHUB_TOKEN gh ...` rather than re-authenticating unnecessarily.
 - Remove the worktree after the merge: `git worktree remove ../repolens-<feature>`.
 
 ## Operational notes
