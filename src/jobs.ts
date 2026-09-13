@@ -1,4 +1,5 @@
 import type { Db, JobKind, JobRow } from './db.js';
+import { traceTask } from './telemetry.js';
 
 export interface JobContext {
   progress: (message: string) => void;
@@ -102,7 +103,7 @@ export class JobQueue {
       // escape into drain() and stall the queue.
       this.db.updateJob(id, { status: 'running' });
       this.log(`job ${id} (${kind}) started`);
-      const result = await fn({ progress: (m) => this.db.updateJob(id, { progress: m }) });
+      const result = await traceTask(`repolens.${kind}`, () => fn({ progress: (m) => this.db.updateJob(id, { progress: m }) }));
       this.db.updateJob(id, { status: 'done', result_json: result === undefined ? null : JSON.stringify(result) });
       this.log(`job ${id} (${kind}) done`);
     } catch (err) {

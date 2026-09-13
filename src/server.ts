@@ -13,6 +13,7 @@ import { createApp, type AppDeps } from './app.js';
 import { OpenRouterPricing } from './usage/pricing.js';
 import { UsageTracker } from './usage/tracker.js';
 import { startPoller } from './poller.js';
+import { startTelemetry, withTelemetryLogging } from './telemetry.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
   const token = config.github.app
@@ -25,8 +26,14 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const usage = new UsageTracker({ db, pricing, log });
   // Reviews get the configured reasoning budget.
   const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
+  const verifierLlm = config.llm.provider === 'openrouter' && config.review.verifierModel
+    ? createProvider(config, { model: config.review.verifierModel, reasoningEffort: config.review.verifierReasoningEffort ?? '', onUsage: usage.sinkFor('review') })
+    : config.llm.provider === 'claude-cli' ? llm : undefined;
   const escalationLlm = config.llm.provider === 'openrouter' && config.review.escalationModel && config.review.escalationModel !== llm.model
-    ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
+    ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.review.escalationReasoningEffort ?? config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
+    : undefined;
+  const arbiterLlm = config.llm.provider === 'openrouter' && config.review.arbiterModel
+    ? createProvider(config, { model: config.review.arbiterModel, reasoningEffort: config.review.arbiterReasoningEffort ?? 'low', onUsage: usage.sinkFor('review') })
     : undefined;
   // Chat always gets its own provider so it pins effort to 'low' rather than
   // inheriting the review budget, even when it runs on the same provider/model.
@@ -44,10 +51,12 @@ export function buildDeps(config: Config, log: (msg: string) => void = console.l
   const retrieve = createRetriever({ db, embeddings });
   const github = new GitHubClient({ token, baseUrl: config.github.apiUrl });
   const jobs = new JobQueue(db, log);
-  return { config, db, llm, escalationLlm, chatLlm, embeddings, retrieve, github, jobs, usage, log };
+  return { config, db, llm, escalationLlm, verifierLlm, arbiterLlm, arbiterAllFindings: config.review.arbiterAllFindings, dualDiscovery: config.review.dualDiscovery, focusedVerification: config.review.focusedVerification, discoveryMaxOutput: config.review.discoveryMaxOutput, chatLlm, embeddings, retrieve, github, jobs, usage, log };
 }
 
 export function startServer(config: Config, log: (msg: string) => void = console.log) {
+  startTelemetry(process.env.TRACEWAY_URL ?? '', process.env.TRACEWAY_BACKEND_TOKEN ?? '');
+  log = withTelemetryLogging(log);
   const deps = buildDeps(config, log);
   const app = createApp(deps);
 

@@ -6,6 +6,8 @@ services:
     pull_policy: always
     container_name: repolens
     restart: unless-stopped
+    env_file:
+      - /opt/repolens/.env
     environment:
       REPOLENS_HOST: 0.0.0.0
     ports:

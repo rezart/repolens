@@ -2,7 +2,8 @@ import { IncompleteResponseError, NetworkProviderError, ProviderError } from './
 import type { ChatMessage, CompleteRequest, LLMProvider, OnDelta } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
-import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE, REVIEW_ESCALATION_INPUT_PRICE, REVIEW_ESCALATION_OUTPUT_PRICE } from '../review/budget.js';
+import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT, REVIEW_INPUT_PRICE, REVIEW_OUTPUT_PRICE, REVIEW_VERIFIER_INPUT_PRICE, REVIEW_VERIFIER_OUTPUT_PRICE, REVIEW_ESCALATION_INPUT_PRICE, REVIEW_ESCALATION_OUTPUT_PRICE, REVIEW_ARBITRATION_INPUT_PRICE, REVIEW_ARBITRATION_OUTPUT_PRICE } from '../review/budget.js';
+import { traceAi } from '../telemetry.js';
 
 export type Sleep = (ms: number) => Promise<void>;
 
@@ -23,7 +24,6 @@ export interface OpenRouterOptions {
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const MAX_ATTEMPTS = 3;
 const ESCALATION_TIMEOUT_MS = 600_000;
-
 const defaultSleep: Sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 /** OpenRouter's usage block, requested with `usage: { include: true }`. */
@@ -129,33 +129,35 @@ export class OpenRouterProvider implements LLMProvider {
     if (streaming) body.stream = true;
     // Every model uses the same token bounds and routing price caps below.
     if (req.reviewBudget) {
-      const maxOutput = req.reviewStage === 'escalation' ? REVIEW_ESCALATION_MAX_OUTPUT : REVIEW_MAX_OUTPUT;
+      const maxOutput = req.reviewStage === 'arbitration' ? REVIEW_ARBITRATION_MAX_OUTPUT : req.reviewStage === 'verification' ? REVIEW_VERIFIER_MAX_OUTPUT
+        : req.reviewStage === 'initial' || req.reviewStage === 'escalation' ? REVIEW_ESCALATION_MAX_OUTPUT
+          : REVIEW_MAX_OUTPUT;
       if (streaming || !Number.isInteger(req.maxTokens) ||
           req.maxTokens! <= 0 || req.maxTokens! > maxOutput || reviewCostUpperBound(req) > REVIEW_MAX_USD) {
         throw new ProviderError('openrouter', 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       body.provider = {
-        order: ['DeepInfra', 'Google', 'Venice', 'Novita'],
         require_parameters: true, allow_fallbacks: true,
         max_price: {
-          prompt: req.reviewStage === 'escalation' ? REVIEW_ESCALATION_INPUT_PRICE : REVIEW_INPUT_PRICE,
-          completion: req.reviewStage === 'escalation' ? REVIEW_ESCALATION_OUTPUT_PRICE : REVIEW_OUTPUT_PRICE,
+          prompt: req.reviewStage === 'arbitration' ? REVIEW_ARBITRATION_INPUT_PRICE : req.reviewStage === 'escalation' ? REVIEW_ESCALATION_INPUT_PRICE : req.reviewStage === 'verification' ? REVIEW_VERIFIER_INPUT_PRICE : REVIEW_INPUT_PRICE,
+          completion: req.reviewStage === 'arbitration' ? REVIEW_ARBITRATION_OUTPUT_PRICE : req.reviewStage === 'escalation' ? REVIEW_ESCALATION_OUTPUT_PRICE : req.reviewStage === 'verification' ? REVIEW_VERIFIER_OUTPUT_PRICE : REVIEW_OUTPUT_PRICE,
           request: 0,
         },
       };
-      delete body.reasoning;
     }
     return JSON.stringify(body);
   }
 
   async complete(req: CompleteRequest): Promise<string> {
     const timeoutMs = req.reviewStage === 'escalation' ? Math.max(this.timeoutMs, ESCALATION_TIMEOUT_MS) : this.timeoutMs;
-    const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs));
-    if (req.reviewBudget && finishReason !== 'stop') {
-      const reason = typeof finishReason === 'string' && finishReason.trim() ? finishReason.trim() : 'missing';
-      throw new IncompleteResponseError('openrouter', `Review did not finish (finish_reason: ${reason}); refusing to publish an incomplete review.`);
-    }
-    return content;
+    return traceAi(this.model, async () => {
+      const { content, finishReason } = await this.readContent(await this.post(this.buildPayload(req, false), req.reviewBudget ? 1 : MAX_ATTEMPTS, timeoutMs));
+      if (req.reviewBudget && finishReason !== 'stop') {
+        const reason = typeof finishReason === 'string' && finishReason.trim() ? finishReason.trim() : 'missing';
+        throw new IncompleteResponseError('openrouter', `Review did not finish (finish_reason: ${reason}); refusing to publish an incomplete review.`);
+      }
+      return content;
+    }, { provider: this.name });
   }
 
   /**
@@ -164,6 +166,10 @@ export class OpenRouterProvider implements LLMProvider {
    * because deltas have already been handed out.
    */
   async stream(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
+    return traceAi(this.model, () => this.streamResult(req, onDelta), { provider: this.name });
+  }
+
+  private async streamResult(req: CompleteRequest, onDelta: OnDelta): Promise<string> {
     const res = await this.post(this.buildPayload(req, true));
     const body = res.body;
     if (!body) throw new ProviderError('openrouter', 'streaming response had no body', res.status);

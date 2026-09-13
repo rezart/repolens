@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { httpInstrumentationMiddleware } from '@hono/otel';
 import { bodyLimit } from 'hono/body-limit';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { streamSSE } from 'hono/streaming';
@@ -31,6 +32,18 @@ export interface AppDeps {
   llm: LLMProvider;
   /** Stronger backend for high-risk review hunks, when configured. */
   escalationLlm?: LLMProvider;
+  /** Independent backend for finding verification, when configured. */
+  verifierLlm?: LLMProvider;
+  /** Optional fail-closed arbiter for verifier contradictions. */
+  arbiterLlm?: LLMProvider;
+  /** Sends every non-duplicate verifier candidate to the arbiter when enabled. */
+  arbiterAllFindings?: boolean;
+  /** Enables the independent complementary discovery pass. */
+  dualDiscovery?: boolean;
+  /** Enables the uncertain-only focused verifier recheck. */
+  focusedVerification?: boolean;
+  /** Maximum output tokens for budgeted discovery; verifier remains fixed at 6000. */
+  discoveryMaxOutput?: number;
   /** Backend used for chat answers; may be a cheaper/faster model than `llm`. */
   chatLlm: LLMProvider;
   embeddings: EmbeddingProvider | null;
@@ -167,7 +180,12 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
           db: deps.db,
           llm: deps.llm,
           escalationLlm: deps.escalationLlm,
-          verifierLlm: deps.llm,
+          verifierLlm: deps.verifierLlm,
+          arbiterLlm: deps.arbiterLlm,
+          arbiterAllFindings: deps.arbiterAllFindings,
+          dualDiscovery: deps.dualDiscovery,
+          focusedVerification: deps.focusedVerification,
+          discoveryMaxOutput: deps.discoveryMaxOutput,
           retrieve: deps.retrieve,
           github: deps.github,
           identifiers: identifiersFromCode,
@@ -249,6 +267,7 @@ export function createApp(deps: AppDeps): Hono {
     const status = (err as { status?: number }).status;
     return c.json({ error: err.message }, status && status >= 400 && status < 600 ? (status as 400) : 500);
   });
+  app.use(httpInstrumentationMiddleware({ serviceName: 'repolens', serviceVersion: config.revision ?? VERSION }));
 
   // ---- auth ----
   // The token is only accepted in the Authorization header: query strings leak into
@@ -274,6 +293,7 @@ export function createApp(deps: AppDeps): Hono {
       embeddings: deps.embeddings?.model ?? null,
     }),
   );
+  app.get('/api/traceway/config', (c) => c.json({ connectionString: config.tracewayWebConnectionString ?? '', version: config.revision ?? VERSION }));
 
   // ---- repositories ----
   app.get('/api/repositories', (c) => c.json({ repositories: db.listRepos() }));
@@ -460,6 +480,10 @@ export function createApp(deps: AppDeps): Hono {
     c.header('Content-Type', 'text/javascript');
     c.header('Cache-Control', 'no-cache');
     return c.body(await readFile(join(process.cwd(), 'node_modules/dompurify/dist/purify.min.js')));
+  });
+  app.get('/vendor/traceway.js', async (c) => {
+    c.header('Content-Type', 'text/javascript');
+    return c.body(await readFile(join(process.cwd(), 'node_modules/@tracewayapp/frontend/dist/traceway.iife.global.js')));
   });
   // The dashboard has no build step or hashed filenames, so browsers must
   // revalidate on every load; otherwise heuristic caching keeps serving a

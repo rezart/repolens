@@ -4,4 +4,6 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export const reviewCallCost = new AsyncLocalStorage<{
   reported: boolean;
   costUsd: number | null;
+  stage?: string;
+  pass?: string;
 }>();
