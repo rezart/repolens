@@ -1732,7 +1732,8 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     };
     let followupRetryAttemptsUsed = 0;
     const consumeFollowupRetryAllowance = (): boolean => {
-      if (followupRetryAttemptsUsed >= maxRetries) return false;
+      // Reconciliation owns one corrective retry so earlier stages cannot starve it.
+      if (maxRetries === 0 || followupRetryAttemptsUsed >= 1) return false;
       followupRetryAttemptsUsed++;
       return true;
     };
@@ -1860,7 +1861,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     let batch: { findings: Finding[] } | undefined;
     let followupReserve = 0;
     if (budgeted && lineage.previous) {
-      // Reserve the initial reconciliation call and one corrective retry; each admitted call still checks the total cap.
+      // Reserve the initial reconciliation call and its dedicated corrective retry.
       const reserve = reviewCostUpperBound({
         system: FOLLOWUP_RECONCILIATION_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({ previous: lineage.previous.findings, delta: lineage.previous.delta }) +
