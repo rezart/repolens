@@ -21,6 +21,7 @@ import {
   VERIFIER_SYSTEM_PROMPT,
   buildFileReviewMessage,
   renderHistoricalContext,
+  REGENERATION_GUIDANCE,
 } from './prompts.js';
 
 export type Severity = 'critical' | 'warning' | 'nit';
@@ -674,17 +675,19 @@ function traceFinding(finding: Finding): ReviewTraceFinding {
 }
 
 function withCorrection(req: CompleteRequest, validationError: string, allowedPathsAndLines: Array<{ path: string; lines: number[] }>): CompleteRequest {
-  const content = req.messages[0]?.content ?? '';
-  let payload: Record<string, unknown>;
-  try {
-    const parsed = JSON.parse(content) as unknown;
-    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : { original: parsed };
-  } catch {
-    payload = { original: content };
-  }
-  payload.validationError = validationError;
-  payload.allowedPathsAndLines = allowedPathsAndLines;
-  return { ...req, messages: [{ ...req.messages[0]!, content: JSON.stringify(payload) }, ...req.messages.slice(1)] };
+  const baseMessages = req.messages.length > 1 ? [req.messages[0]!] : req.messages;
+  const correctionContent = JSON.stringify({
+    guidance: REGENERATION_GUIDANCE,
+    validationError,
+    allowedPathsAndLines,
+  });
+  return {
+    ...req,
+    messages: [
+      ...baseMessages,
+      { role: 'user', content: correctionContent },
+    ],
+  };
 }
 
 function allowedFindingLines(file: DiffFile): Set<number> {
@@ -1303,11 +1306,9 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
     let verifierFindingsTrace: Finding[] = [];
     const maxRetries = deps.maxRetries ?? 3;
     let retryAttemptsUsed = 0;
-    let correctiveRetryUsed = false;
-    const consumeRetryAllowance = (corrective = false): boolean => {
-      if (retryAttemptsUsed >= maxRetries || corrective && correctiveRetryUsed) return false;
+    const consumeRetryAllowance = (): boolean => {
+      if (retryAttemptsUsed >= maxRetries) return false;
       retryAttemptsUsed++;
-      if (corrective) correctiveRetryUsed = true;
       return true;
     };
 
@@ -1512,8 +1513,14 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
           const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
           if (malformed) {
             markTraceValidation(traceIndex, err);
-            if (!consumeRetryAllowance(true)) throw err;
-            attemptReq = withCorrection(req, errMessage(err), allowedPathsAndLines);
+            if (!consumeRetryAllowance()) {
+              if (lastRetryError && /budget/i.test(errMessage(err))) {
+                throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
+              }
+              throw err;
+            }
+            lastRetryError = err;
+            attemptReq = withCorrection(attemptReq, errMessage(err), allowedPathsAndLines);
             const previous = activeLlm.model;
             activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
             const message = `${previous}: ${errMessage(err)}; corrective retry with ${activeLlm.model}`;
@@ -1521,9 +1528,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             log(`review: ${message}`);
             continue;
           }
-          const retryable = err instanceof JsonExtractError || err instanceof IncompleteResponseError ||
-            err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
-          if (correctiveRetryUsed) throw err;
+          const retryable = err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
           if (!retryable || !consumeRetryAllowance()) {
             if (lastRetryError && /budget/i.test(errMessage(err))) {
               throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
@@ -1531,7 +1536,6 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
             throw err;
           }
           lastRetryError = err;
-          attemptReq = req;
           const previous = activeLlm.model;
           activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
           const message = `${previous}: ${errMessage(err)}; retry ${retryAttemptsUsed}/${maxRetries} with ${activeLlm.model}`;
@@ -1752,7 +1756,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
       };
       const escalationResult = await completeStructured(req, escalationLlm, parseEscalation,
         riskyFiles.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) })),
-        () => consumeRetryAllowance(true));
+        () => consumeRetryAllowance());
       const { decisions, escalated } = escalationResult;
       escalationDecisionsTrace = decisions.map((decision) => ({ id: decision.id as string, decision: String(decision.decision) }));
       escalationFindingsTrace = escalated.slice();
@@ -1823,7 +1827,7 @@ export async function reviewPullRequest(deps: ReviewDeps, opts: ReviewOptions): 
         return decisions;
       };
       const decisions = await completeStructured(verifierReq, verifierLlm, parseVerification, allowedVerifierLines,
-        () => consumeRetryAllowance(true));
+        () => consumeRetryAllowance());
       const supported = new Set(decisions.filter((decision) => decision.decision === 'supported').map((decision) => decision.id as number));
       verifierDecisionsTrace = decisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
       findings = findings.filter((finding, id) => supported.has(id) && finding.confidence === 'high' && finding.severity !== 'nit');

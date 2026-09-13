@@ -114,6 +114,23 @@ describe('OpenRouter review budget', () => {
     await expect(p.complete(req)).rejects.toThrow('incomplete review');
     expect(seen[0]?.costUsd).toBe(0.01604);
   });
+
+  it('includes normalized finish_reason or missing sentinel in incomplete budgeted-completion errors', async () => {
+    for (const [finish_reason, expected] of [
+      ['length', 'finish_reason: length'],
+      ['content_filter', 'finish_reason: content_filter'],
+      [undefined, 'finish_reason: missing'],
+      ['', 'finish_reason: missing'],
+      ['  ', 'finish_reason: missing'],
+    ] as const) {
+      const f = fakeFetch([jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason }] })]);
+      const p = new OpenRouterProvider({ apiKey: 'k', model: 'qwen/qwen3-coder', fetch: f.fetch });
+      const err = await p.complete(req).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(IncompleteResponseError);
+      expect((err as Error).message).toContain(expected);
+      expect((err as Error).message).not.toContain('{}');
+    }
+  });
 });
 
 describe('OpenRouter review timeouts', () => {
