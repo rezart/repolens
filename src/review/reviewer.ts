@@ -1480,7 +1480,8 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     } catch (err) {
       if (!(err instanceof JsonExtractError || err instanceof IncompleteResponseError)) throw err;
       if (!consumeRetryAllowance()) throw err;
-      return run(withCorrection(req, errMessage(err), allowed));
+      const validationError = err instanceof IncompleteResponseError && err.detail ? err.detail : errMessage(err);
+      return run(withCorrection(req, validationError, allowed));
     }
   };
   const log = deps.log ?? (() => {});
@@ -1729,6 +1730,13 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       retryAttemptsUsed++;
       return true;
     };
+    let followupRetryAttemptsUsed = 0;
+    const consumeFollowupRetryAllowance = (): boolean => {
+      // Reconciliation owns one corrective retry so earlier stages cannot starve it.
+      if (maxRetries === 0 || followupRetryAttemptsUsed >= 1) return false;
+      followupRetryAttemptsUsed++;
+      return true;
+    };
 
     const historyPathSet = new Set<string>();
     for (const file of files) {
@@ -1853,8 +1861,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     let batch: { findings: Finding[] } | undefined;
     let followupReserve = 0;
     if (budgeted && lineage.previous) {
-      // ponytail: reserve four bytes per possible finding-output token plus a
-      // bounded head context; use provider tokenization if this becomes restrictive.
+      // Reserve the initial reconciliation call and its dedicated corrective retry.
       const reserve = reviewCostUpperBound({
         system: FOLLOWUP_RECONCILIATION_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({ previous: lineage.previous.findings, delta: lineage.previous.delta }) +
@@ -2622,7 +2629,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         const reconciled = await completeStructured(req, verifierLlm ?? activeLlm,
           (raw) => reconcileFollowup(raw, lineage, findings, head),
           head.map((file) => ({ path: file.path, lines: file.lines.map((line) => line.line) })),
-          () => consumeRetryAllowance());
+          () => consumeFollowupRetryAllowance());
         findings = reconciled.findings;
         verifierFindingsTrace = findings.slice();
         summary = reconciled.summary;

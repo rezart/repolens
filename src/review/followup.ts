@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { extractJson } from '../llm/json.js';
+import { extractJson, JsonExtractError } from '../llm/json.js';
 import { IncompleteResponseError } from '../llm/types.js';
 import type { Lineage } from './lineage.js';
 import type { Finding } from './reviewer.js';
@@ -17,38 +17,59 @@ const response = z.object({
   candidates: z.array(z.object({ id: z.number().int().nonnegative(), introduced: z.boolean(), reason: z.string().trim().min(1), evidence: citation.nullable() })),
 });
 
+type Citation = z.infer<typeof citation>;
+
 export function reconcileFollowup(raw: string, lineage: Lineage, findings: Finding[], head: Array<{ path: string; lines: Array<{ line: number; text: string }> }>): { findings: Finding[]; summary: string } {
   const previous = lineage.previous!;
-  const fail = (): never => { throw new IncompleteResponseError('follow-up', 'Incomplete or unsupported follow-up assessment; no review was published.'); };
-  const parsed = response.safeParse(extractJson(raw));
-  if (!parsed.success) return fail();
+  const fail = (validationError: string): never => {
+    throw new IncompleteResponseError(
+      'follow-up',
+      `Follow-up reconciliation validation failed: ${validationError}; no review was published.`,
+      undefined,
+      validationError,
+    );
+  };
+  let extracted: unknown;
+  try {
+    extracted = extractJson(raw);
+  } catch (error) {
+    if (error instanceof JsonExtractError) return fail('response must contain a valid JSON object');
+    return fail('response could not be parsed');
+  }
+  const parsed = response.safeParse(extracted);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue?.path.length ? issue.path.join('.') : 'response';
+    return fail(`${path}: ${issue?.message ?? 'invalid value'}`);
+  }
   const result = parsed.data;
-  const exactIds = (items: Array<{ id: number }>, count: number) => items.length === count && new Set(items.map((item) => item.id)).size === count && items.every((item) => item.id < count);
-  if (!exactIds(result.previous, previous.findings.length) || !exactIds(result.candidates, findings.length)) return fail();
-  const inHead = (ref: z.infer<typeof citation> | null) => !!ref && ref.side === 'new' && head.some((file) => file.path === ref.path && file.lines.some((line) => line.line === ref.line));
-  const inDelta = (ref: z.infer<typeof citation> | null) => !!ref && !!previous.delta?.some((file) =>
+  const exactIds = (items: Array<{ id: number }>, count: number): boolean => items.length === count && new Set(items.map((item) => item.id)).size === count && items.every((item) => item.id < count);
+  if (!exactIds(result.previous, previous.findings.length)) return fail(`previous IDs must be exactly one each of 0..${Math.max(0, previous.findings.length - 1)}`);
+  if (!exactIds(result.candidates, findings.length)) return fail(`candidate IDs must be exactly one each of 0..${Math.max(0, findings.length - 1)}`);
+  const inHead = (ref: Citation | null): boolean => !!ref && ref.side === 'new' && head.some((file) => file.path === ref.path && file.lines.some((line) => line.line === ref.line));
+  const inDelta = (ref: Citation | null): boolean => !!ref && !!previous.delta?.some((file) =>
     (ref.side === 'new' ? file.newPath : file.oldPath) === ref.path && file.hunks.some((hunk) => hunk.lines.some((line) =>
       ref.side === 'new' ? line.type === 'add' && line.newLine === ref.line : line.type === 'del' && line.oldLine === ref.line)));
   const remaining = new Set<number>();
   for (const item of result.previous) {
-    if (item.status === 'unconfirmed') return fail();
+    if (item.status === 'unconfirmed') return fail(`previous[${item.id}].status=unconfirmed is unsupported; use remaining, resolved, or retracted`);
     const old = previous.findings[item.id]!;
     const currentPath = previous.delta?.find((file) => file.oldPath === old.path)?.newPath ?? old.path;
-    const matches = findings.flatMap((finding, id) =>
-      finding.path === currentPath && (finding.title === old.title || !!old.rootCause && finding.rootCause === old.rootCause) ? [id] : []);
-    if (item.status === 'remaining'
-      ? item.findingIndex === null || !matches.includes(item.findingIndex)
-      : matches.length > 0) return fail();
-    if (item.status === 'resolved' ? !inDelta(item.evidence) : !inHead(item.evidence)) return fail();
+    const matches = findings.flatMap((finding, id) => finding.path === currentPath && (finding.title === old.title || !!old.rootCause && finding.rootCause === old.rootCause) ? [id] : []);
+    if (item.status === 'remaining' && item.findingIndex === null) return fail(`previous[${item.id}] remaining status requires a findingIndex mapping`);
+    if (item.status === 'remaining' && !matches.includes(item.findingIndex!)) return fail(`previous[${item.id}] remaining status maps to a candidate that does not match the previous finding`);
+    if (item.status !== 'remaining' && matches.length > 0) return fail(`previous[${item.id}] ${item.status} status is invalid while a matching current candidate remains`);
+    if (item.status === 'resolved' && !inDelta(item.evidence)) return fail(`previous[${item.id}] resolved status requires evidence citing an added or removed line in the delta`);
+    if (item.status !== 'resolved' && !inHead(item.evidence)) return fail(`previous[${item.id}] ${item.status} status requires evidence citing a current head line`);
     if (item.status === 'remaining') {
-      if (item.findingIndex === null || item.findingIndex >= findings.length || remaining.has(item.findingIndex)) return fail();
-      remaining.add(item.findingIndex);
-    } else if (item.findingIndex !== null) return fail();
+      if (item.findingIndex! >= findings.length || remaining.has(item.findingIndex!)) return fail(`previous[${item.id}] remaining status uses a duplicate or out-of-range findingIndex`);
+      remaining.add(item.findingIndex!);
+    } else if (item.findingIndex !== null) return fail(`previous[${item.id}] ${item.status} status must not include findingIndex`);
   }
   const introduced = new Set<number>();
   for (const item of result.candidates) {
     if (!item.introduced || remaining.has(item.id)) continue;
-    if (previous.delta === null ? !inHead(item.evidence) : !inDelta(item.evidence)) return fail();
+    if (previous.delta === null ? !inHead(item.evidence) : !inDelta(item.evidence)) return fail(`candidates[${item.id}] introduced=true requires evidence citing a ${previous.delta === null ? 'current head' : 'delta'} line`);
     introduced.add(item.id);
   }
   const kept = findings.filter((_, id) => remaining.has(id) || introduced.has(id));
