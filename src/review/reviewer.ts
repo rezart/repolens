@@ -895,18 +895,16 @@ function traceFinding(finding: Finding): ReviewTraceFinding {
 }
 
 function withCorrection(req: CompleteRequest, validationError: string, allowedPathsAndLines: Array<{ path: string; lines: number[] }>): CompleteRequest {
-  const baseMessages = req.messages.length > 1 ? [req.messages[0]!] : req.messages;
   const correctionContent = JSON.stringify({
     guidance: REGENERATION_GUIDANCE,
     validationError,
     allowedPathsAndLines,
   });
+  // Rebuild from the immutable original: a corrected request is never itself
+  // corrected, so appending cannot accumulate stale correction payloads.
   return {
     ...req,
-    messages: [
-      ...baseMessages,
-      { role: 'user', content: correctionContent },
-    ],
+    messages: [...req.messages, { role: 'user', content: correctionContent }],
   };
 }
 
