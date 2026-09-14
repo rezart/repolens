@@ -43,7 +43,7 @@ const envSchema = z.object({
   REVIEW_FALLBACK_MODELS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((m) => m.trim()) : [])
     .pipe(z.array(z.string().regex(/^[^\s,]+$/))),
   /** Extra attempts for failed batch reviews, within the total review budget. */
-  REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(0),
+  REVIEW_MAX_RETRIES: z.coerce.number().int().min(0).default(1),
   /** Maximum output tokens for budgeted discovery. */
   REVIEW_DISCOVERY_MAX_OUTPUT: z.coerce.number().int().min(1).max(16000).default(8000),
   /** Optional strong model for high-risk hunk re-review. */
