@@ -9,7 +9,7 @@ describe('loadConfig', () => {
     expect(c.embedding).toBeNull();
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
-    expect(c.review.maxRetries).toBe(0);
+    expect(c.review.maxRetries).toBe(1);
     expect(c.review.escalationModel).toBe('');
     expect(c.review.escalationReasoningEffort).toBeUndefined();
     expect(c.review.verifierModel).toBe('google/gemini-3.1-flash-lite');
@@ -37,8 +37,8 @@ describe('loadConfig', () => {
   it('rejects an empty bind hostname', () => {
     expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REPOLENS_HOST: '' })).toThrow(ConfigError);
   });
-  it('defaults to no response retries and validates overrides', () => {
-    expect(loadConfig({ LLM_PROVIDER: 'claude-cli' }).review.maxRetries).toBe(0);
+  it('defaults to one response retry and validates overrides', () => {
+    expect(loadConfig({ LLM_PROVIDER: 'claude-cli' }).review.maxRetries).toBe(1);
     expect(loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: '0' }).review.maxRetries).toBe(0);
     for (const value of ['-1', '1.5', 'invalid']) {
       expect(() => loadConfig({ LLM_PROVIDER: 'claude-cli', REVIEW_MAX_RETRIES: value })).toThrow(ConfigError);
