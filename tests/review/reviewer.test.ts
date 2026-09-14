@@ -47,6 +47,7 @@ import {
   type ReviewDeps,
   type Finding,
 } from '../../src/review/reviewer.js';
+import { ReviewCheckpointBusyError, CompletedReviewV1 } from '../../src/review/checkpoint.js';
 
 describe('arbiter filtering', () => {
   it('defines the strict decisions-only arbiter schema', () => {
@@ -4526,4 +4527,130 @@ describe('default injectable helpers', () => {
     expect(defaultFormatContext([CHUNK])).toBe('### src/x.ts:1-3\n```\nexport function x() { return 1; }\n```');
     expect(defaultFormatContext([])).toBe('');
   });
+});
+
+describe('durable review checkpoint resume', () => {
+  const seedRepo = (db: Db) => {
+    db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+  };
+
+  it('persists discovery and resumes at verification without repeating discovery calls', async () => {
+    const shared = openDb(':memory:');
+    shared.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    shared.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const discovery = fakeLlm({ file: JSON.stringify({ findings: [{ line: 4, severity: 'critical', title: 'Assignment', body: 'Use ===.' }] }) });
+    let fail = true;
+    const verifierCalls: CompleteRequest[] = [];
+    const verifier: LLMProvider = { name: 'verifier', model: 'v1', concurrency: 1, async complete(req) {
+      verifierCalls.push(req);
+      if (fail) throw new ProviderError('verifier', 'down', 400);
+      return JSON.stringify({ decisions: [{ id: 0, decision: 'supported', explanation: 'Confirmed.', evidence: { path: 'src/app.ts', line: 4 } }], missingEvidence: [] });
+    } };
+    const deps = { db: shared, llm: discovery.provider, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub().github };
+    try {
+      const job1 = shared.createJob('review', REPO_ID, 42);
+      const firstError = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, jobId: job1.id, post: false }).catch((error: unknown) => error);
+      expect(firstError).toBeInstanceOf(Error);
+      const checkpoint = shared.findOpenReviewCheckpoint(REPO_ID, 42);
+      const rows = shared.raw.prepare('select id,state,progress_json,last_error_code from review_checkpoints').all();
+      expect(rows).toHaveLength(1);
+      expect(checkpoint).toBeTruthy();
+      expect(JSON.parse(checkpoint!.progress_json!).discovery).toBeTruthy();
+      const job2 = shared.createJob('review', REPO_ID, 42);
+      const discoveryCount = discovery.calls.filter((call) => call.system === FILE_REVIEW_SYSTEM_PROMPT).length;
+      fail = false;
+      const result = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, jobId: job2.id, post: false });
+      expect(discovery.calls.filter((call) => call.system === FILE_REVIEW_SYSTEM_PROMPT)).toHaveLength(discoveryCount);
+      expect(verifierCalls).toHaveLength(2);
+      expect(shared.getReviewCheckpoint(checkpoint!.id)?.state).toBe('finalized');
+      expect(CompletedReviewV1.parse(JSON.parse(shared.getReview(result.reviewId)!.completion_json!)).findings).toHaveLength(1);
+      expect(shared.raw.prepare('select count(*) as n from reviews').get()).toEqual({ n: 1 });
+    } finally {
+      shared.close();
+    }
+  });
+
+  it('busy overlapping claim makes no LLM calls and surfaces a typed error', async () => {
+    const shared = openDb(':memory:');
+    seedRepo(shared);
+    const discovery = fakeLlm({ file: JSON.stringify({ findings: [] }) });
+    const deps = { db: shared, llm: discovery.provider, retrieve: retrieveOne, github: fakeGithub().github };
+    try {
+      // A live foreign owner holds the execution slot.
+      const holderJob = shared.createJob('review', REPO_ID, 42);
+      const foreign = shared.claimReviewCheckpoint(
+        { id: 'foreign-checkpoint', repo_id: REPO_ID, pr_number: 42, head_sha: PR.headSha, base_sha: PR.baseSha, compatibility_key: 'any', payload_version: 1 },
+        'foreign-owner-token', holderJob.id,
+      );
+      const activeJob = shared.createJob('review', REPO_ID, 42);
+      const outcome = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, jobId: activeJob.id, post: false }).catch((error: unknown) => error);
+      expect(outcome).toBeInstanceOf(ReviewCheckpointBusyError);
+      expect(discovery.calls).toHaveLength(0);
+    } finally {
+      shared.close();
+    }
+  });
+
+  it('a corrupt checkpoint payload recomputes discovery from scratch', async () => {
+    const shared = openDb(':memory:');
+    seedRepo(shared);
+    const discovery = fakeLlm({ file: JSON.stringify({ findings: [{ line: 4, severity: 'critical', title: 'Assignment', body: 'Use ===.' }] }) });
+    const verifier: LLMProvider = { name: 'verifier', model: 'v1', concurrency: 1, async complete() { throw new ProviderError('verifier', 'down', 400); } };
+    const deps = { db: shared, llm: discovery.provider, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub().github };
+    try {
+      const job1 = shared.createJob('review', REPO_ID, 42);
+      const first = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, jobId: job1.id, post: false }).catch((error: unknown) => error);
+      expect(first).toBeInstanceOf(Error);
+      const callsAfterFailure = discovery.calls.filter((call) => call.system === FILE_REVIEW_SYSTEM_PROMPT).length;
+      const checkpoint = shared.findOpenReviewCheckpoint(REPO_ID, 42)!;
+      shared.raw.prepare('update review_checkpoints set progress_json=? where id=?').run('{"version":1,"tampered":true}', checkpoint.id);
+      const job2 = shared.createJob('review', REPO_ID, 42);
+      // With the verifier still down, the recomputed run fails again after
+      // repeating discovery exactly once more.
+      const second = await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, jobId: job2.id, post: false }).catch((error: unknown) => error);
+      expect(second).toBeInstanceOf(Error);
+      expect(discovery.calls.filter((call) => call.system === FILE_REVIEW_SYSTEM_PROMPT)).toHaveLength(callsAfterFailure + 2);
+      const reopened = shared.findOpenReviewCheckpoint(REPO_ID, 42)!;
+      expect(reopened.id).not.toBe(checkpoint.id);
+      expect(reopened.state).toBe('active');
+      expect(shared.raw.prepare('select count(*) as n from reviews').get()).toEqual({ n: 0 });
+    } finally {
+      shared.close();
+    }
+  });
+
+  it('fresh bypasses checkpoints entirely and force starts a new execution', async () => {
+    const shared = openDb(':memory:');
+    seedRepo(shared);
+    const discovery = fakeLlm({ file: JSON.stringify({ findings: [] }) });
+    const deps = { db: shared, llm: discovery.provider, retrieve: retrieveOne, github: fakeGithub().github };
+    try {
+      await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false, fresh: true });
+      await reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, post: false, force: true });
+      expect(shared.findOpenReviewCheckpoint(REPO_ID, 42)).toBeUndefined();
+      // The fixture diff has two reviewable files: one discovery call each per run.
+      expect(discovery.calls.filter((call) => call.system === FILE_REVIEW_SYSTEM_PROMPT)).toHaveLength(4);
+    } finally {
+      shared.close();
+    }
+  });
+
+  it('leaves no review row when a mid-stage failure escapes', async () => {
+    const shared = openDb(':memory:');
+    seedRepo(shared);
+    const discovery = fakeLlm({ file: JSON.stringify({ findings: [{ line: 4, severity: 'critical', title: 'Assignment', body: 'Use ===.' }] }) });
+    const verifier: LLMProvider = { name: 'verifier', model: 'v1', concurrency: 1, async complete() { throw new ProviderError('verifier', 'down', 400); } };
+    const deps = { db: shared, llm: discovery.provider, verifierLlm: verifier, retrieve: retrieveOne, github: fakeGithub().github };
+    try {
+      const job = shared.createJob('review', REPO_ID, 42);
+      await expect(reviewPullRequest(deps, { repoId: REPO_ID, prNumber: 42, jobId: job.id, post: false })).rejects.toThrow('down');
+      expect(shared.raw.prepare('select count(*) as n from reviews').get()).toEqual({ n: 0 });
+      const checkpoint = shared.findOpenReviewCheckpoint(REPO_ID, 42)!;
+      expect(checkpoint.owner_token).toBeNull();
+    } finally {
+      shared.close();
+    }
+  });
+
 });
