@@ -1,6 +1,21 @@
-import type { Db, RepoRow } from '../db.js';
+import type { Db, RepoRow, ReviewCheckpointRow, ReviewCallAttemptRow } from '../db.js';
 import { matchesGlob } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  CHECKPOINT_PAYLOAD_VERSION,
+  compatibilityKey as makeCompatibilityKey,
+  canonicalHash,
+  canonicalJson,
+  validateCheckpointPayload,
+  resumeStageOf,
+  lastLedgerOf,
+  ReviewCheckpointBusyError,
+  ReviewCheckpointCorruptError,
+  type ReviewCompatibility,
+  type ReviewProgress,
+  type ReviewLedger,
+  type CompletedReview,
+} from './checkpoint.js';
 import { reviewCallCost } from '../usage/review-cost.js';
 import { countReview, recordReviewCall, recordReviewScope } from './metrics.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
@@ -28,6 +43,17 @@ import {
   renderHistoricalContext,
   REGENERATION_GUIDANCE,
 } from './prompts.js';
+
+/**
+ * Prompt texts a resumed review must have seen verbatim. Digesting the actual
+ * constants (rather than a hardcoded tag) keeps the key honest as prompts evolve.
+ */
+const PROMPT_DIGEST_INPUTS = [
+  FILE_REVIEW_SYSTEM_PROMPT, BATCH_REVIEW_SYSTEM_PROMPT, CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT,
+  FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, focusedVerifierSystemPrompt(),
+] as const;
+/** Structural version of the review pipeline; bump when stage semantics change. */
+const ALGORITHM_DIGEST = 'reviewer-stages-v1';
 
 export type Severity = 'critical' | 'warning' | 'nit';
 export type Verdict = 'approve' | 'comment' | 'request_changes';
@@ -286,6 +312,8 @@ export interface ReviewDeps {
 export interface ReviewOptions {
   repoId: string;
   prNumber: number;
+  /** Durable queue job id; direct calls may omit it. */
+  jobId?: number;
   /** Post the review to GitHub (default true). */
   post?: boolean;
   /** Re-review even when a review for this head sha already exists. */
@@ -295,12 +323,7 @@ export interface ReviewOptions {
 }
 
 const SEVERITIES: readonly Severity[] = ['critical', 'warning', 'nit'];
-const SEVERITY_ALIASES: Readonly<Record<string, Severity>> = {
-  blocker: 'critical', error: 'critical', high: 'critical',
-  medium: 'warning', moderate: 'warning',
-  low: 'nit', info: 'nit', informational: 'nit',
-};
-
+const SEVERITY_ALIASES: Readonly<Record<string, Severity>> = { blocker: 'critical', error: 'critical', high: 'critical', medium: 'warning', moderate: 'warning', low: 'nit', info: 'nit', informational: 'nit' };
 function normalizeSeverity(raw: unknown): Severity | null {
   if (typeof raw !== 'string') return null;
   const value = raw.toLowerCase().trim();
@@ -1411,8 +1434,9 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
   let activeLlm = llm;
   let costUsd: number | null = 0;
   let reservedUsd = 0;
-  let usedUsd = 0;
   const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification' | 'arbitration'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' | 'evidence'; elapsedMs: number }> = [];
+  let usedUsd = 0;
+  const activeAttemptIds = new Set<string>();
   const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
     const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass, elapsedMs: 0 } : undefined;
@@ -1425,6 +1449,13 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       throw new Error(`Review stage exceeds the remaining $0.50 budget; used $${usedUsd.toFixed(6)}, reserved $${reservedUsd.toFixed(6)}, next attempt $${estimate.toFixed(6)}; no review was published.`);
     }
     if (req.reviewBudget && !alreadyReserved) reservedUsd += estimate;
+    let attemptId: string | undefined;
+    if (checkpoint && checkpointOwner && req.reviewBudget) {
+      attemptId = randomUUID();
+      db.reserveReviewCall({ id: attemptId, checkpoint_id: checkpoint.id, job_id: opts.jobId ?? null, unit_key: `${req.reviewStage ?? 'unknown'}:${traceCalls.length}`, attempt_ordinal: traceCalls.length, provider: provider.name, model: provider.model, stage: req.reviewStage ?? 'unknown', pass, request_hash: canonicalHash({ system: req.system, messages: req.messages, model: provider.model }), estimated_usd: estimate, budgeted: 1, reservation_usd: estimate });
+      activeAttemptIds.add(attemptId);
+      reviewCallCost.enterWith({ reported: false, costUsd: 0, stage: req.reviewStage, pass, attemptId, usageSeq: 0 });
+    }
     const call = { reported: false, costUsd: 0 as number | null, stage: req.system === FOLLOWUP_RECONCILIATION_PROMPT ? 'reconciliation' : req.reviewStage ?? 'unknown', pass };
     let raw: string | undefined;
     let error: unknown;
@@ -1437,8 +1468,11 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     } finally {
       recordReviewCall(Math.max(0, Date.now() - started) / 1000, { stage: call.stage, pass, provider: provider.name, model: provider.model, outcome: threw ? 'error' : 'success' });
       if (traceCall) traceCall.elapsedMs = Math.max(0, Date.now() - started);
+      const state = reviewCallCost.getStore();
+      if (state?.durableWriteFailed) throw state.durableWriteFailed;
       const next = costUsd !== null && call.reported && call.costUsd !== null ? costUsd + call.costUsd : null;
       costUsd = next !== null && Number.isFinite(next) ? next : null;
+      if (attemptId && checkpoint && checkpointOwner) db.settleReviewCall(checkpoint.id, checkpointOwner, attemptId, { state: 'settled', outcome: threw ? 'error' : 'success', error_class: null, validation_error: null, error_status: null, usage_complete: call.reported ? 1 : 0, cost_usd: call.reported ? call.costUsd : null, elapsed_ms: Math.max(0, Date.now() - started) });
     }
     const validCost = call.reported && call.costUsd !== null && Number.isFinite(call.costUsd) && call.costUsd >= 0;
     if (req.reviewBudget && validCost) {
@@ -1496,10 +1530,100 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
   if (!found) throw new Error(`Unknown repo: ${opts.repoId}`);
   // Aliased so the type stays narrowed inside the nested runReview().
   const repo: RepoRow = found;
-
   const pr = await github.getPull(repo.owner, repo.name, opts.prNumber);
   const postCtx: PostContext = { db, github, llm, repo, pr, log, fresh: opts.fresh };
 
+  const cached = opts.fresh || opts.force ? null : db.findReview(opts.repoId, opts.prNumber, pr.headSha);
+  let checkpoint: ReviewCheckpointRow | undefined;
+  let checkpointOwner: string | undefined;
+  let checkpointGeneration = 0;
+  let checkpointCompatibility: ReviewCompatibility | undefined;
+  /** Resumed stage state; populated only when a compatible durable snapshot validates. */
+  let resume: ReviewProgress | undefined;
+  const checkpointEligible = !cached && !opts.fresh && !opts.force && opts.jobId !== undefined;
+  if (checkpointEligible) {
+    checkpointOwner = randomUUID();
+    checkpointCompatibility = {
+      version: 1, repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha,
+      title: pr.title, body: pr.body, instructions: repo.instructions ?? '',
+      provider: llm.name, model: llm.model, fallbackModels: (llm.reviewFallbacks ?? []).map((p) => `${p.name}:${p.model}`),
+      supportsBatchReview: llm.supportsBatchReview === true, maxFiles: deps.maxFiles ?? 40, maxRetries: deps.maxRetries ?? 3,
+      discoveryMaxOutput: deps.discoveryMaxOutput ?? REVIEW_MAX_OUTPUT,
+      dualDiscovery: Boolean(deps.dualDiscovery), focusedVerification: Boolean(deps.focusedVerification),
+      arbiter: Boolean(deps.arbiterLlm), arbiterAllFindings: Boolean(deps.arbiterAllFindings),
+      escalationModel: deps.escalationLlm?.model ?? '', verifierModel: deps.verifierLlm?.model ?? '',
+      ignorePatterns: deps.ignorePatterns ?? [], budgetUsd: REVIEW_MAX_USD,
+      promptDigest: canonicalHash(PROMPT_DIGEST_INPUTS), algorithmDigest: ALGORITHM_DIGEST,
+      contextGeneration: repo.review_context_generation, indexedCommit: repo.last_commit, fresh: false,
+    };
+    const compatibilityKeyHash = makeCompatibilityKey(checkpointCompatibility);
+    const claim = db.claimReviewCheckpoint(
+      { id: randomUUID(), repo_id: opts.repoId, pr_number: opts.prNumber, head_sha: pr.headSha, base_sha: pr.baseSha, compatibility_key: compatibilityKeyHash, payload_version: CHECKPOINT_PAYLOAD_VERSION },
+      checkpointOwner, opts.jobId ?? 0,
+    );
+    if (claim.kind === 'busy') throw new ReviewCheckpointBusyError(claim.jobId);
+    if (claim.kind === 'incompatible' || claim.kind === 'blocked') {
+      // Another live invocation owns this checkpoint: never fight it, even when stale.
+      if (claim.row.owner_token && claim.row.state !== 'blocked') throw new ReviewCheckpointBusyError(claim.row.owner_job_id);
+      // Idle stale/blocked row: discard its payload and open a fresh checkpoint.
+      db.invalidateReviewCheckpoint(claim.row.id, claim.row.owner_token, claim.row.generation, claim.kind === 'blocked' ? 'blocked' : 'incompatible');
+      const reclaimed = db.claimReviewCheckpoint(
+        { id: randomUUID(), repo_id: opts.repoId, pr_number: opts.prNumber, head_sha: pr.headSha, base_sha: pr.baseSha, compatibility_key: compatibilityKeyHash, payload_version: CHECKPOINT_PAYLOAD_VERSION },
+        checkpointOwner, opts.jobId ?? 0,
+      );
+      if (reclaimed.kind !== 'claimed') throw new ReviewCheckpointBusyError(reclaimed.kind === 'busy' ? reclaimed.jobId : null);
+      checkpoint = reclaimed.row;
+    } else {
+      checkpoint = claim.row;
+    }
+    checkpointGeneration = checkpoint.generation;
+    try {
+      if (checkpoint.progress_json || checkpoint.payload_hash) {
+        resume = validateCheckpointPayload(checkpoint.progress_json, checkpoint.payload_hash);
+      }
+    } catch (err) {
+      if (!(err instanceof ReviewCheckpointCorruptError)) throw err;
+      log(`review: checkpoint payload corrupt (${err.message}); recomputing from scratch`);
+      db.invalidateReviewCheckpoint(checkpoint.id, checkpointOwner, checkpointGeneration, 'corrupt');
+      const reclaimed = db.claimReviewCheckpoint(
+        { id: randomUUID(), repo_id: opts.repoId, pr_number: opts.prNumber, head_sha: pr.headSha, base_sha: pr.baseSha, compatibility_key: compatibilityKeyHash, payload_version: CHECKPOINT_PAYLOAD_VERSION },
+        checkpointOwner, opts.jobId ?? 0,
+      );
+      if (reclaimed.kind !== 'claimed') throw new ReviewCheckpointBusyError(reclaimed.kind === 'busy' ? reclaimed.jobId : null);
+      checkpoint = reclaimed.row;
+      checkpointGeneration = checkpoint.generation;
+    }
+  }
+  const resumeStage = resume ? resumeStageOf(resume) : undefined;
+  /** Retry/money state a stage snapshot must carry verbatim. */
+  let providerIndex = 0;
+  let retryAttemptsUsed = 0;
+  let followupRetryAttemptsUsed = 0;
+  let followupReserve = 0;
+  const resumedLedger = resume ? lastLedgerOf(resume) : undefined;
+  if (resumedLedger) {
+    usedUsd = resumedLedger.usedUsd;
+    reservedUsd = resumedLedger.reservedUsd;
+    costUsd = resumedLedger.costUsd;
+    retryAttemptsUsed = resumedLedger.retryAttemptsUsed;
+    followupRetryAttemptsUsed = resumedLedger.followupRetryAttemptsUsed;
+    followupReserve = resumedLedger.followupReserve;
+    providerIndex = resumedLedger.activeProviderIndex;
+    const providers = [llm, ...(llm.reviewFallbacks ?? [])];
+    activeLlm = providers[Math.min(providerIndex, Math.max(0, providers.length - 1))]!;
+  }
+  let progress: ReviewProgress = resume ?? { version: 1 };
+  const currentLedger = (): ReviewLedger => ({
+    usedUsd, reservedUsd, costUsd, retryAttemptsUsed,
+    followupRetryAttemptsUsed, followupReserve, activeProviderIndex: providerIndex,
+  });
+  const persistStageProgress = (next: ReviewProgress): void => {
+    if (!checkpoint || !checkpointOwner) return;
+    checkpoint = db.updateReviewCheckpoint(checkpoint.id, checkpointOwner, checkpointGeneration, {
+      progress_json: canonicalJson(next), payload_hash: canonicalHash(next),
+    });
+    checkpointGeneration = checkpoint.generation;
+  };
   const failureTrace = (): ReviewTrace | undefined => {
     if (!traceCalls.length) return undefined;
     const stages = (['initial', 'escalation', 'verification'] as const)
@@ -1534,7 +1658,6 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     }
   };
 
-  const cached = opts.fresh || opts.force ? null : db.findReview(opts.repoId, opts.prNumber, pr.headSha);
   const statusWarnings: string[] = [];
   // A cached, already-posted review is not "in progress": go straight to its final state.
   if (!cached || cached.posted !== 1) {
@@ -1578,7 +1701,6 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       countReview('runs', 1, { outcome: post && !cachedResult.posted ? 'publication_failed' : 'cache_hit' });
       return cachedResult;
     }
-
     const result = await runReview();
     const status = statusForFindings(result.findings, failOn);
     await setStatus(status, result.reviewUrl ?? pr.htmlUrl, result.warnings);
@@ -1608,6 +1730,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       costUsd,
       trace: failureTrace(),
     });
+    if (checkpoint && checkpointOwner) db.releaseReviewCheckpoint(checkpoint.id, checkpointOwner);
     // The check must not stay pending forever when the review itself blows up.
     // Descriptions are capped at 140 characters, so a long message would make the
     // status call fail too and leave the check pending.
@@ -1724,13 +1847,11 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     let verifierExecuted = false;
     let verifierFindingsTrace: Finding[] = [];
     const maxRetries = deps.maxRetries ?? 3;
-    let retryAttemptsUsed = 0;
     const consumeRetryAllowance = (): boolean => {
       if (retryAttemptsUsed >= maxRetries) return false;
       retryAttemptsUsed++;
       return true;
     };
-    let followupRetryAttemptsUsed = 0;
     const consumeFollowupRetryAllowance = (): boolean => {
       // Reconciliation owns one corrective retry so earlier stages cannot starve it.
       if (maxRetries === 0 || followupRetryAttemptsUsed >= 1) return false;
@@ -1859,8 +1980,15 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     // independent verifier; keep older staged/non-Qwen callers unchanged.
     const complementaryDiscovery = Boolean(deps.dualDiscovery) && budgeted && Boolean(verifierLlm) && !escalationLlm && /qwen/i.test(llm.model);
     let batch: { findings: Finding[] } | undefined;
-    let followupReserve = 0;
-    if (budgeted && lineage.previous) {
+    const resumedDiscovery = resume?.discovery;
+    if (resumedDiscovery) {
+      warnings.length = 0;
+      warnings.push(...resumedDiscovery.warnings);
+      traceCalls.push(...resumedDiscovery.calls.map((call) => ({ ...call, pass: call.pass ?? 'normal', elapsedMs: call.elapsedMs ?? 0 })));
+      initialOmittedContext = resumedDiscovery.omittedContext;
+      primaryTrace = resumedDiscovery.primaryTrace.slice();
+    }
+    if (budgeted && lineage.previous && !resumedDiscovery) {
       // Reserve the initial reconciliation call and its dedicated corrective retry.
       const reserve = reviewCostUpperBound({
         system: FOLLOWUP_RECONCILIATION_PROMPT,
@@ -1871,7 +1999,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       followupReserve = reserve * (maxRetries > 0 ? 2 : 1);
       reservedUsd += followupReserve;
     }
-    if (budgeted) {
+    if (budgeted && !resumedDiscovery) {
       const req: CompleteRequest = {
         system: lineage.previous ? FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT : BATCH_REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
@@ -1947,7 +2075,6 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       initialOmittedContext = omitted;
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
       if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
-      let providerIndex = 0;
       let lastRetryError: unknown;
       let attemptReq = req;
       const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
@@ -2042,7 +2169,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       }
     }
 
-    const perFile = batch ? [batch.findings] : await mapPool(files, llm.concurrency, async (file) => {
+    const perFile = batch ? [batch.findings] : resumedDiscovery ? [] : await mapPool(files, llm.concurrency, async (file) => {
       const path = file.newPath ?? file.oldPath!;
       const changedText = file.hunks
         .flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content))
@@ -2105,8 +2232,12 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       }
     });
 
-    let findings = perFile.flat().sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+    let findings = (resumedDiscovery ? resumedDiscovery.findings : perFile.flat()).sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
     primaryTrace = findings.slice();
+    if (!resumedDiscovery) {
+      progress = { ...progress, discovery: { findings, primaryTrace, warnings: [...warnings], ledger: currentLedger(), omittedContext: initialOmittedContext, calls: traceCalls.filter((call) => call.stage === 'initial') } };
+      persistStageProgress(progress);
+    }
     const riskyFiles = files.flatMap((file) => {
       const hunks = file.hunks.filter((_, index) => {
         const risk = assessChange({ ...file, hunks: [file.hunks[index]!] });
@@ -2153,7 +2284,18 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       json: true,
       maxTokens: REVIEW_VERIFIER_MAX_OUTPUT, reviewBudget: budgeted, reviewStage: 'verification',
     });
-    if (escalationLlm && riskyFiles.length) {
+    const resumedEscalation = resume?.escalation;
+    if (resumedEscalation) {
+      findings = resumedEscalation.findings.slice();
+      warnings.length = 0;
+      warnings.push(...resumedEscalation.warnings);
+      traceCalls.push(...resumedEscalation.calls.map((call) => ({ ...call, pass: call.pass ?? 'normal', elapsedMs: call.elapsedMs ?? 0 })));
+      escalationOmittedContext = resumedEscalation.omittedContext;
+      escalationDecisionsTrace = resumedEscalation.decisions.map((decision) => ({ id: decision.id, decision: decision.decision }));
+      escalationFindingsTrace = resumedEscalation.escalatedFindings.slice();
+    }
+    const escalationRan = Boolean(escalationLlm && riskyFiles.length);
+    if (escalationLlm && riskyFiles.length && !resumedEscalation) {
       await assertHeadUnchanged();
       const paths = riskyFiles.map((file) => file.newPath ?? file.oldPath!);
       const seenEscalationContext = new Set<string>();
@@ -2290,14 +2432,40 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       escalationFindingsTrace = escalated.slice();
       const rejected = new Set(decisions.filter((decision) => decision.decision === 'reject').map((decision) => primaryById.get(decision.id as string)));
       findings = findings.filter((finding) => !rejected.has(finding));
-      findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary &&
-        primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
+      findings.push(...escalated.filter((finding) => ![...rejected].some((primary) => primary && primary.path === finding.path && findingLine(primary) === findingLine(finding) && rootCauseMarker(primary) === rootCauseMarker(finding))));
     }
 
-    findings = deduplicateProvisionalCandidates(findings);
-    findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-    findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
-    if (verifierLlm && findings.length > 0) {
+    if (!resumedEscalation) {
+      findings = deduplicateProvisionalCandidates(findings);
+      findings.sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+      findings = await validateRepositoryRuleFindings(findings, github, repo, pr.baseSha, warnings);
+      if (escalationRan) {
+        progress = { ...progress, escalation: { findings, warnings: [...warnings], ledger: currentLedger(), decisions: escalationDecisionsTrace ?? [], escalatedFindings: escalationFindingsTrace ?? [], omittedContext: escalationOmittedContext, calls: traceCalls.filter((call) => call.stage === 'escalation') } };
+        persistStageProgress(progress);
+      }
+    }
+    const resumedVerification = resume?.verification;
+    if (resumedVerification) {
+      findings = resumedVerification.findings.slice();
+      traceCalls.push(...resumedVerification.calls.map((call) => ({ ...call, pass: call.pass ?? 'normal', elapsedMs: call.elapsedMs ?? 0 })));
+      warnings.push(...resumedVerification.warnings);
+      if (resumedVerification.arbitration) {
+        traceCalls.push(...resumedVerification.arbitration.calls.map((call) => ({ ...call, pass: call.pass ?? 'normal', elapsedMs: call.elapsedMs ?? 0 })));
+        arbitrationExecuted = resumedVerification.arbitration.executed;
+        arbitrationDecisionsTrace = resumedVerification.arbitration.decisions.map((decision) => ({ id: decision.id, decision: decision.decision }));
+        arbitrationFiles = files.filter((file) => resumedVerification.arbitration!.selectedPaths.includes(file.newPath ?? file.oldPath ?? ''));
+      }
+      verifierExecuted = resumedVerification.executed || resumedVerification.calls.length > 0;
+      verifierSelectedPaths = new Set(resumedVerification.selectedPaths);
+      verifierOmittedContext = resumedVerification.omittedContext;
+      verifierDecisionsTrace = resumedVerification.decisions?.map((decision) => ({ id: decision.id, decision: decision.decision, ...(decision.duplicateOf !== undefined ? { duplicateOf: decision.duplicateOf } : {}) }));
+      verifierFocusedDecisionsTrace = resumedVerification.focusedDecisions?.map((decision) => ({ id: decision.id, decision: decision.decision }));
+      verifierEvidenceDecisionsTrace = resumedVerification.evidenceDecisions?.map((decision) => ({ id: decision.id, decision: decision.decision }));
+      verifierFocusedSkipped = resumedVerification.focusedSkipped;
+      verifierMissingEvidenceTrace = resumedVerification.missingEvidence;
+      verifierFindingsTrace = resumedVerification.findingsTrace.slice();
+    }
+    if (verifierLlm && findings.length > 0 && !resume?.verification) {
       await assertHeadUnchanged();
       // The initial retrieval only knows the diff. Refresh each finding's
       // context with its implicated identifiers/callees before verification.
@@ -2561,11 +2729,11 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
           const focusedPayload = JSON.parse(focusedReq.messages[0]!.content) as { files: VerifierContextFile[] };
           const focusedFiles = focusedPayload.files;
           const focusedCall = await completeCall(focusedReq, verifierLlm, false, 'focused');
+          let focusedDecisions: Array<Record<string, unknown>>;
           if (focusedCall.failed) {
             if (focusedCall.error instanceof JsonExtractError || focusedCall.error instanceof IncompleteResponseError) markTraceValidation(focusedCall.traceIndex, focusedCall.error);
             throw focusedCall.error;
           }
-          let focusedDecisions: Array<Record<string, unknown>>;
           try {
             const focusedObj = extractJson(focusedCall.raw!) as Record<string, unknown>;
             focusedDecisions = Array.isArray(focusedObj?.decisions) ? focusedObj.decisions as Array<Record<string, unknown>> : [];
@@ -2587,11 +2755,23 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         }
       }
     }
-    findings = selectPostedFindings(findings);
-
+    if (!resumedVerification) findings = selectPostedFindings(findings);
+    if (!resumedVerification && verifierExecuted) {
+      progress = { ...progress, verification: { findings, warnings: [...warnings], ledger: currentLedger(), executed: verifierExecuted, selectedPaths: [...verifierSelectedPaths], omittedContext: verifierOmittedContext, ...(verifierDecisionsTrace ? { decisions: verifierDecisionsTrace } : {}), ...(verifierFocusedDecisionsTrace ? { focusedDecisions: verifierFocusedDecisionsTrace } : {}), ...(verifierEvidenceDecisionsTrace ? { evidenceDecisions: verifierEvidenceDecisionsTrace } : {}), ...(verifierFocusedSkipped ? { focusedSkipped: verifierFocusedSkipped } : {}), ...(verifierMissingEvidenceTrace ? { missingEvidence: verifierMissingEvidenceTrace } : {}), findingsTrace: verifierFindingsTrace, ...(arbitrationExecuted ? { arbitration: { executed: true, selectedPaths: arbitrationFiles.map((file) => file.newPath ?? file.oldPath ?? ''), decisions: arbitrationDecisionsTrace ?? [], calls: traceCalls.filter((call) => call.stage === 'arbitration') } } : {}), calls: traceCalls.filter((call) => call.stage === 'verification') } };
+      persistStageProgress(progress);
+    }
     await assertHeadUnchanged();
-    let summary = buildFindingSummary(findings);
-    if (lineage.previous) {
+    const resumedReconciliation = resume?.reconciliation;
+    let summary = resumedReconciliation ? resumedReconciliation.summary : buildFindingSummary(findings);
+    if (resumedReconciliation) {
+      findings = resumedReconciliation.findings.slice();
+      warnings.length = 0;
+      warnings.push(...resumedReconciliation.warnings);
+      summary = resumedReconciliation.summary;
+      verifierExecuted = true;
+      verifierFindingsTrace = findings.slice();
+    }
+    if (lineage.previous && !resumedReconciliation) {
       reservedUsd -= followupReserve;
       const previous = lineage.previous;
       if (previous.findings.length || findings.length) {
@@ -2637,6 +2817,8 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         summary = reconcileFollowup('{"previous":[],"candidates":[]}', lineage, [], []).summary;
       }
       await assertHeadUnchanged();
+      progress = { ...progress, reconciliation: { findings, summary, warnings: [...warnings], ledger: currentLedger() } };
+      persistStageProgress(progress);
     }
     const verdict = verdictForFindings(findings);
     const traceStage = (stage: 'initial' | 'escalation' | 'verification' | 'arbitration' | 'final', selected: DiffFile[], omittedContext: number, extra: { primaryFindings?: Finding[]; decisions?: Array<{ id: string | number; decision: string }>; focusedDecisions?: Array<{ id: string | number; decision: string }>; evidenceDecisions?: Array<{ id: string | number; decision: string }>; focusedSkipped?: 'budget' | 'disabled'; missingEvidence?: ReviewTrace['stages'][number]['missingEvidence']; findings?: Finding[] } = {}) => ({
@@ -2671,20 +2853,18 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       warnings.push('Repository has not been indexed; review ran without codebase context.');
     }
 
-    const row = db.insertReview({
-      repo_id: opts.repoId,
-      pr_number: opts.prNumber,
-      head_sha: pr.headSha,
-      status: 'done',
-      cost_usd: costUsd,
-      provider: activeLlm.name,
-      model: activeLlm.model,
-      summary,
-      verdict,
-      comments_json: JSON.stringify(findings),
-      posted: 0,
-      error: null,
-    });
+    const riskMetadata = files.map((file) => ({ path: file.newPath ?? file.oldPath!, risk: assessChange(file) }));
+    const completed: CompletedReview = { version: 1, summary, verdict, findings, skippedFiles, warnings: [...warnings], riskMetadata, trace, provider: activeLlm.name, model: activeLlm.model, costUsd };
+    const row = checkpoint && checkpointOwner && checkpointCompatibility
+      ? db.finalizeReviewCheckpoint(checkpoint.id, checkpointOwner, checkpointGeneration, {
+          repo_id: opts.repoId, pr_number: opts.prNumber, head_sha: pr.headSha, status: 'done', cost_usd: costUsd,
+          provider: activeLlm.name, model: activeLlm.model, summary, verdict, comments_json: JSON.stringify(findings), posted: 0, error: null,
+          completion_json: canonicalJson(completed), compatibility_key: makeCompatibilityKey(checkpointCompatibility), base_sha: pr.baseSha,
+        })
+      : db.insertReview({
+          repo_id: opts.repoId, pr_number: opts.prNumber, head_sha: pr.headSha, status: 'done', cost_usd: costUsd,
+          provider: activeLlm.name, model: activeLlm.model, summary, verdict, comments_json: JSON.stringify(findings), posted: 0, error: null,
+        });
 
     const result: ReviewResult = {
       reviewId: row.id,
@@ -2696,16 +2876,20 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       posted: false,
       skippedFiles,
       warnings,
-      riskMetadata: files.map((file) => ({ path: file.newPath ?? file.oldPath!, risk: assessChange(file) })),
+      riskMetadata,
       trace,
     };
 
     postCtx.llm = activeLlm;
     if (post) await postReview(postCtx, result);
 
+    if (checkpoint && checkpointOwner) {
+      db.releaseReviewCheckpoint(checkpoint.id, checkpointOwner);
+    }
     return result;
   }
 }
+
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

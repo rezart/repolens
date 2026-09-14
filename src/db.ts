@@ -19,6 +19,7 @@ export interface RepoRow {
   indexed_at: string | null;
   error: string | null;
   instructions: string | null;
+  review_context_generation: number;
   file_count: number;
   chunk_count: number;
   created_at: string;
@@ -65,16 +66,17 @@ export interface ReviewRow {
   pr_number: number;
   head_sha: string;
   status: 'done' | 'error';
-  /** Backend that produced the saved review; null for historical reviews. */
   provider: string | null;
   model: string | null;
-  /** Reported inference total; null for historical or incompletely priced reviews. */
   cost_usd: number | null;
   summary: string | null;
   verdict: string | null;
   comments_json: string;
   posted: number;
   error: string | null;
+  completion_json?: string | null;
+  compatibility_key?: string | null;
+  base_sha?: string | null;
   created_at: string;
 }
 
@@ -82,7 +84,6 @@ export interface JobRow {
   id: number;
   kind: JobKind;
   repo_id: string | null;
-  /** Pull request the job is about (review jobs only). */
   pr_number: number | null;
   status: JobStatus;
   progress: string | null;
@@ -90,6 +91,83 @@ export interface JobRow {
   result_json: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export type ReviewCheckpointState = 'active' | 'ready' | 'finalized' | 'invalidated' | 'blocked';
+export interface ReviewCheckpointRow {
+  id: string;
+  repo_id: string;
+  pr_number: number;
+  head_sha: string;
+  base_sha: string;
+  compatibility_key: string;
+  payload_version: number;
+  state: ReviewCheckpointState;
+  owner_token: string | null;
+  owner_job_id: number | null;
+  generation: number;
+  inputs_json: string | null;
+  progress_json: string | null;
+  payload_hash: string | null;
+  review_id: number | null;
+  last_error_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+export type ReviewCallAttemptState = 'started' | 'settled' | 'interrupted';
+export interface ReviewCallAttemptRow {
+  id: string;
+  checkpoint_id: string;
+  job_id: number | null;
+  unit_key: string;
+  attempt_ordinal: number;
+  provider: string;
+  model: string;
+  stage: string;
+  pass: string;
+  request_hash: string;
+  estimated_usd: number;
+  budgeted: number;
+  state: ReviewCallAttemptState;
+  outcome: string | null;
+  error_class: string | null;
+  validation_error: string | null;
+  error_status: number | null;
+  usage_reported: number;
+  usage_complete: number;
+  cost_usd: number | null;
+  reservation_usd: number;
+  elapsed_ms: number | null;
+  started_at: string;
+  settled_at: string | null;
+}
+
+export interface ReviewCheckpointInput {
+  id: string;
+  repo_id: string;
+  pr_number: number;
+  head_sha: string;
+  base_sha: string;
+  compatibility_key: string;
+  payload_version: number;
+  inputs_json?: string | null;
+  progress_json?: string | null;
+  payload_hash?: string | null;
+}
+export interface ReviewCallAttemptInput {
+  id: string;
+  checkpoint_id: string;
+  job_id?: number | null;
+  unit_key: string;
+  attempt_ordinal: number;
+  provider: string;
+  model: string;
+  stage: string;
+  pass: string;
+  request_hash: string;
+  estimated_usd: number;
+  budgeted: number;
+  reservation_usd: number;
 }
 
 /** One backend call, as written by UsageTracker. */
@@ -101,8 +179,9 @@ export interface UsageInsert {
   cached_input_tokens: number;
   cache_write_tokens: number;
   output_tokens: number;
-  /** Cost reported by the backend; null when it reported none. */
   cost_usd: number | null;
+  review_attempt_id?: string | null;
+  review_usage_seq?: number | null;
 }
 
 /**
@@ -140,6 +219,7 @@ create table if not exists repos (
   indexed_at text,
   error text,
   instructions text,
+  review_context_generation integer not null default 0,
   file_count integer not null default 0,
   chunk_count integer not null default 0,
   created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -188,9 +268,62 @@ create table if not exists reviews (
   comments_json text not null default '[]',
   posted integer not null default 0,
   error text,
+  completion_json text,
+  compatibility_key text,
+  base_sha text,
   created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create index if not exists reviews_repo on reviews(repo_id, pr_number);
+create table if not exists review_checkpoints (
+  id text primary key,
+  repo_id text not null references repos(id) on delete cascade,
+  pr_number integer not null,
+  head_sha text not null,
+  base_sha text not null,
+  compatibility_key text not null,
+  payload_version integer not null,
+  state text not null check(state in ('active','ready','finalized','invalidated','blocked')),
+  owner_token text,
+  owner_job_id integer references jobs(id) on delete set null,
+  generation integer not null default 0,
+  inputs_json text,
+  progress_json text,
+  payload_hash text,
+  review_id integer references reviews(id) on delete set null,
+  last_error_code text,
+  created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+create unique index if not exists review_checkpoints_open on review_checkpoints(repo_id, pr_number) where state in ('active','ready','blocked');
+create index if not exists review_checkpoints_state on review_checkpoints(state, updated_at);
+create table if not exists review_call_attempts (
+  id text primary key,
+  checkpoint_id text not null references review_checkpoints(id) on delete cascade,
+  job_id integer references jobs(id) on delete set null,
+  unit_key text not null,
+  attempt_ordinal integer not null,
+  provider text not null,
+  model text not null,
+  stage text not null,
+  pass text not null,
+  request_hash text not null,
+  estimated_usd real not null,
+  budgeted integer not null,
+  state text not null check(state in ('started','settled','interrupted')),
+  outcome text,
+  error_class text,
+  validation_error text,
+  error_status integer,
+  usage_reported integer not null default 0,
+  usage_complete integer not null default 0,
+  cost_usd real,
+  reservation_usd real not null,
+  elapsed_ms integer,
+  started_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  settled_at text,
+  unique(checkpoint_id, unit_key, attempt_ordinal)
+);
+create index if not exists review_call_attempts_checkpoint on review_call_attempts(checkpoint_id);
 create table if not exists jobs (
   id integer primary key autoincrement,
   kind text not null,
@@ -214,9 +347,12 @@ create table if not exists llm_usage (
   cached_input_tokens integer not null default 0,
   cache_write_tokens integer not null default 0,
   output_tokens integer not null default 0,
-  cost_usd real
+  cost_usd real,
+  review_attempt_id text,
+  review_usage_seq integer
 );
 create index if not exists llm_usage_ts on llm_usage(ts);
+create unique index if not exists review_usage_unique on llm_usage(review_attempt_id, review_usage_seq) where review_attempt_id is not null and review_usage_seq is not null;
 create table if not exists embedding_cache (
   model text not null,
   input_hash text not null,
@@ -449,13 +585,7 @@ export class Db {
   vecSearch(repoIds: string[], embedding: number[], limit: number): SearchHit[] {
     if (!this.vecDim || repoIds.length === 0) return [];
     const placeholders = repoIds.map(() => '?').join(',');
-    const rows = this.raw
-      .prepare(
-        `select v.chunk_id as chunk_id, v.distance as distance
-         from chunk_vec v
-         where v.embedding match ? and k = ? and v.repo_id in (${placeholders})`,
-      )
-      .all(new Float32Array(embedding), limit, ...repoIds) as Array<{ chunk_id: number | bigint; distance: number }>;
+    const rows = this.raw.prepare(`select v.chunk_id as chunk_id, v.distance as distance from chunk_vec v where v.embedding match ? and k = ? and v.repo_id in (${placeholders})`).all(new Float32Array(embedding), limit, ...repoIds) as Array<{ chunk_id: number | bigint; distance: number }>;
     const hits: SearchHit[] = [];
     for (const r of rows) {
       const chunk = this.getChunk(Number(r.chunk_id));
@@ -466,25 +596,145 @@ export class Db {
 
   /** Chunk ids in a repo that have no vector yet (used to backfill embeddings). */
   chunkIdsWithoutVectors(repoId: string): number[] {
-    if (!this.vecDim) {
-      return (this.raw.prepare(`select id from chunks where repo_id=?`).all(repoId) as { id: number }[]).map((r) => r.id);
-    }
-    return (
-      this.raw
-        .prepare(`select id from chunks where repo_id=? and id not in (select chunk_id from chunk_vec where repo_id=?)`)
-        .all(repoId, repoId) as { id: number }[]
-    ).map((r) => r.id);
+    if (!this.vecDim) return (this.raw.prepare(`select id from chunks where repo_id=?`).all(repoId) as { id: number }[]).map((r) => r.id);
+    return (this.raw.prepare(`select id from chunks where repo_id=? and id not in (select chunk_id from chunk_vec where repo_id=?)`).all(repoId, repoId) as { id: number }[]).map((r) => r.id);
+  }
+  bumpReviewContextGeneration(repoId: string): number {
+    this.raw.prepare(`update repos set review_context_generation=review_context_generation+1 where id=?`).run(repoId);
+    const row = this.raw.prepare(`select review_context_generation from repos where id=?`).get(repoId) as { review_context_generation: number } | undefined;
+    if (!row) throw new Error(`repository not found: ${repoId}`);
+    return row.review_context_generation;
   }
 
   // ---- reviews ----
-  insertReview(r: Omit<ReviewRow, 'id' | 'created_at' | 'cost_usd' | 'provider' | 'model'> & { cost_usd?: number | null; provider?: string | null; model?: string | null }): ReviewRow {
-    const res = this.raw
-      .prepare(
-        `insert into reviews (repo_id, pr_number, head_sha, status, summary, verdict, comments_json, posted, error, cost_usd, provider, model)
-         values (@repo_id, @pr_number, @head_sha, @status, @summary, @verdict, @comments_json, @posted, @error, @cost_usd, @provider, @model)`,
-      )
-      .run({ cost_usd: null, provider: null, model: null, ...r });
+  insertReview(r: Omit<ReviewRow, 'id' | 'created_at' | 'cost_usd' | 'provider' | 'model' | 'completion_json' | 'compatibility_key' | 'base_sha'> & { cost_usd?: number | null; provider?: string | null; model?: string | null; completion_json?: string | null; compatibility_key?: string | null; base_sha?: string | null }): ReviewRow {
+    const res = this.raw.prepare(`insert into reviews (repo_id,pr_number,head_sha,status,summary,verdict,comments_json,posted,error,cost_usd,provider,model,completion_json,compatibility_key,base_sha) values (@repo_id,@pr_number,@head_sha,@status,@summary,@verdict,@comments_json,@posted,@error,@cost_usd,@provider,@model,@completion_json,@compatibility_key,@base_sha)`).run({ cost_usd: null, provider: null, model: null, completion_json: null, compatibility_key: null, base_sha: null, ...r });
     return this.getReview(Number(res.lastInsertRowid))!;
+  }
+
+  // ---- durable review execution ----
+  getReviewCheckpoint(id: string): ReviewCheckpointRow | undefined {
+    return this.raw.prepare(`select * from review_checkpoints where id=?`).get(id) as ReviewCheckpointRow | undefined;
+  }
+
+  findOpenReviewCheckpoint(repoId: string, prNumber: number): ReviewCheckpointRow | undefined {
+    return this.raw.prepare(`select * from review_checkpoints where repo_id=? and pr_number=? and state in ('active','ready','blocked') order by updated_at desc limit 1`).get(repoId, prNumber) as ReviewCheckpointRow | undefined;
+  }
+
+  createReviewCheckpoint(input: ReviewCheckpointInput): ReviewCheckpointRow {
+    this.raw.prepare(`insert into review_checkpoints (id,repo_id,pr_number,head_sha,base_sha,compatibility_key,payload_version,state,inputs_json,progress_json,payload_hash) values (@id,@repo_id,@pr_number,@head_sha,@base_sha,@compatibility_key,@payload_version,'active',@inputs_json,@progress_json,@payload_hash)`).run({ inputs_json: null, progress_json: null, payload_hash: null, ...input });
+    return this.getReviewCheckpoint(input.id)!;
+  }
+
+  /** Atomically claim an unowned checkpoint; a different owner never gets to overwrite it. */
+  claimReviewCheckpoint(input: ReviewCheckpointInput, ownerToken: string, ownerJobId: number): { kind: 'claimed'; row: ReviewCheckpointRow } | { kind: 'busy'; jobId: number | null } | { kind: 'incompatible'; row: ReviewCheckpointRow } | { kind: 'blocked'; row: ReviewCheckpointRow } {
+    const tx = this.raw.transaction(() => {
+      let row = this.getReviewCheckpoint(input.id);
+      if (!row) {
+        try { row = this.createReviewCheckpoint(input); } catch (err) {
+          if (!(err instanceof Error) || !String(err.message).includes('UNIQUE')) throw err;
+          row = this.findOpenReviewCheckpoint(input.repo_id, input.pr_number);
+        }
+      }
+      if (!row) throw new Error('checkpoint disappeared while claiming');
+      if (row.head_sha !== input.head_sha || row.base_sha !== input.base_sha || row.compatibility_key !== input.compatibility_key || row.payload_version !== input.payload_version) return { kind: 'incompatible', row } as const;
+      if (row.state === 'blocked') return { kind: 'blocked', row } as const;
+      if (row.owner_token && row.owner_token !== ownerToken) return { kind: 'busy', jobId: row.owner_job_id } as const;
+      this.raw.prepare(`update review_checkpoints set owner_token=?, owner_job_id=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=?`).run(ownerToken, ownerJobId, row.id);
+      return { kind: 'claimed', row: this.getReviewCheckpoint(row.id)! } as const;
+    });
+    return tx();
+  }
+
+  updateReviewCheckpoint(id: string, ownerToken: string, expectedGeneration: number, patch: Partial<Pick<ReviewCheckpointRow, 'state'|'inputs_json'|'progress_json'|'payload_hash'|'last_error_code'>>): ReviewCheckpointRow {
+    const allowed = ['state', 'inputs_json', 'progress_json', 'payload_hash', 'last_error_code'] as const;
+    const keys = allowed.filter((key) => patch[key] !== undefined);
+    if (!keys.length) return this.getReviewCheckpoint(id)!;
+    const sets = keys.map((key) => `${key}=@${key}`);
+    sets.push('generation=generation+1', "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+    const params: Record<string, unknown> = { id, owner_token: ownerToken, generation: expectedGeneration };
+    for (const key of keys) params[key] = patch[key];
+    const result = this.raw.prepare(`update review_checkpoints set ${sets.join(',')} where id=@id and owner_token=@owner_token and generation=@generation`).run(params);
+    if (result.changes !== 1) throw new Error('review checkpoint ownership conflict');
+    return this.getReviewCheckpoint(id)!;
+  }
+
+  releaseReviewCheckpoint(id: string, ownerToken: string): boolean {
+    return this.raw.prepare(`update review_checkpoints set owner_token=null, owner_job_id=null, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=? and owner_token=?`).run(id, ownerToken).changes === 1;
+  }
+
+  invalidateReviewCheckpoint(id: string, ownerToken: string | null, expectedGeneration: number, reason: string): ReviewCheckpointRow {
+    const ownerClause = ownerToken === null ? 'owner_token is null' : 'owner_token=@owner_token';
+    const result = this.raw.prepare(`update review_checkpoints set state='invalidated', inputs_json=null, progress_json=null, last_error_code=@reason, generation=generation+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=@id and generation=@generation and ${ownerClause}`).run({ id, generation: expectedGeneration, owner_token: ownerToken, reason });
+    if (result.changes !== 1) throw new Error('review checkpoint ownership conflict');
+    return this.getReviewCheckpoint(id)!;
+  }
+
+  reserveReviewCall(input: ReviewCallAttemptInput): ReviewCallAttemptRow {
+    this.raw.prepare(`insert into review_call_attempts (id,checkpoint_id,job_id,unit_key,attempt_ordinal,provider,model,stage,pass,request_hash,estimated_usd,budgeted,state,reservation_usd) values (@id,@checkpoint_id,@job_id,@unit_key,@attempt_ordinal,@provider,@model,@stage,@pass,@request_hash,@estimated_usd,@budgeted,'started',@reservation_usd)`).run({ job_id: null, ...input });
+    return this.getReviewCallAttempt(input.id)!;
+  }
+
+  getReviewCallAttempt(id: string): ReviewCallAttemptRow | undefined { return this.raw.prepare(`select * from review_call_attempts where id=?`).get(id) as ReviewCallAttemptRow | undefined; }
+  listReviewCallAttempts(checkpointId: string): ReviewCallAttemptRow[] { return this.raw.prepare(`select * from review_call_attempts where checkpoint_id=? order by started_at,id`).all(checkpointId) as ReviewCallAttemptRow[]; }
+
+  settleReviewCallAttempt(id: string, settlement: Pick<ReviewCallAttemptRow, 'state'|'outcome'|'error_class'|'validation_error'|'error_status'|'usage_complete'|'cost_usd'|'elapsed_ms'>): ReviewCallAttemptRow {
+    this.raw.prepare(`update review_call_attempts set state=@state,outcome=@outcome,error_class=@error_class,validation_error=@validation_error,error_status=@error_status,usage_complete=@usage_complete,cost_usd=@cost_usd,elapsed_ms=@elapsed_ms,settled_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=@id`).run({ id, ...settlement });
+    return this.getReviewCallAttempt(id)!;
+  }
+
+  finalizeReviewCheckpoint(id: string, ownerToken: string, expectedGeneration: number, review: Omit<ReviewRow, 'id'|'created_at'|'completion_json'|'compatibility_key'|'base_sha'> & Pick<ReviewRow, 'completion_json'|'compatibility_key'|'base_sha'>): ReviewRow {
+    const tx = this.raw.transaction(() => {
+      const checkpoint = this.getReviewCheckpoint(id);
+      if (!checkpoint) throw new Error('review checkpoint not found');
+      if (checkpoint.state === 'finalized' && checkpoint.review_id) return this.getReview(checkpoint.review_id)!;
+      const res = this.raw.prepare(`insert into reviews (repo_id,pr_number,head_sha,status,cost_usd,summary,verdict,comments_json,posted,error,completion_json,compatibility_key,base_sha,provider,model) values (@repo_id,@pr_number,@head_sha,@status,@cost_usd,@summary,@verdict,@comments_json,@posted,@error,@completion_json,@compatibility_key,@base_sha,@provider,@model)`).run(review);
+      const reviewId = Number(res.lastInsertRowid);
+      const update = this.raw.prepare(`update review_checkpoints set review_id=?,state='finalized',inputs_json=null,progress_json=null,owner_token=null,owner_job_id=null,generation=generation+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=? and owner_token=? and generation=?`).run(reviewId,id,ownerToken,expectedGeneration);
+      if (update.changes !== 1) throw new Error('review checkpoint ownership conflict');
+      return this.getReview(reviewId)!;
+    });
+    return tx();
+  }
+
+  reserveReviewCalls(checkpointId: string, ownerToken: string, expectedGeneration: number, inputs: ReviewCallAttemptInput[], ceiling = Number.POSITIVE_INFINITY, heldFutureReserve = 0): ReviewCallAttemptRow[] {
+    const tx = this.raw.transaction(() => {
+      const checkpoint = this.getReviewCheckpoint(checkpointId);
+      if (!checkpoint || checkpoint.owner_token !== ownerToken || checkpoint.generation !== expectedGeneration) throw new Error('review checkpoint ownership conflict');
+      const existing = this.listReviewCallAttempts(checkpointId).reduce((sum, call) => sum + call.reservation_usd, 0);
+      const requested = inputs.reduce((sum, call) => sum + call.reservation_usd, 0);
+      if (existing + requested + heldFutureReserve > ceiling) throw new Error('review stage exceeds remaining budget');
+      const rows = inputs.map((input) => this.reserveReviewCall({ ...input, checkpoint_id: checkpointId }));
+      this.raw.prepare(`update review_checkpoints set generation=generation+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=? and owner_token=? and generation=?`).run(checkpointId, ownerToken, expectedGeneration);
+      return rows;
+    });
+    return tx();
+  }
+
+  recordReviewCallUsage(attemptId: string, seq: number, usage: UsageInsert): void {
+    const tx = this.raw.transaction(() => {
+      if (this.raw.prepare(`select id from llm_usage where review_attempt_id=? and review_usage_seq=?`).get(attemptId, seq)) return;
+      this.raw.prepare(`insert into llm_usage (role,provider,model,input_tokens,cached_input_tokens,cache_write_tokens,output_tokens,cost_usd,review_attempt_id,review_usage_seq) values (@role,@provider,@model,@input_tokens,@cached_input_tokens,@cache_write_tokens,@output_tokens,@cost_usd,@attempt_id,@seq)`).run({ ...usage, attempt_id: attemptId, seq });
+      this.raw.prepare(`update review_call_attempts set usage_reported=1 where id=?`).run(attemptId);
+    });
+    tx();
+  }
+
+  settleReviewCall(checkpointId: string, ownerToken: string, attemptId: string, settlement: Pick<ReviewCallAttemptRow, 'state'|'outcome'|'error_class'|'validation_error'|'error_status'|'usage_complete'|'cost_usd'|'elapsed_ms'>, progressJson?: string): ReviewCallAttemptRow {
+    const tx = this.raw.transaction(() => {
+      const checkpoint = this.getReviewCheckpoint(checkpointId);
+      if (!checkpoint || checkpoint.owner_token !== ownerToken) throw new Error('review checkpoint ownership conflict');
+      const attempt = this.getReviewCallAttempt(attemptId);
+      if (!attempt || attempt.checkpoint_id !== checkpointId) throw new Error('review call attempt not found');
+      if (progressJson !== undefined) validateReviewProgressJson(progressJson);
+      const row = this.settleReviewCallAttempt(attemptId, settlement);
+      if (settlement.state === 'settled' && settlement.cost_usd !== null && settlement.cost_usd !== undefined) {
+        this.raw.prepare(`update review_call_attempts set reservation_usd=? where id=?`).run(settlement.cost_usd, attemptId);
+      }
+      if (progressJson !== undefined) this.raw.prepare(`update review_checkpoints set progress_json=?,generation=generation+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where id=? and owner_token=?`).run(progressJson, checkpointId, ownerToken);
+      return row;
+    });
+    return tx();
   }
 
   getReview(id: number): ReviewRow | undefined {
@@ -537,28 +787,33 @@ export class Db {
     return this.getJob(Number(res.lastInsertRowid))!;
   }
 
-  updateJob(id: number, patch: Partial<Pick<JobRow, 'status' | 'progress' | 'error' | 'result_json'>>) {
-    const sets = Object.keys(patch).map((k) => `${k}=@${k}`);
-    sets.push(`updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-    this.raw.prepare(`update jobs set ${sets.join(', ')} where id=@id`).run({ id, ...patch });
+  listJobs(limit = 50): JobRow[] {
+    return this.raw.prepare(`select * from jobs order by id desc limit ?`).all(limit) as JobRow[];
   }
 
   getJob(id: number): JobRow | undefined {
     return this.raw.prepare(`select * from jobs where id=?`).get(id) as JobRow | undefined;
   }
 
-  listJobs(limit = 50): JobRow[] {
-    return this.raw.prepare(`select * from jobs order by id desc limit ?`).all(limit) as JobRow[];
+  updateJob(id: number, patch: Partial<Pick<JobRow, 'status' | 'progress' | 'error' | 'result_json'>>) {
+    const sets = Object.keys(patch).map((k) => `${k}=@${k}`);
+    sets.push(`updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+    this.raw.prepare(`update jobs set ${sets.join(', ')} where id=@id`).run({ id, ...patch });
   }
 
-  // ---- usage ----
   insertUsage(row: UsageInsert) {
-    this.raw
-      .prepare(
-        `insert into llm_usage (role, provider, model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_usd)
-         values (@role, @provider, @model, @input_tokens, @cached_input_tokens, @cache_write_tokens, @output_tokens, @cost_usd)`,
-      )
-      .run(row);
+    const insert = this.raw.prepare(
+      `insert into llm_usage (role, provider, model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_usd, review_attempt_id, review_usage_seq)
+       values (@role, @provider, @model, @input_tokens, @cached_input_tokens, @cache_write_tokens, @output_tokens, @cost_usd, @review_attempt_id, @review_usage_seq)`,
+    );
+    try {
+      insert.run({ review_attempt_id: null, review_usage_seq: null, ...row });
+    } catch (err) {
+      if (!row.review_attempt_id || !(err instanceof Error) || !String(err.message).includes('UNIQUE')) throw err;
+    }
+    if (row.review_attempt_id) {
+      this.raw.prepare(`update review_call_attempts set usage_reported=1 where id=?`).run(row.review_attempt_id);
+    }
   }
 
   /** Per UTC day, role, provider and model since `sinceIso` (inclusive), newest day first. */
@@ -591,6 +846,20 @@ export class Db {
     this.raw.prepare(`insert into meta (key, value) values (?, ?) on conflict(key) do update set value=excluded.value`).run(key, value);
   }
 
+  /** Startup-only recovery: conservatively account for calls left in flight. */
+  recoverInterruptedReviewExecutions(): void {
+    const tx = this.raw.transaction(() => {
+      this.raw.prepare(`update jobs set status='error', error=coalesce(error,'interrupted by process restart'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where kind='review' and status in ('queued','running')`).run();
+      this.raw.prepare(`update review_call_attempts set state='interrupted', outcome='interrupted', settled_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where state='started'`).run();
+      this.raw.prepare(`update review_checkpoints set owner_token=null, owner_job_id=null, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where state in ('active','ready','blocked')`).run();
+    });
+    tx();
+  }
+
+  pruneReviewCheckpointPayloads(beforeIso: string): number {
+    const result = this.raw.prepare(`update review_checkpoints set state='invalidated', inputs_json=null, progress_json=null, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where owner_token is null and state in ('active','ready') and updated_at < ?`).run(beforeIso);
+    return result.changes;
+  }
   /** Review jobs of one repository, latest first. */
   listReviewJobsForRepo(repoId: string, limit = 200): JobRow[] {
     return this.raw
@@ -607,14 +876,38 @@ function isDenseFiniteVector(vector: ArrayLike<number>): boolean {
  * Additive migrations for databases created by an older RepoLens. Every step must be
  * safe to re-run: the schema above already contains the result for fresh databases.
  */
+function validateReviewProgressJson(value: string): void {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error('invalid review progress JSON'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid review progress payload');
+  const p = parsed as Record<string, unknown>;
+  const phases: Record<string, true> = { preparation: true, discovery: true, escalation: true, rule_validation: true, verification: true, arbitration: true, evidence: true, reconciliation: true, final: true };
+  if (p.version !== 1 || typeof p.phase !== 'string' || phases[p.phase] !== true || !Array.isArray(p.completedUnits) || !Number.isInteger(p.activeProviderIndex) || !Number.isInteger(p.retryAttemptsUsed) || !Number.isInteger(p.followupRetryAttemptsUsed) || typeof p.followupReserve !== 'number' || !Number.isFinite(p.followupReserve) || typeof p.usedUsd !== 'number' || !Number.isFinite(p.usedUsd) || typeof p.reservedUsd !== 'number' || !Number.isFinite(p.reservedUsd) || !Array.isArray(p.warnings)) throw new Error('invalid review progress payload');
+}
+
 export function migrate(raw: Database.Database) {
   const reviewColumns = raw.pragma('table_info(reviews)') as Array<{ name: string }>;
+  const repoColumns = raw.pragma('table_info(repos)') as Array<{ name: string }>;
+  if (!repoColumns.some((c) => c.name === 'review_context_generation')) raw.exec(`alter table repos add column review_context_generation integer not null default 0`);
   if (!reviewColumns.some((c) => c.name === 'cost_usd')) raw.exec(`alter table reviews add column cost_usd real`);
-  for (const column of ['provider', 'model']) {
+  for (const column of ['provider', 'model', 'compatibility_key', 'base_sha'] as const) {
     if (!reviewColumns.some((c) => c.name === column)) raw.exec(`alter table reviews add column ${column} text`);
   }
+  if (!reviewColumns.some((c) => c.name === 'completion_json')) raw.exec(`alter table reviews add column completion_json text`);
+  if (reviewColumns.some((c) => c.name === 'envelope_json')) raw.exec(`update reviews set completion_json=envelope_json where completion_json is null`);
   const columns = raw.pragma('table_info(jobs)') as Array<{ name: string }>;
   if (!columns.some((c) => c.name === 'pr_number')) raw.exec(`alter table jobs add column pr_number integer`);
+  const usageColumns = raw.pragma('table_info(llm_usage)') as Array<{ name: string }>;
+  if (!usageColumns.some((c) => c.name === 'review_attempt_id')) raw.exec(`alter table llm_usage add column review_attempt_id text`);
+  if (!usageColumns.some((c) => c.name === 'review_usage_seq')) raw.exec(`alter table llm_usage add column review_usage_seq integer`);
+  raw.exec(`create unique index if not exists review_usage_unique on llm_usage(review_attempt_id, review_usage_seq) where review_attempt_id is not null and review_usage_seq is not null`);
+  raw.exec(`create table if not exists review_checkpoints (id text primary key, repo_id text not null references repos(id) on delete cascade, pr_number integer not null, head_sha text not null, base_sha text not null, compatibility_key text not null, payload_version integer not null, state text not null check(state in ('active','ready','finalized','invalidated','blocked')), owner_token text, owner_job_id integer references jobs(id) on delete set null, generation integer not null default 0, inputs_json text, progress_json text, payload_hash text, review_id integer references reviews(id) on delete set null, last_error_code text, created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`);
+  raw.exec(`create unique index if not exists review_checkpoints_open on review_checkpoints(repo_id,pr_number) where state in ('active','ready','blocked')`);
+  raw.exec(`create index if not exists review_checkpoints_identity on review_checkpoints(repo_id,pr_number,head_sha,compatibility_key)`);
+  raw.exec(`create index if not exists review_checkpoints_state on review_checkpoints(state,updated_at)`);
+
+  raw.exec(`create table if not exists review_call_attempts (id text primary key, checkpoint_id text not null references review_checkpoints(id) on delete cascade, job_id integer references jobs(id) on delete set null, unit_key text not null, attempt_ordinal integer not null, provider text not null, model text not null, stage text not null, pass text not null, request_hash text not null, estimated_usd real not null, budgeted integer not null, state text not null check(state in ('started','settled','interrupted')), outcome text, error_class text, validation_error text, error_status integer, usage_reported integer not null default 0, usage_complete integer not null default 0, cost_usd real, reservation_usd real not null, elapsed_ms integer, started_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')), settled_at text, unique(checkpoint_id,unit_key,attempt_ordinal))`);
+  raw.exec(`create index if not exists review_call_attempts_checkpoint on review_call_attempts(checkpoint_id)`);
 }
 
 export function openDb(path: string): Db {

@@ -75,19 +75,30 @@ export class UsageTracker {
         cost.costUsd = next !== null && Number.isFinite(next) ? next : null;
       }
       recordUsageTelemetry(role, record);
+      const row = {
+        role,
+        provider: record.provider,
+        model: record.model,
+        input_tokens: record.inputTokens,
+        cached_input_tokens: record.cachedInputTokens,
+        cache_write_tokens: record.cacheWriteTokens,
+        output_tokens: record.outputTokens,
+        cost_usd: record.costUsd,
+      };
       try {
-        this.db.insertUsage({
-          role,
-          provider: record.provider,
-          model: record.model,
-          input_tokens: record.inputTokens,
-          cached_input_tokens: record.cachedInputTokens,
-          cache_write_tokens: record.cacheWriteTokens,
-          output_tokens: record.outputTokens,
-          cost_usd: record.costUsd,
-        });
+        if (cost?.attemptId) {
+          // Durable per-attempt journal: the sequence is consumed exactly once
+          // per event (a failed write leaves a gap) so replay after a crash
+          // cannot double-count a usage row.
+          const seq = cost.usageSeq ?? 0;
+          cost.usageSeq = seq + 1;
+          this.db.recordReviewCallUsage(cost.attemptId, seq, row);
+        } else {
+          this.db.insertUsage(row);
+        }
       } catch (err) {
         this.log(`usage: failed to record ${role} call: ${err instanceof Error ? err.message : String(err)}`);
+        if (cost?.attemptId) cost.durableWriteFailed = err instanceof Error ? err : new Error(String(err));
       }
     };
   }

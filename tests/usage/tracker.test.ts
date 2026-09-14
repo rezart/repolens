@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { openDb } from '../../src/db.js';
+import { openDb, type Db, type UsageInsert } from '../../src/db.js';
 import { OpenRouterPricing } from '../../src/usage/pricing.js';
 import { UsageTracker } from '../../src/usage/tracker.js';
+import { reviewCallCost } from '../../src/usage/review-cost.js';
 
 const DAY = 86_400_000;
 
@@ -73,6 +74,80 @@ describe('UsageTracker.sinkFor', () => {
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain('embed');
     expect(logs[0]).toContain('disk full');
+    db.close();
+  });
+});
+
+describe('UsageTracker.sinkFor durable review usage', () => {
+  const record = { provider: 'openrouter', model: 'qwen/qwen3-coder', inputTokens: 10, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 2, costUsd: 0.01 };
+  const attempt = (attemptId?: string, usageSeq?: number) => ({ reported: false, costUsd: 0 as number | null, stage: 'initial', pass: 'normal', ...(attemptId ? { attemptId } : {}), ...(usageSeq !== undefined ? { usageSeq } : {}) });
+
+  /** Minimal test double over the real Db: swap in a durable sink and observe it. */
+  function dbWithDurable(handle: (attemptId: string, seq: number, row: UsageInsert) => void): Db {
+    const db = openDb(':memory:');
+    db.recordReviewCallUsage = handle;
+    return db;
+  }
+
+  it('persists each event durably with its own sequence when an attempt is active', () => {
+    const durable: Array<{ attemptId: string; seq: number; row: UsageInsert }> = [];
+    const db = dbWithDurable((attemptId, seq, row) => { durable.push({ attemptId, seq, row }); });
+    const tracker = new UsageTracker({ db, pricing: null });
+
+    reviewCallCost.run(attempt('attempt-1'), () => {
+      const sink = tracker.sinkFor('review');
+      sink({ ...record });
+      sink({ ...record, costUsd: 0.02 });
+    });
+
+    expect(durable.map((row) => row.seq)).toEqual([0, 1]);
+    expect(new Set(durable.map((row) => row.attemptId))).toEqual(new Set(['attempt-1']));
+    expect(durable[0]!.row).toMatchObject({ role: 'review', provider: record.provider, model: record.model, cost_usd: 0.01 });
+    // Ordinary rows must not be written alongside the durable ones.
+    expect(db.usageByDay('1970-01-01')).toHaveLength(0);
+    db.close();
+  });
+
+  it('consumes the sequence of a failed write and keeps billing, so resume cannot double-count', () => {
+    const durable: Array<{ seq: number }> = [];
+    let writes = 0;
+    const db = dbWithDurable((_attemptId, seq) => {
+      writes++;
+      if (writes === 2) throw new Error('disk full');
+      durable.push({ seq });
+    });
+    const logs: string[] = [];
+    const tracker = new UsageTracker({ db, pricing: null, log: (m) => logs.push(m) });
+
+    const failure = reviewCallCost.run(attempt('attempt-2'), () => {
+      const sink = tracker.sinkFor('review');
+      sink({ ...record });
+      sink({ ...record });
+      sink({ ...record });
+    });
+    expect(failure).toBeUndefined(); // billing never breaks the call itself
+    expect(logs.some((m) => m.includes('disk full'))).toBe(true);
+    // seq 1 was consumed by the failed write; the third event took seq 2.
+    expect(durable.map((row) => row.seq)).toEqual([0, 2]);
+    db.close();
+  });
+
+  it('keeps the ordinary path when no attempt is active, even inside a stale attempt context', () => {
+    let durable = 0;
+    const db = dbWithDurable(() => { durable++; });
+    const tracker = new UsageTracker({ db, pricing: null });
+
+    // No attemptId in the store: durable path must not trigger.
+    reviewCallCost.run({ reported: false, costUsd: 0, stage: 'initial', pass: 'normal' }, () => {
+      tracker.sinkFor('review')({ ...record });
+    });
+    // Chat never uses the durable path even with an attempt present.
+    reviewCallCost.run(attempt('attempt-3'), () => {
+      tracker.sinkFor('chat')({ ...record });
+    });
+
+    expect(durable).toBe(0);
+    expect(db.usageByDay('1970-01-01').map((row) => row.role).sort()).toEqual(['chat', 'review']);
     db.close();
   });
 });
