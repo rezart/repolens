@@ -554,7 +554,7 @@ describe('API', () => {
     it('waits for a flurry of pushes to settle before queuing one review', async () => {
       vi.useFakeTimers();
       try {
-        const d = makeDeps({}, { REVIEW_SETTLE_SECONDS: '300' });
+        const d = makeDeps({}, { REVIEW_SETTLE_SECONDS: '60' });
         const a = createApp(d);
         d.db.upsertRepo({ id: 'github:o/n', remote: 'u', owner: 'o', name: 'n', branch: 'main' });
         const push = async () => {
@@ -567,11 +567,11 @@ describe('API', () => {
           return res.json();
         };
         expect((await push()).action).toBe('review');
-        vi.advanceTimersByTime(200_000);
+        vi.advanceTimersByTime(40_000);
         await push();
-        vi.advanceTimersByTime(200_000);
+        vi.advanceTimersByTime(59_999);
         expect(d.db.listJobs()).toEqual([]);
-        vi.advanceTimersByTime(101_000);
+        vi.advanceTimersByTime(1);
         expect(d.db.listJobs().map((j) => [j.kind, j.pr_number])).toEqual([['review', 3]]);
       } finally {
         vi.useRealTimers();
