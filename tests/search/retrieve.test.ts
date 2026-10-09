@@ -134,6 +134,25 @@ describe('createRetriever', () => {
     expect(calls).toBe(0);
   });
 
+  it('reuses query vectors while reading updated index content and exclusions', async () => {
+    const { auth, database } = seed(db);
+    db.ensureVecTable(3);
+    db.insertVectors([{ chunkId: auth, repoId: REPO, embedding: [1, 0, 0] }, { chunkId: database, repoId: REPO, embedding: [0, 1, 0] }]);
+    let calls = 0;
+    const embeddings = fakeEmbeddings([1, 0, 0]);
+    embeddings.embed = async (texts) => { calls++; return texts.map(() => [1, 0, 0]); };
+    const retrieve = createRetriever({ db, embeddings });
+    const query = 'token verification';
+    const original = await retrieve({ repoIds: [REPO], query });
+    expect(original.find((hit) => hit.chunkId === auth)?.content).toBe(AUTH_CODE);
+    db.raw.prepare('update chunks set content=? where id=?').run('token verification updated implementation', auth);
+    const updated = await retrieve({ repoIds: [REPO], query });
+    expect(updated.find((hit) => hit.chunkId === auth)?.content).toBe('token verification updated implementation');
+    const excluded = await retrieve({ repoIds: [REPO], query, excludePaths: ['src/auth.ts'] });
+    expect(excluded.map((hit) => hit.chunkId)).not.toContain(auth);
+    expect(calls).toBe(1);
+  });
+
   it('honours excludePaths, on top of excludePath', async () => {
     seed(db);
     const retrieve = createRetriever({ db });

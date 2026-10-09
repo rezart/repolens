@@ -150,7 +150,7 @@ npm run cli -- review github:owner/name --all --post  # every unreviewed open PR
 
 ### GitHub setup
 
-RepoLens can learn about new changes two ways. **Polling** (default, every 5 minutes) needs no inbound network access: it reindexes when the tracked branch moves and reviews any open, non-draft PR whose head commit hasn't been reviewed. **Webhooks** react instantly but need the server reachable from the internet (a reverse proxy or a Cloudflare Tunnel). Both can be on at once; reviews are deduped by head commit. Automatic reviews wait 60 seconds after the last push (`REVIEW_SETTLE_SECONDS`) so a flurry of commits produces one review. Manual reviews start immediately.
+RepoLens can learn about new changes two ways. **Polling** (default, every 5 minutes) needs no inbound network access: it reindexes when the tracked branch moves and reviews any open, non-draft PR whose head commit hasn't been reviewed. **Webhooks** react instantly but need the server reachable from the internet (a reverse proxy or a Cloudflare Tunnel). Both can be on at once; reviews are deduped by head commit. Automatic reviews wait 30 seconds after the last push (`REVIEW_SETTLE_SECONDS`) so a flurry of commits produces one review. Manual reviews start immediately.
 
 1. For a dedicated bot identity, [configure a GitHub App](docs/INTEGRATION.md#github-app-authentication). Alternatively, create a token with `repo` scope (classic PAT) or a fine-grained token with *Contents: read*, *Pull requests: read & write* and *Commit statuses: read & write* (the last one for the [blocking check](#blocking-merges-on-the-review)). Put it in `GITHUB_TOKEN`. Private repos are cloned with this token.
 2. (Webhooks only) In the repository (or org) settings add a webhook:

@@ -65,7 +65,7 @@ const envSchema = z.object({
   REVIEW_IGNORE_PATTERNS: z.string().default('').transform((s) => s.trim() ? s.split(',').map((p) => p.trim()) : [])
     .pipe(z.array(z.string().min(1).max(200).regex(/^[^,[\]]+$/))),
   /** Seconds a PR must go without a new push before an automatic review starts. 0 reviews immediately. */
-  REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(60),
+  REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(30),
 });
 
 export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli';

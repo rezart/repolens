@@ -17,6 +17,7 @@ import { reviewCostUpperBound, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_MAX_OUTPUT, 
 import { UsageTracker } from '../../src/usage/tracker.js';
 import { reviewCallCost } from '../../src/usage/review-cost.js';
 import { OpenRouterProvider } from '../../src/llm/openrouter.js';
+import { createRetriever } from '../../src/search/retrieve.js';
 import { JobQueue } from '../../src/jobs.js';
 import { FOLLOWUP_RECONCILIATION_PROMPT } from '../../src/review/followup.js';
 import { hunkText, parseUnifiedDiff } from '../../src/review/diff.js';
@@ -855,6 +856,62 @@ describe('reviewPullRequest', () => {
     expect(result.findings[0]!.path).toBe(paths[39]);
     expect(result.verdict).toBe('request_changes');
     expect(lexicalOnlyRequests.every((value) => value === undefined)).toBe(true);
+  });
+
+  it('batches shared query embeddings across files without dropping changed-file coverage', async () => {
+    const paths = Array.from({ length: 20 }, (_, i) => `src/file${i}.ts`);
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+sharedToken();\n`).join('');
+    const helper = db.upsertFile({ repo_id: REPO_ID, path: 'src/helper.ts', blob_hash: 'h', language: 'typescript', size: 100 });
+    const [chunkId] = db.insertChunks([{ fileId: helper.id, repoId: REPO_ID, path: helper.path, startLine: 1, endLine: 1, content: 'export function sharedToken() { return true; }' }]);
+    db.ensureVecTable(3);
+    db.insertVectors([{ chunkId, repoId: REPO_ID, embedding: [1, 0, 0] }]);
+    const batches: string[][] = [];
+    const retrieve = createRetriever({ db, embeddings: { model: 'fake', dimension: 3, async embed(texts) {
+      batches.push(texts);
+      return texts.map(() => [1, 0, 0]);
+    } } });
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Reviewed.', verdict: 'approve', findings: [] });
+    } };
+    const result = await reviewPullRequest({ db, llm, retrieve, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(result.skippedFiles).toEqual([]);
+    expect(calls).toHaveLength(1);
+    for (const path of paths) expect(calls[0]!.messages[0]!.content).toContain(path);
+    expect(calls[0]!.messages[0]!.content).toContain('export function sharedToken()');
+    expect(batches.flat().filter((query) => query === 'sharedToken')).toHaveLength(1);
+    expect(batches.every((batch) => batch.length <= 16)).toBe(true);
+    // Twenty files previously made around eighty serial embedding requests.
+    expect(batches.length).toBeLessThan(15);
+    expect(new Set(batches.flat()).size).toBe(batches.flat().length);
+  });
+
+  it('bounds concurrent file retrieval and packs context in file order despite completion order', async () => {
+    const paths = Array.from({ length: 8 }, (_, i) => `src/file${i}.ts`);
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+sharedToken();\n`).join('');
+    const calls: CompleteRequest[] = [];
+    let active = 0;
+    let peak = 0;
+    const retrieve: RetrieveFn = async (req) => {
+      const i = paths.indexOf(req.query);
+      if (i < 0) return [];
+      peak = Math.max(peak, ++active);
+      // Reverse the completion order within each group of four files.
+      for (let tick = 0; tick < 4 - i % 4; tick++) await new Promise<void>((resolve) => setImmediate(resolve));
+      active--;
+      return [{ ...CHUNK, chunkId: i + 100, path: `src/helper${i}.ts`, content: `export function sharedToken() { return 'CONTEXT_${i}'; }` }];
+    };
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, async complete(req) {
+      calls.push(req);
+      return JSON.stringify({ reviewedPaths: paths, summary: 'Reviewed.', verdict: 'approve', findings: [] });
+    } };
+    await reviewPullRequest({ db, llm, retrieve, github: fakeGithub(diff).github }, { repoId: REPO_ID, prNumber: 42, post: false });
+    expect(peak).toBe(4);
+    const prompt = calls[0]!.messages[0]!.content;
+    const positions = paths.map((_, i) => prompt.indexOf(`CONTEXT_${i}`));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
   });
 
   it('deduplicates equivalent evidence before packing and leaves room for a retry', async () => {
