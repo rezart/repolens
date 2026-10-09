@@ -2310,6 +2310,30 @@ describe('reviewPullRequest lineage', () => {
     expect(result.findings).toEqual([]);
   });
 
+  it('recovers from an invented previous finding after a clean earlier review', async () => {
+    db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done',
+      summary: 'Clean.', verdict: 'approve', comments_json: '[]', posted: 1, error: null });
+    const llm: LLMProvider = { ...fakeLlm().provider, supportsBatchReview: true, complete: async (req) => {
+      if (req.system === FOLLOWUP_RECONCILIATION_PROMPT) {
+        const correction = req.messages.length > 1 ? JSON.parse(req.messages.at(-1)!.content) : null;
+        return JSON.stringify({
+          previous: correction?.validationError === 'previous must be an empty array because no previous findings were supplied' ? [] : [
+            { id: 0, status: 'resolved', findingIndex: null, reason: 'Invented from the response example.', evidence: { path: 'src/app.ts', line: 4, side: 'new' } },
+          ],
+          candidates: [{ id: 0, introduced: false, reason: 'The issue predates this delta.', evidence: null }],
+        });
+      }
+      return JSON.stringify({ reviewedPaths: ['src/app.ts', 'src/gone.ts'], summary: 'Reviewed.', verdict: 'comment', findings: [
+        { path: 'src/app.ts', line: 4, severity: 'warning', title: 'Older issue', body: 'Unchanged since the previous review.' },
+      ] });
+    } };
+    const gh = fakeGithub(DIFF, PR, { compare: DELTA, headFiles: { 'src/app.ts': 'a\nb\nc\nif (n === 0) return;' } });
+    const result = await reviewPullRequest(makeDeps(db, { llm, github: gh.github, maxRetries: 1 }), { repoId: REPO_ID, prNumber: 42 });
+    expect(result.findings).toEqual([]);
+    expect(result.verdict).toBe('approve');
+    expect(gh.reviews[0]!.input.body).toContain('No actionable issues remain.');
+  });
+
   it('fails closed after exhausting the dedicated reconciliation allowance', async () => {
     db.insertReview({ repo_id: REPO_ID, pr_number: 42, head_sha: 'head-sha-0', status: 'done',
       summary: 'First pass.', verdict: 'request_changes', comments_json: JSON.stringify([
