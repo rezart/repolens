@@ -1,4 +1,4 @@
-import { metrics, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
+import { metrics, SpanKind, SpanStatusCode, trace, type Attributes } from '@opentelemetry/api';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
@@ -44,7 +44,15 @@ export function withTelemetryLogging(output: (message: string) => void): (messag
 }
 
 export async function traceTask<T>(name: string, run: () => Promise<T>): Promise<T> {
-  return trace.getTracer('repolens').startActiveSpan(name, { kind: SpanKind.CONSUMER }, async (span) => {
+  return traceWork(name, run, SpanKind.CONSUMER);
+}
+
+export async function traceOperation<T>(name: string, run: () => Promise<T>, attributes: Attributes = {}): Promise<T> {
+  return traceWork(name, run, SpanKind.INTERNAL, attributes);
+}
+
+async function traceWork<T>(name: string, run: () => Promise<T>, kind: SpanKind, attributes: Attributes = {}): Promise<T> {
+  return trace.getTracer('repolens').startActiveSpan(name, { kind, attributes }, async (span) => {
     try {
       const result = await run();
       span.setStatus({ code: SpanStatusCode.OK });

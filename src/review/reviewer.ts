@@ -17,6 +17,7 @@ import {
   type CompletedReview,
 } from './checkpoint.js';
 import { reviewCallCost } from '../usage/review-cost.js';
+import { traceOperation } from '../telemetry.js';
 import { countReview, recordReviewCall, recordReviewScope } from './metrics.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT } from './budget.js';
@@ -501,9 +502,9 @@ async function retrieveTargetedChunks(
   const testQuery = [...changedSymbols, targeted.stem, 'test'].filter(Boolean).join(' ');
   if (testQuery && !queries.includes(testQuery)) queries.push(testQuery);
   const chunksById = new Map<number, RetrievedChunk>();
-  for (const query of queries) {
-    for (const chunk of await retrieve({ repoIds: [repoId], query, limit: 8, excludePaths })) chunksById.set(chunk.chunkId, chunk);
-  }
+  const results = await Promise.all(queries.map((query) => retrieve({ repoIds: [repoId], query, limit: 8, excludePaths })));
+  // Merge in query order so network completion order cannot change prompt context.
+  for (const chunks of results) for (const chunk of chunks) chunksById.set(chunk.chunkId, chunk);
   const excluded = new Set(excludePaths);
   const relevant = selectRelevantChunks([...chunksById.values()].filter((chunk) => !excluded.has(chunk.path)), [...changedSymbols, targeted.stem], path, Number.MAX_SAFE_INTEGER);
   const selected = relevant.slice(0, 8);
@@ -2054,21 +2055,25 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       if (rules) addContext(rules);
       const batchHistory = historyFor(...historyPaths);
       if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
-      const seen = new Set<number>();
-      for (const file of files) {
+      log(`review: gathering context for ${files.length} files`);
+      const contexts = await traceOperation('review.context.discovery', () => mapPool(files, 4, async (file) => {
         const path = file.newPath ?? file.oldPath!;
         const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
         try {
-          const selected = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths);
-          relevantChunksByPath.set(path, selected);
-          relevantContextByPath.set(path, formatContext(selected));
-          for (const chunk of selected) {
-            if (seen.has(chunk.chunkId)) continue;
-            seen.add(chunk.chunkId);
-            addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
-          }
+          return { path, selected: await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths) };
         } catch (err) {
-          warnings.push(`${path}: retrieval failed: ${errMessage(err)}`);
+          return { path, selected: [], warning: `${path}: retrieval failed: ${errMessage(err)}` };
+        }
+      }));
+      const seen = new Set<number>();
+      for (const { path, selected, warning } of contexts) {
+        if (warning) warnings.push(warning);
+        relevantChunksByPath.set(path, selected);
+        relevantContextByPath.set(path, formatContext(selected));
+        for (const chunk of selected) {
+          if (seen.has(chunk.chunkId)) continue;
+          seen.add(chunk.chunkId);
+          addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
         }
       }
       if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.50; all file diffs included.`);
@@ -2469,9 +2474,10 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       await assertHeadUnchanged();
       // The initial retrieval only knows the diff. Refresh each finding's
       // context with its implicated identifiers/callees before verification.
-      for (const path of new Set(findings.map((finding) => finding.path))) {
+      log('review: gathering evidence for verification');
+      const focusedContexts = await traceOperation('review.context.verification', () => mapPool([...new Set(findings.map((finding) => finding.path))], 4, async (path) => {
         const file = files.find((candidate) => (candidate.newPath ?? candidate.oldPath) === path);
-        if (!file) continue;
+        if (!file) return { path, focused: [] as RetrievedChunk[] };
         const changedText = file.hunks.flatMap((hunk) => hunk.lines
           .filter((line) => line.type === 'add' || line.type === 'del')
           .map((line) => line.content)).join('\n');
@@ -2479,38 +2485,41 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
           finding.title, finding.body, finding.rootCause, finding.evidence?.trigger, finding.evidence?.consequence,
         ].filter(Boolean).join(' ')).join('\n');
         try {
-          const focused = await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths, focusText);
-          if (focused.length) {
-            const merged = mergeRelevantChunks(relevantChunksByPath.get(path) ?? [], focused);
-            relevantChunksByPath.set(path, merged);
-            relevantContextByPath.set(path, formatContext(merged));
-            const scopedContents = referencedHeadContentsByVerifierPath.get(path) ?? new Map<string, string>();
-            const scopedLines = referencedHeadLinesByVerifierPath.get(path) ?? new Map<string, number[]>();
-            for (const chunk of focused) {
-              if (changedPaths.includes(chunk.path)) continue;
-              if (!referencedHeadFetched.has(chunk.path)) {
-                if (referencedHeadFetched.size >= REFERENCED_HEAD_FILES_MAX) break;
-                referencedHeadFetched.add(chunk.path);
-                try {
-                  const content = await github.getFileContent(repo.owner, repo.name, chunk.path, pr.headSha);
-                  if (content !== null) {
-                    referencedHeadContents.set(chunk.path, content);
-                  }
-                } catch (err) {
-                  warnings.push(`${chunk.path}: fetching referenced head content failed: ${errMessage(err)}`);
+          return { path, focused: await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths, focusText) };
+        } catch (err) {
+          return { path, focused: [], warning: `${path}: finding retrieval failed: ${errMessage(err)}` };
+        }
+      }));
+      for (const { path, focused, warning } of focusedContexts) {
+        if (warning) warnings.push(warning);
+        if (focused.length) {
+          const merged = mergeRelevantChunks(relevantChunksByPath.get(path) ?? [], focused);
+          relevantChunksByPath.set(path, merged);
+          relevantContextByPath.set(path, formatContext(merged));
+          const scopedContents = referencedHeadContentsByVerifierPath.get(path) ?? new Map<string, string>();
+          const scopedLines = referencedHeadLinesByVerifierPath.get(path) ?? new Map<string, number[]>();
+          for (const chunk of focused) {
+            if (changedPaths.includes(chunk.path)) continue;
+            if (!referencedHeadFetched.has(chunk.path)) {
+              if (referencedHeadFetched.size >= REFERENCED_HEAD_FILES_MAX) break;
+              referencedHeadFetched.add(chunk.path);
+              try {
+                const content = await github.getFileContent(repo.owner, repo.name, chunk.path, pr.headSha);
+                if (content !== null) {
+                  referencedHeadContents.set(chunk.path, content);
                 }
-              }
-              const content = referencedHeadContents.get(chunk.path);
-              if (content !== undefined) {
-                scopedContents.set(chunk.path, content);
-                scopedLines.set(chunk.path, [...new Set([...(scopedLines.get(chunk.path) ?? []), chunk.startLine, chunk.endLine])]);
+              } catch (err) {
+                warnings.push(`${chunk.path}: fetching referenced head content failed: ${errMessage(err)}`);
               }
             }
-            referencedHeadContentsByVerifierPath.set(path, scopedContents);
-            referencedHeadLinesByVerifierPath.set(path, scopedLines);
+            const content = referencedHeadContents.get(chunk.path);
+            if (content !== undefined) {
+              scopedContents.set(chunk.path, content);
+              scopedLines.set(chunk.path, [...new Set([...(scopedLines.get(chunk.path) ?? []), chunk.startLine, chunk.endLine])]);
+            }
           }
-        } catch (err) {
-          warnings.push(`${path}: finding retrieval failed: ${errMessage(err)}`);
+          referencedHeadContentsByVerifierPath.set(path, scopedContents);
+          referencedHeadLinesByVerifierPath.set(path, scopedLines);
         }
       }
       await assertHeadUnchanged();

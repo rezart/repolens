@@ -183,7 +183,7 @@ Add `"force":true` to re-review a head that was already reviewed.
 
 ## Optional: webhook for instant triggering
 
-If RepoLens is reachable from GitHub (reverse proxy or tunnel), add a webhook so reviews start within seconds of a push instead of on the next poll. Set `GITHUB_WEBHOOK_SECRET` in RepoLens first; the endpoint refuses deliveries without it.
+If RepoLens is reachable from GitHub (reverse proxy or tunnel), add a webhook so RepoLens receives PR updates immediately instead of on the next poll. Automatic reviews wait for a short settling window (`REVIEW_SETTLE_SECONDS`, default 30 seconds) after the last delivery to collapse rapid pushes into one review. Existing deployments must update their explicit setting; changing the default does not override `.env`. Set `GITHUB_WEBHOOK_SECRET` in RepoLens first; the endpoint refuses deliveries without it.
 
 ```bash
 gh api -X POST "repos/$REPO/hooks" --input - <<EOF

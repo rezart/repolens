@@ -10,7 +10,7 @@ describe('loadConfig', () => {
     expect(c.hostname).toBe('127.0.0.1');
     expect(c.revision).toBeNull();
     expect(c.review.maxRetries).toBe(1);
-    expect(c.review.settleSeconds).toBe(60);
+    expect(c.review.settleSeconds).toBe(30);
     expect(c.review.escalationModel).toBe('');
     expect(c.review.escalationReasoningEffort).toBeUndefined();
     expect(c.review.verifierModel).toBe('google/gemini-3.1-flash-lite');

@@ -1,6 +1,7 @@
 import type { Db, ChunkRow, SearchHit } from '../db.js';
 import type { EmbeddingProvider } from '../embeddings/types.js';
 import type { RetrieveFn, RetrieveRequest, RetrievedChunk } from './types.js';
+import { QueryEmbeddings } from './query-embeddings.js';
 import { buildFtsQuery, tokenizeQuery } from './tokenize.js';
 
 /** A citation returned alongside an answer or review. */
@@ -74,6 +75,7 @@ function toRetrieved(chunk: ChunkRow, score: number): RetrievedChunk {
  * (when an embedding provider and a vector table are both available).
  */
 export function createRetriever({ db, embeddings }: { db: Db; embeddings?: EmbeddingProvider | null }): RetrieveFn {
+  const queries = embeddings ? new QueryEmbeddings(embeddings, () => db.vectorDimension) : null;
   return async (req: RetrieveRequest): Promise<RetrievedChunk[]> => {
     const limit = req.limit ?? DEFAULT_LIMIT;
     if (limit <= 0 || req.repoIds.length === 0) return [];
@@ -86,7 +88,7 @@ export function createRetriever({ db, embeddings }: { db: Db; embeddings?: Embed
     let semantic: SearchHit[] = [];
     if (!req.lexicalOnly && embeddings && db.vectorDimension !== null) {
       try {
-        const [vector] = await embeddings.embed([req.query]);
+        const vector = await queries!.get(req.query);
         if (vector && vector.length === db.vectorDimension) {
           semantic = db.vecSearch(req.repoIds, vector, pool);
         }
