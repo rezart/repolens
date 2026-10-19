@@ -7,6 +7,7 @@ import { recordUsageTelemetry } from '../telemetry.js';
 
 /** One UTC day of calls for a role/provider/model, with costs resolved. */
 export interface UsageReportRow {
+  billingSource?: 'ChatGPT subscription';
   day: string;
   role: string;
   provider: string;
@@ -121,11 +122,13 @@ export class UsageTracker {
 }
 
 function priceRow(row: UsageDayRow, list: PriceList | null): UsageReportRow {
+  const subscription = row.provider === 'subscription';
   const estimatedCostUsd = estimateUnpriced(row, list);
   return {
     day: row.day,
     role: row.role,
     provider: row.provider,
+    ...(subscription ? { billingSource: 'ChatGPT subscription' as const } : {}),
     model: row.model,
     calls: row.calls,
     inputTokens: row.input_tokens,
@@ -134,7 +137,7 @@ function priceRow(row: UsageDayRow, list: PriceList | null): UsageReportRow {
     outputTokens: row.output_tokens,
     reportedCostUsd: row.reported_cost_usd,
     estimatedCostUsd,
-    costUsd:
+    costUsd: subscription ? null :
       estimatedCostUsd === null
         ? // Nothing to add: show the reported total (even a free model's 0) as long as
           // at least one call in the row was priced by its backend.
@@ -142,7 +145,7 @@ function priceRow(row: UsageDayRow, list: PriceList | null): UsageReportRow {
           ? row.reported_cost_usd
           : null
         : row.reported_cost_usd + estimatedCostUsd,
-    priced: row.unpriced_calls === 0 || estimatedCostUsd !== null,
+    priced: !subscription && (row.unpriced_calls === 0 || estimatedCostUsd !== null),
   };
 }
 
@@ -152,6 +155,7 @@ function startOfUtcDay(ms: number): number {
 
 /** Zero when every call reported its own cost, null when no list price resolves. */
 function estimateUnpriced(row: UsageDayRow, list: PriceList | null): number | null {
+  if (row.provider === 'subscription') return null;
   if (row.unpriced_calls === 0) return 0;
   const price = list ? OpenRouterPricing.resolve(list, row.provider, row.model) : null;
   if (!price) return null;

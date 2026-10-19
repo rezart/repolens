@@ -34,6 +34,20 @@ export interface SubscriptionOptions {
   onUsage?: UsageSink;
 }
 
+function encodeRequest(req: CompleteRequest, model: string, effort: string): string {
+  const input = JSON.stringify({ system: req.system ?? '', messages: req.messages,
+    ...(req.json || req.jsonSchema ? { outputInstruction: req.jsonSchema
+      ? 'Return one JSON value matching the supplied output schema.'
+      : 'Return a single JSON object and nothing else.' } : {}),
+  });
+  return JSON.stringify({ model, effort, input, ...(req.jsonSchema ? { output_schema: req.jsonSchema } : {}) });
+}
+
+/** Byte planning only; subscription turns have no enforceable dollar/token route cap. */
+export function subscriptionRequestSize(req: CompleteRequest, model: string): number {
+  return Buffer.byteLength(encodeRequest(req, model, 'medium'));
+}
+
 /** Text-only private IPC. This provider has no subprocess or TCP fallback. */
 export class SubscriptionProvider implements LLMProvider {
   readonly name = 'subscription';
@@ -74,12 +88,7 @@ export class SubscriptionProvider implements LLMProvider {
     }
     // JSON framing preserves each role and prevents content from replacing the
     // envelope's system instructions. The broker receives no execution controls.
-    const input = JSON.stringify({ system: req.system ?? '', messages: req.messages,
-      ...(req.json || req.jsonSchema ? { outputInstruction: 'Return one JSON value matching the supplied output schema.' } : {}),
-    });
-    const body = JSON.stringify({ model: this.model, effort: this.effort, input,
-      ...(req.jsonSchema ? { output_schema: req.jsonSchema } : {}),
-    });
+    const body = encodeRequest(req, this.model, this.effort);
     if (Buffer.byteLength(body) > MAX_INPUT) throw new ProviderError(this.name, 'request too large');
     try {
       const [socket, directory] = await Promise.all([fs.lstat(this.socketPath), fs.lstat(path.dirname(this.socketPath))]);

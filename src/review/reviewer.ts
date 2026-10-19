@@ -20,6 +20,7 @@ import { reviewCallCost } from '../usage/review-cost.js';
 import { traceOperation } from '../telemetry.js';
 import { countReview, recordReviewCall, recordReviewScope } from './metrics.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
+import { subscriptionRequestSize } from '../llm/subscription.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT } from './budget.js';
 import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
@@ -241,7 +242,7 @@ export interface ReviewTrace {
     selectedPaths: string[];
     hunks: Array<{ path: string; lines: number[] }>;
     omittedContext: number;
-    calls: Array<{ provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass?: 'normal' | 'focused' | 'evidence'; elapsedMs?: number }>;
+    calls: Array<{ provider: string; model: string; estimatedCostUsd: number | null; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass?: 'normal' | 'focused' | 'evidence'; elapsedMs?: number }>;
     findingCount: number;
     primaryFindings?: ReviewTraceFinding[];
     decisions?: Array<{ id: string | number; decision: string }>;
@@ -1435,12 +1436,12 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
   let activeLlm = llm;
   let costUsd: number | null = 0;
   let reservedUsd = 0;
-  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification' | 'arbitration'; provider: string; model: string; estimatedCostUsd: number; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' | 'evidence'; elapsedMs: number }> = [];
+  const traceCalls: Array<{ stage: 'initial' | 'escalation' | 'verification' | 'arbitration'; provider: string; model: string; estimatedCostUsd: number | null; costUsd: number | null; outcome: 'success' | 'error' | 'validation_error'; failure?: string; pass: 'normal' | 'focused' | 'evidence'; elapsedMs: number }> = [];
   let usedUsd = 0;
   const activeAttemptIds = new Set<string>();
   const completeCall = async (req: CompleteRequest, provider: LLMProvider = activeLlm, alreadyReserved = false, pass: 'normal' | 'focused' | 'evidence' = 'normal', ceiling = REVIEW_MAX_USD): Promise<{ raw?: string; error?: unknown; failed: boolean; costUsd: number | null; traceIndex?: number }> => {
     const estimate = req.reviewBudget ? reviewCostUpperBound(req) : 0;
-    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: estimate, costUsd: null, outcome: 'error', pass, elapsedMs: 0 } : undefined;
+    const traceCall: (typeof traceCalls)[number] | undefined = req.reviewStage ? { stage: req.reviewStage, provider: provider.name, model: provider.model, estimatedCostUsd: provider.name === 'subscription' ? null : estimate, costUsd: null, outcome: 'error', pass, elapsedMs: 0 } : undefined;
     if (traceCall) traceCalls.push(traceCall);
     const traceIndex = traceCall ? traceCalls.length - 1 : undefined;
     const started = Date.now();
@@ -1462,7 +1463,10 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     let error: unknown;
     let threw = false;
     try {
-      raw = await reviewCallCost.run(call, () => provider.complete(req));
+      // Subscription IPC has byte/time bounds. Omit unsupported sampling and
+      // dollar/token route controls explicitly at the call site.
+      const { maxTokens: _maxTokens, temperature: _temperature, reviewBudget: _reviewBudget, ...subscriptionReq } = req;
+      raw = await reviewCallCost.run(call, () => provider.complete(provider.name === 'subscription' ? subscriptionReq : req));
     } catch (err) {
       threw = true;
       error = err;
@@ -1553,7 +1557,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       dualDiscovery: Boolean(deps.dualDiscovery), focusedVerification: Boolean(deps.focusedVerification),
       arbiter: Boolean(deps.arbiterLlm), arbiterAllFindings: Boolean(deps.arbiterAllFindings),
       escalationModel: deps.escalationLlm?.model ?? '', verifierModel: deps.verifierLlm?.model ?? '',
-      ignorePatterns: deps.ignorePatterns ?? [], budgetUsd: REVIEW_MAX_USD,
+      ignorePatterns: deps.ignorePatterns ?? [], budgetUsd: llm.name === 'subscription' ? null : REVIEW_MAX_USD,
       promptDigest: canonicalHash(PROMPT_DIGEST_INPUTS), algorithmDigest: ALGORITHM_DIGEST,
       contextGeneration: repo.review_context_generation, indexedCommit: repo.last_commit, fresh: false,
     };
@@ -1791,6 +1795,12 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     }
 
     const budgeted = llm.supportsBatchReview === true;
+    const subscription = llm.name === 'subscription';
+    if (subscription && [llm, escalationLlm, verifierLlm, deps.arbiterLlm, ...(llm.reviewFallbacks ?? [])]
+      .some((provider) => provider && provider.name !== 'subscription')) {
+      throw new Error('Subscription reviews require subscription providers for every enabled role');
+    }
+    const discoverySize = (req: CompleteRequest) => subscription ? subscriptionRequestSize(req, llm.model) : reviewCostUpperBound(req);
     const discoveryMaxOutput = Math.min(
       REVIEW_ESCALATION_MAX_OUTPUT,
       Math.max(1, Number.isInteger(deps.discoveryMaxOutput) ? deps.discoveryMaxOutput! : REVIEW_MAX_OUTPUT),
@@ -1979,7 +1989,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
     const referencedHeadFetched = new Set<string>();
     // The precision/recall arm uses two independent Qwen views and the
     // independent verifier; keep older staged/non-Qwen callers unchanged.
-    const complementaryDiscovery = Boolean(deps.dualDiscovery) && budgeted && Boolean(verifierLlm) && !escalationLlm && /qwen/i.test(llm.model);
+    const complementaryDiscovery = Boolean(deps.dualDiscovery) && Boolean(verifierLlm) && (subscription || budgeted && !escalationLlm && /qwen/i.test(llm.model));
     let batch: { findings: Finding[] } | undefined;
     const resumedDiscovery = resume?.discovery;
     if (resumedDiscovery) {
@@ -2000,7 +2010,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       followupReserve = reserve * (maxRetries > 0 ? 2 : 1);
       reservedUsd += followupReserve;
     }
-    if (budgeted && !resumedDiscovery) {
+    if ((budgeted || subscription) && !resumedDiscovery) {
       const req: CompleteRequest = {
         system: lineage.previous ? FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT : BATCH_REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
@@ -2014,19 +2024,19 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
           })),
         }) }],
         json: true, jsonSchema: buildBatchReviewJsonSchema(files.map((f) => ({ path: f.newPath ?? f.oldPath!, allowedFindingLines: [...allowedFindingLines(f)] }))),
-        maxTokens: discoveryMaxOutput, reviewBudget: true, reviewStage: 'initial',
+        maxTokens: discoveryMaxOutput, reviewBudget: budgeted, reviewStage: 'initial',
       };
       // Reject the core prompt before the retrieval loop or any inference call.
-      const coreCost = reviewCostUpperBound(req);
-      const discoveryBudget = REVIEW_MAX_USD - reservedUsd;
+      const coreCost = discoverySize(req);
+      const discoveryBudget = subscription ? 256 * 1024 : REVIEW_MAX_USD - reservedUsd;
       if (coreCost > discoveryBudget) {
-        throw new Error('Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
+        throw new Error(subscription ? 'Review exceeds the private broker input limit; split this pull request.' : 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
       }
       // Reserve half the ceiling for one retry while keeping the full core diff.
       // The complementary system prompt is longer, so account for that fixed
       // overhead before splitting the cap between the two worst-case calls.
       const complementaryOverhead = complementaryDiscovery
-        ? reviewCostUpperBound({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) - coreCost
+        ? discoverySize({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) - coreCost
         : 0;
       const optionalContextBudget = complementaryDiscovery
         ? (discoveryBudget - complementaryOverhead) / 2
@@ -2040,7 +2050,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         seenContext.add(block);
         const previous = req.messages[0]!.content;
         req.messages[0]!.content += `\n\n${block}`;
-        if (reviewCostUpperBound(req) > optionalContextBudget) {
+        if (discoverySize(req) > optionalContextBudget) {
           req.messages[0]!.content = previous;
           omitted++;
         }
@@ -2076,10 +2086,10 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
           addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
         }
       }
-      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within $0.50; all file diffs included.`);
+      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within ${subscription ? 'the private broker input limit' : '$0.50'}; all file diffs included.`);
       initialOmittedContext = omitted;
       const providers = [llm, ...(llm.reviewFallbacks ?? [])];
-      if (providers.some((p) => !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
+      if (providers.some((p) => subscription ? p.name !== 'subscription' : !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
       let lastRetryError: unknown;
       let attemptReq = req;
       const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
@@ -2103,16 +2113,24 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       if (complementaryDiscovery) {
         await assertHeadUnchanged();
         const complementaryReq: CompleteRequest = { ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT };
-        const combinedEstimate = reviewCostUpperBound(req) + reviewCostUpperBound(complementaryReq);
+        const combinedEstimate = discoverySize(req) + discoverySize(complementaryReq);
         if (combinedEstimate > discoveryBudget) {
-          throw new Error(`Combined discovery passes exceed the $0.50 review budget; estimated $${combinedEstimate.toFixed(6)}; no review was published.`);
+          throw new Error(subscription ? 'Combined discovery passes exceed the private broker input allowance; no review was published.'
+            : `Combined discovery passes exceed the $0.50 review budget; estimated $${combinedEstimate.toFixed(6)}; no review was published.`);
         }
         // Reserve both worst-case calls before either provider starts.
-        reservedUsd += combinedEstimate;
-        const [localCall, contractCall] = await Promise.all([
+        if (budgeted) reservedUsd += combinedEstimate;
+        const sequentialDiscovery = async () => {
+          const first = await completeCall(req, activeLlm, true);
+          if (first.failed) throw first.error;
+          return [first, await completeCall(complementaryReq, llm, true)] as const;
+        };
+        // The shared account runs one turn at a time. Start the second IPC
+        // timeout after the first completes instead of while it waits in queue.
+        const [localCall, contractCall] = await (subscription ? sequentialDiscovery() : Promise.all([
           completeCall(req, activeLlm, true),
           completeCall(complementaryReq, llm, true),
-        ]);
+        ]));
         if (localCall.failed) throw localCall.error;
         if (contractCall.failed) throw contractCall.error;
         let local: { findings: Finding[] };
@@ -2152,6 +2170,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
             log(`review: ${message}`);
             continue;
           }
+          if (subscription && err instanceof ProviderError && !(err instanceof NetworkProviderError)) throw err;
           const retryable = err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
           if (!retryable || !consumeRetryAllowance()) {
             if (lastRetryError && /budget/i.test(errMessage(err))) {
@@ -2607,7 +2626,10 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
           arbitrationDecisionsTrace = arbiterDecisions.map((decision) => ({ id: decision.id as number, decision: String(decision.decision) }));
           findings = restoreArbitratedFindings(findings, arbitrationCandidates, arbiterDecisions as Array<{ id: number; decision: string }>);
         } catch (err) {
-          // Fail closed: disputed findings stay suppressed when arbitration is unavailable.
+          // Subscription roles must all complete; unavailable arbitration cannot
+          // turn a suppressed finding into a passing subscription review.
+          if (deps.arbiterLlm.name === 'subscription') throw err;
+          // Preserve the existing behavior for other providers.
           const traceCall = traceCalls.at(-1);
           if (traceCall?.stage === 'arbitration' && traceCall.outcome === 'success') {
             traceCall.outcome = 'validation_error';

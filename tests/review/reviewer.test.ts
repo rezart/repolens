@@ -4071,7 +4071,8 @@ describe('staged review', () => {
       const billed = calls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0);
       const arbitration = result.trace!.stages.find((stage) => stage.stage === 'arbitration')!.calls[0]!;
       expect(billed).toBeLessThanOrEqual(REVIEW_MAX_USD);
-      expect(billed + arbitration.estimatedCostUsd).toBeGreaterThan(REVIEW_MAX_USD);
+      expect(arbitration.estimatedCostUsd).not.toBeNull();
+      expect(billed + arbitration.estimatedCostUsd!).toBeGreaterThan(REVIEW_MAX_USD);
     } finally { testDb.close(); }
   });
 

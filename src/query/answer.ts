@@ -102,7 +102,7 @@ export async function answerQuestion(opts: AnswerOptions): Promise<AnswerResult>
   const request = {
     system: ANSWER_SYSTEM_PROMPT,
     messages: [...prior, { role: 'user' as const, content: buildAnswerUserMessage(question, context) }],
-    maxTokens: ANSWER_MAX_TOKENS,
+    ...(llm.name === 'subscription' ? {} : { maxTokens: ANSWER_MAX_TOKENS }),
   };
   const message = onDelta
     ? await completeStreaming(llm, request, onDelta)

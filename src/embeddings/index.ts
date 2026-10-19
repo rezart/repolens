@@ -1,4 +1,5 @@
 import type { Config } from '../config.js';
+import { assertSubscriptionOnlyConfig } from '../config.js';
 import { ProviderError } from '../llm/types.js';
 import type { EmbeddingProvider } from './types.js';
 import type { UsageSink } from '../usage/types.js';
@@ -181,6 +182,7 @@ async function safeText(res: Response): Promise<string> {
 
 /** Build the configured embedding backend, or null when embeddings are disabled. */
 export function createEmbeddings(config: Config, opts: { onUsage?: UsageSink } = {}): EmbeddingProvider | null {
+  assertSubscriptionOnlyConfig(config);
   if (!config.embedding) return null;
   return new OpenAIEmbeddings({
     baseUrl: config.embedding.baseUrl,

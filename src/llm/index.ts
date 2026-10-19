@@ -1,4 +1,5 @@
 import type { Config, LLMProviderName } from '../config.js';
+import { assertSubscriptionOnlyConfig, SUBSCRIPTION_MODEL } from '../config.js';
 import { OpenRouterProvider } from './openrouter.js';
 import { ClaudeCliProvider } from './claude-cli.js';
 import { SubscriptionProvider } from './subscription.js';
@@ -33,6 +34,11 @@ export interface CreateProviderOptions {
  * different provider/model than reviews without a second Config object.
  */
 export function createProvider(config: Config, opts: CreateProviderOptions = {}): LLMProvider {
+  assertSubscriptionOnlyConfig(config);
+  if (config.billingMode === 'subscription_only' && ((opts.provider && opts.provider !== 'subscription')
+      || (opts.model && !SUBSCRIPTION_MODEL.test(opts.model)) || opts.fallbackModels?.length)) {
+    throw new Error('Subscription-only mode rejects provider/model fallback overrides');
+  }
   const llm = config.llm;
   const provider = opts.provider ?? llm.provider;
   if (provider === 'codex-cli') {

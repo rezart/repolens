@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Config } from './config.js';
+import { assertSubscriptionOnlyConfig } from './config.js';
 import { openDb } from './db.js';
 import { createProvider } from './llm/index.js';
 import { createEmbeddings } from './embeddings/index.js';
@@ -16,23 +17,25 @@ import { startPoller } from './poller.js';
 import { startTelemetry, withTelemetryLogging } from './telemetry.js';
 
 export function buildDeps(config: Config, log: (msg: string) => void = console.log): AppDeps {
+  assertSubscriptionOnlyConfig(config);
   const token = config.github.app
     ? createAppTokenProvider({ ...config.github.app, privateKey: readFileSync(config.github.app.privateKeyPath, 'utf8') }, { baseUrl: config.github.apiUrl })
     : config.github.token;
   const db = openDb(join(config.dataDir, 'repolens.db'));
   // Accounting is wired before the backends so each one gets its role's sink.
   // The price list is public, so it is fetched with or without an OpenRouter key.
-  const pricing = new OpenRouterPricing({ db, baseUrl: config.llm.openrouterBaseUrl });
+  const pricing = config.billingMode === 'subscription_only' ? null : new OpenRouterPricing({ db, baseUrl: config.llm.openrouterBaseUrl });
   const usage = new UsageTracker({ db, pricing, log });
   // Reviews get the configured reasoning budget.
   const llm = createProvider(config, { fallbackModels: config.review.fallbackModels, reasoningEffort: config.llm.reasoningEffort, onUsage: usage.sinkFor('review') });
-  const verifierLlm = config.llm.provider === 'openrouter' && config.review.verifierModel
+  const independentRoles = config.llm.provider === 'openrouter' || config.llm.provider === 'subscription';
+  const verifierLlm = independentRoles && config.review.verifierModel
     ? createProvider(config, { model: config.review.verifierModel, reasoningEffort: config.review.verifierReasoningEffort ?? '', onUsage: usage.sinkFor('review') })
     : config.llm.provider === 'claude-cli' ? llm : undefined;
-  const escalationLlm = config.llm.provider === 'openrouter' && config.review.escalationModel && config.review.escalationModel !== llm.model
+  const escalationLlm = independentRoles && config.review.escalationModel && (config.llm.provider === 'subscription' || config.review.escalationModel !== llm.model)
     ? createProvider(config, { model: config.review.escalationModel, reasoningEffort: config.review.escalationReasoningEffort ?? config.llm.reasoningEffort, onUsage: usage.sinkFor('review') })
     : undefined;
-  const arbiterLlm = config.llm.provider === 'openrouter' && config.review.arbiterModel
+  const arbiterLlm = independentRoles && config.review.arbiterModel
     ? createProvider(config, { model: config.review.arbiterModel, reasoningEffort: config.review.arbiterReasoningEffort ?? 'low', onUsage: usage.sinkFor('review') })
     : undefined;
   // Chat always gets its own provider so it pins effort to 'low' rather than
