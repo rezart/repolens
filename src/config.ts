@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import path from 'node:path';
 
 const envSchema = z.object({
   REPOLENS_DATA_DIR: z.string().default('./data'),
@@ -9,7 +10,8 @@ const envSchema = z.object({
   REPOLENS_REVISION: z.string().trim().default(''),
   TRACEWAY_WEB_CONNECTION_STRING: z.string().default(''),
 
-  LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli']).default('openrouter'),
+  LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', 'subscription']).default('openrouter'),
+  SUBSCRIPTION_SOCKET_PATH: z.string().default(''),
   LLM_MODEL: z.string().default(''),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
   OPENROUTER_API_KEY: z.string().default(''),
@@ -31,7 +33,7 @@ const envSchema = z.object({
   /** Seconds between GitHub polls for new commits and pull requests. 0 disables polling. */
   REPOLENS_POLL_INTERVAL: z.coerce.number().int().min(0).default(300),
   /** Provider and model used for chat answers; blank = same as LLM_PROVIDER / LLM_MODEL. */
-  CHAT_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', '']).default(''),
+  CHAT_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', 'subscription', '']).default(''),
   CHAT_MODEL: z.string().default(''),
   /** Reasoning effort for the review provider (codex: model_reasoning_effort; openrouter: reasoning.effort). Blank = provider default. */
   LLM_REASONING_EFFORT: z.enum(['low', 'medium', 'high', '']).default(''),
@@ -68,7 +70,7 @@ const envSchema = z.object({
   REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(30),
 });
 
-export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli';
+export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli' | 'subscription';
 
 export interface Config {
   dataDir: string;
@@ -80,6 +82,7 @@ export interface Config {
   tracewayWebConnectionString?: string;
   llm: {
     provider: LLMProviderName;
+    subscriptionSocketPath?: string;
     model: string;
     timeoutMs: number;
     openrouterApiKey: string;
@@ -123,6 +126,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
   // Chat may run on a different backend; validate the effective chat provider the same way.
   const chatProvider = e.CHAT_PROVIDER || e.LLM_PROVIDER;
+  if ([e.LLM_PROVIDER, chatProvider].includes('subscription')) {
+    if (!path.isAbsolute(e.SUBSCRIPTION_SOCKET_PATH)) {
+      throw new ConfigError('SUBSCRIPTION_SOCKET_PATH must be an absolute private Unix socket path');
+    }
+    if ((e.LLM_PROVIDER === 'subscription' && !e.LLM_MODEL)
+        || (chatProvider === 'subscription' && !(e.CHAT_MODEL || e.LLM_MODEL))) {
+      throw new ConfigError('A subscription model must be explicitly configured');
+    }
+  }
   if (chatProvider === 'openrouter' && !e.OPENROUTER_API_KEY) {
     throw new ConfigError('OPENROUTER_API_KEY is required when chat runs on OpenRouter (CHAT_PROVIDER=openrouter)');
   }
@@ -139,6 +151,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     tracewayWebConnectionString: e.TRACEWAY_WEB_CONNECTION_STRING,
     llm: {
       provider: e.LLM_PROVIDER,
+      subscriptionSocketPath: e.SUBSCRIPTION_SOCKET_PATH,
       model: e.LLM_MODEL,
       timeoutMs: e.LLM_TIMEOUT_MS,
       openrouterApiKey: e.OPENROUTER_API_KEY,
