@@ -104,6 +104,15 @@ describe('SubscriptionProvider', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it('retains consumed usage when a completed turn has invalid structured output', async () => {
+    const socketPath = await broker((_req, res) => res.end(JSON.stringify({ ...valid, text: 'invalid JSON' })));
+    const onUsage = vi.fn();
+    const provider = new SubscriptionProvider({ socketPath, model: 'gpt-6.1-sol', timeoutMs: 1000, onUsage });
+    await expect(provider.complete({ messages: [], json: true })).rejects.toThrow(/structured output/);
+    expect(onUsage).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 7, outputTokens: 3, costUsd: null }));
+  });
+
   it('validates strict structured output before returning it', async () => {
     let response = '{"approve":true}';
     const socketPath = await broker((_req, res) => res.end(JSON.stringify({ ...valid, text: response })));

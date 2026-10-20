@@ -102,15 +102,6 @@ export class SubscriptionProvider implements LLMProvider {
     const result = resultSchema.safeParse(response);
     if (!result.success) throw new IncompleteResponseError(this.name, 'incomplete or unsupported broker result');
     const value = result.data;
-    if (req.json || schema) {
-      try {
-        const output: unknown = JSON.parse(value.text);
-        if (schema) schema.parse(output);
-        else if (!output || typeof output !== 'object' || Array.isArray(output)) throw new Error('expected object');
-      } catch {
-        throw new IncompleteResponseError(this.name, 'invalid structured output');
-      }
-    }
     if (typeof value.input_tokens === 'number' && typeof value.output_tokens === 'number'
         && (value.cached_input_tokens == null || value.cached_input_tokens <= value.input_tokens)) {
       try {
@@ -121,6 +112,15 @@ export class SubscriptionProvider implements LLMProvider {
           cachedInputTokens: value.cached_input_tokens ?? 0, cacheWriteTokens: 0,
           outputTokens: value.output_tokens, costUsd: null });
       } catch { /* A failed usage sink must not repeat inference. */ }
+    }
+    if (req.json || schema) {
+      try {
+        const output: unknown = JSON.parse(value.text);
+        if (schema) schema.parse(output);
+        else if (!output || typeof output !== 'object' || Array.isArray(output)) throw new Error('expected object');
+      } catch {
+        throw new IncompleteResponseError(this.name, 'invalid structured output');
+      }
     }
     return value.text;
   }
