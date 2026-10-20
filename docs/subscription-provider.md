@@ -100,3 +100,19 @@ retrieval. Reuse these tests instead of maintaining a second copy of Codex
 protocol fixtures in this repository. A real-broker integration smoke and live
 role review remain rollout checks; neither may be skipped or treated as passing
 because a synthetic suite passed.
+
+### Large pull requests
+
+Subscription reviews accept at most 200 reviewable files by default and inspect
+all of them in sequential discovery batches. Each batch contains at most 40
+complete file diffs and must fit the existing 256 KiB private broker request
+bound, including its schema and required PR context. A single oversized file
+still blocks review. Explicit lower `maxFiles` limits remain enforced.
+
+The planner includes both discovery passes when enabled. Findings from every
+batch enter the existing verification, arbitration and posting pipeline. Each
+response must identify exactly its assigned reviewed paths; a failed or incomplete
+batch, or a changed PR head, prevents the final approval and commit success status.
+There are no partial passing statuses or omitted remainder files. Per-call native
+subscription deadlines and retry allowances remain unchanged. API-provider reviews
+retain their existing file and monetary limits.

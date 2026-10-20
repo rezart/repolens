@@ -21,6 +21,7 @@ import { traceOperation } from '../telemetry.js';
 import { countReview, recordReviewCall, recordReviewScope } from './metrics.js';
 import type { CompleteRequest, LLMProvider } from '../llm/types.js';
 import { subscriptionRequestSize } from '../llm/subscription.js';
+import { subscriptionBatches } from './subscription-batches.js';
 import { reviewCostUpperBound, REVIEW_MAX_USD, REVIEW_MAX_OUTPUT, REVIEW_VERIFIER_MAX_OUTPUT, REVIEW_ESCALATION_MAX_OUTPUT, REVIEW_ARBITRATION_MAX_OUTPUT } from './budget.js';
 import { IncompleteResponseError, NetworkProviderError, ProviderError } from '../llm/types.js';
 import { extractJson, JsonExtractError } from '../llm/json.js';
@@ -1526,7 +1527,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
   const log = deps.log ?? (() => {});
   const identifiers = deps.identifiers ?? defaultIdentifiers;
   const formatContext = deps.formatContext ?? defaultFormatContext;
-  const maxFiles = deps.maxFiles ?? 40;
+  const maxFiles = deps.maxFiles ?? (llm.name === 'subscription' ? 200 : 40);
   const post = opts.post ?? true;
   const failOn = deps.failOn ?? 'critical';
   const statusContext = (deps.statusContext ?? '').trim();
@@ -1552,7 +1553,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       version: 1, repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha,
       title: pr.title, body: pr.body, instructions: repo.instructions ?? '',
       provider: llm.name, model: llm.model, fallbackModels: (llm.reviewFallbacks ?? []).map((p) => `${p.name}:${p.model}`),
-      supportsBatchReview: llm.supportsBatchReview === true, maxFiles: deps.maxFiles ?? 40, maxRetries: deps.maxRetries ?? 3,
+      supportsBatchReview: llm.supportsBatchReview === true, maxFiles, maxRetries: deps.maxRetries ?? 3,
       discoveryMaxOutput: deps.discoveryMaxOutput ?? REVIEW_MAX_OUTPUT,
       dualDiscovery: Boolean(deps.dualDiscovery), focusedVerification: Boolean(deps.focusedVerification),
       arbiter: Boolean(deps.arbiterLlm), arbiterAllFindings: Boolean(deps.arbiterAllFindings),
@@ -1636,7 +1637,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       .filter((stage) => stage.calls.length);
     return {
       version: 1,
-      identity: { repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha, provider: activeLlm.name, model: activeLlm.model, config: { maxRetries: deps.maxRetries ?? 3, maxFiles: deps.maxFiles ?? 40 } },
+      identity: { repoId: opts.repoId, prNumber: opts.prNumber, headSha: pr.headSha, baseSha: pr.baseSha, provider: activeLlm.name, model: activeLlm.model, config: { maxRetries: deps.maxRetries ?? 3, maxFiles } },
       stages,
       finalFindings: [],
     };
@@ -2012,7 +2013,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
       reservedUsd += followupReserve;
     }
     if ((budgeted || subscription) && !resumedDiscovery) {
-      const req: CompleteRequest = {
+      const makeDiscoveryRequest = (files: DiffFile[]): CompleteRequest => ({
         system: lineage.previous ? FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT : BATCH_REVIEW_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: JSON.stringify({
           prTitle: pr.title, prBody: pr.body, instructions: repo.instructions,
@@ -2026,172 +2027,184 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         }) }],
         json: true, jsonSchema: buildBatchReviewJsonSchema(files.map((f) => ({ path: f.newPath ?? f.oldPath!, allowedFindingLines: [...allowedFindingLines(f)] }))),
         maxTokens: discoveryMaxOutput, reviewBudget: budgeted, reviewStage: 'initial',
-      };
-      // Reject the core prompt before the retrieval loop or any inference call.
-      const coreCost = discoverySize(req);
-      const discoveryBudget = subscription ? 256 * 1024 : REVIEW_MAX_USD - reservedUsd;
-      if (coreCost > discoveryBudget) {
-        throw new Error(subscription ? 'Review exceeds the private broker input limit; split this pull request.' : 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
-      }
-      // Reserve half the ceiling for one retry while keeping the full core diff.
-      // The complementary system prompt is longer, so account for that fixed
-      // overhead before splitting the cap between the two worst-case calls.
-      const complementaryOverhead = complementaryDiscovery
-        ? discoverySize({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) - coreCost
-        : 0;
-      const optionalContextBudget = complementaryDiscovery
-        ? (discoveryBudget - complementaryOverhead) / 2
-        : maxRetries > 0 ? Math.max(coreCost, discoveryBudget / 2) : discoveryBudget;
-      // Share each context block once across all files; changed code always gets
-      // its full diff before optional context consumes any of the budget.
-      let omitted = 0;
-      const seenContext = new Set<string>();
-      const addContext = (block: string) => {
-        if (!block.trim() || seenContext.has(block)) return;
-        seenContext.add(block);
-        const previous = req.messages[0]!.content;
-        req.messages[0]!.content += `\n\n${block}`;
-        if (discoverySize(req) > optionalContextBudget) {
-          req.messages[0]!.content = previous;
-          omitted++;
+      });
+      const batches = subscription ? subscriptionBatches(files, (group) => {
+        const req = makeDiscoveryRequest(group);
+        return discoverySize(req) + (complementaryDiscovery
+          ? discoverySize({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) : 0);
+      }) : [files];
+      const allBatchFindings: Finding[] = [];
+      for (const files of batches) {
+        const req = makeDiscoveryRequest(files);
+        // Reject the core prompt before the retrieval loop or any inference call.
+        const coreCost = discoverySize(req);
+        const discoveryBudget = subscription ? 256 * 1024 : REVIEW_MAX_USD - reservedUsd;
+        if (coreCost > discoveryBudget) {
+          throw new Error(subscription ? 'Review exceeds the private broker input limit; split this pull request.' : 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
         }
-      };
-      for (const file of files) {
-        const path = file.newPath ?? file.oldPath!;
-        const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
-        const headContext = buildHeadContext({ path, addedText: added, relevantLines: headRelevantLines(file), headContents, exportsByPath });
-        if (headContext) addContext(`Relevant post-change context for ${path} (authoritative):\n${headContext}`);
-      }
-      if (staticEvidence.length) addContext(`Advisory static evidence (bounded heuristics; not authoritative citations):\n${JSON.stringify(staticEvidence)}`);
-      if (rules) addContext(rules);
-      const batchHistory = historyFor(...historyPaths);
-      if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
-      log(`review: gathering context for ${files.length} files`);
-      const contexts = await traceOperation('review.context.discovery', () => mapPool(files, 4, async (file) => {
-        const path = file.newPath ?? file.oldPath!;
-        const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
-        try {
-          return { path, selected: await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths) };
-        } catch (err) {
-          return { path, selected: [], warning: `${path}: retrieval failed: ${errMessage(err)}` };
-        }
-      }));
-      const seen = new Set<number>();
-      for (const { path, selected, warning } of contexts) {
-        if (warning) warnings.push(warning);
-        relevantChunksByPath.set(path, selected);
-        relevantContextByPath.set(path, formatContext(selected));
-        for (const chunk of selected) {
-          if (seen.has(chunk.chunkId)) continue;
-          seen.add(chunk.chunkId);
-          addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
-        }
-      }
-      if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within ${subscription ? 'the private broker input limit' : '$0.50'}; all file diffs included.`);
-      initialOmittedContext = omitted;
-      const providers = [llm, ...(llm.reviewFallbacks ?? [])];
-      if (providers.some((p) => subscription ? p.name !== 'subscription' : !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
-      let lastRetryError: unknown;
-      let attemptReq = req;
-      const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
-      const parseBatchResponse = (raw: string, providerName: string) => {
-        const obj = extractJson(raw) as Record<string, unknown>;
-        if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
-            !toVerdict(obj.verdict) || !hasExactReviewedPaths(obj.reviewedPaths, files.map((f) => f.newPath ?? f.oldPath!)) ||
-            obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
-          throw new IncompleteResponseError(providerName, 'Incomplete review response; no review was published.');
-        }
-        let findings: Finding[];
-        try {
-          findings = files.flatMap((file) => parseFindings(JSON.stringify({
-            findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
-          }), file));
-        } catch (err) {
-          throw new IncompleteResponseError(providerName, errMessage(err));
-        }
-        return { findings };
-      };
-      if (complementaryDiscovery) {
-        await assertHeadUnchanged();
-        const complementaryReq: CompleteRequest = { ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT };
-        const combinedEstimate = discoverySize(req) + discoverySize(complementaryReq);
-        if (combinedEstimate > discoveryBudget) {
-          throw new Error(subscription ? 'Combined discovery passes exceed the private broker input allowance; no review was published.'
-            : `Combined discovery passes exceed the $0.50 review budget; estimated $${combinedEstimate.toFixed(6)}; no review was published.`);
-        }
-        // Reserve both worst-case calls before either provider starts.
-        if (budgeted) reservedUsd += combinedEstimate;
-        const sequentialDiscovery = async () => {
-          const first = await completeCall(req, activeLlm, true);
-          if (first.failed) throw first.error;
-          return [first, await completeCall(complementaryReq, llm, true)] as const;
+        // Reserve half the ceiling for one retry while keeping the full core diff.
+        // The complementary system prompt is longer, so account for that fixed
+        // overhead before splitting the cap between the two worst-case calls.
+        const complementaryOverhead = complementaryDiscovery
+          ? discoverySize({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) - coreCost
+          : 0;
+        const optionalContextBudget = complementaryDiscovery
+          ? (discoveryBudget - complementaryOverhead) / 2
+          : maxRetries > 0 ? Math.max(coreCost, discoveryBudget / 2) : discoveryBudget;
+        // Share each context block once across all files; changed code always gets
+        // its full diff before optional context consumes any of the budget.
+        let omitted = 0;
+        const seenContext = new Set<string>();
+        const addContext = (block: string) => {
+          if (!block.trim() || seenContext.has(block)) return;
+          seenContext.add(block);
+          const previous = req.messages[0]!.content;
+          req.messages[0]!.content += `\n\n${block}`;
+          if (discoverySize(req) > optionalContextBudget) {
+            req.messages[0]!.content = previous;
+            omitted++;
+          }
         };
-        // The shared account runs one turn at a time. Start the second IPC
-        // timeout after the first completes instead of while it waits in queue.
-        const [localCall, contractCall] = await (subscription ? sequentialDiscovery() : Promise.all([
-          completeCall(req, activeLlm, true),
-          completeCall(complementaryReq, llm, true),
-        ]));
-        if (localCall.failed) throw localCall.error;
-        if (contractCall.failed) throw contractCall.error;
-        let local: { findings: Finding[] };
-        let contract: { findings: Finding[] };
-        try { local = parseBatchResponse(localCall.raw!, activeLlm.name); }
-        catch (err) { markTraceValidation(localCall.traceIndex, err); throw err; }
-        try { contract = parseBatchResponse(contractCall.raw!, llm.name); }
-        catch (err) { markTraceValidation(contractCall.traceIndex, err); throw err; }
-        const findings = [...local.findings, ...contract.findings]
-          .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
-        batch = { findings };
-      } else for (let attempt = 0; ; attempt++) {
-        await assertHeadUnchanged();
-        let traceIndex: number | undefined;
-        try {
-          const call = await completeCall(attemptReq);
-          traceIndex = call.traceIndex;
-          if (call.failed) throw call.error;
-          batch = parseBatchResponse(call.raw!, activeLlm.name);
-          break;
-        } catch (err) {
-          const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
-          if (malformed) {
-            markTraceValidation(traceIndex, err);
-            if (!consumeRetryAllowance()) {
+        for (const file of files) {
+          const path = file.newPath ?? file.oldPath!;
+          const added = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.content)).join('\n');
+          const headContext = buildHeadContext({ path, addedText: added, relevantLines: headRelevantLines(file), headContents, exportsByPath });
+          if (headContext) addContext(`Relevant post-change context for ${path} (authoritative):\n${headContext}`);
+        }
+        if (staticEvidence.length) addContext(`Advisory static evidence (bounded heuristics; not authoritative citations):\n${JSON.stringify(staticEvidence)}`);
+        if (rules) addContext(rules);
+        const batchHistory = historyFor(...historyPaths);
+        if (batchHistory.length) addContext(renderHistoricalContext(batchHistory));
+        log(`review: gathering context for ${files.length} files`);
+        const contexts = await traceOperation('review.context.discovery', () => mapPool(files, 4, async (file) => {
+          const path = file.newPath ?? file.oldPath!;
+          const changedText = file.hunks.flatMap((h) => h.lines.filter((l) => l.type === 'add' || l.type === 'del').map((l) => l.content)).join('\n');
+          try {
+            return { path, selected: await retrieveTargetedChunks(retrieve, opts.repoId, path, changedText, identifiers, changedPaths) };
+          } catch (err) {
+            return { path, selected: [], warning: `${path}: retrieval failed: ${errMessage(err)}` };
+          }
+        }));
+        const seen = new Set<number>();
+        for (const { path, selected, warning } of contexts) {
+          if (warning) warnings.push(warning);
+          relevantChunksByPath.set(path, selected);
+          relevantContextByPath.set(path, formatContext(selected));
+          for (const chunk of selected) {
+            if (seen.has(chunk.chunkId)) continue;
+            seen.add(chunk.chunkId);
+            addContext(`Related code from the base-branch index:\n${formatContext([chunk])}`);
+          }
+        }
+        if (omitted) warnings.push(`${omitted} optional context blocks omitted to keep the review within ${subscription ? 'the private broker input limit' : '$0.50'}; all file diffs included.`);
+        initialOmittedContext = omitted;
+        const providers = [llm, ...(llm.reviewFallbacks ?? [])];
+        if (providers.some((p) => subscription ? p.name !== 'subscription' : !p.supportsBatchReview)) throw new Error('Review fallbacks must support budgeted batch reviews');
+        let lastRetryError: unknown;
+        let attemptReq = req;
+        const allowedPathsAndLines = files.map((file) => ({ path: file.newPath ?? file.oldPath!, lines: [...allowedFindingLines(file)].sort((a, b) => a - b) }));
+        const parseBatchResponse = (raw: string, providerName: string) => {
+          const obj = extractJson(raw) as Record<string, unknown>;
+          if (!obj || !Array.isArray(obj.findings) || typeof obj.summary !== 'string' || !obj.summary.trim() ||
+              !toVerdict(obj.verdict) || !hasExactReviewedPaths(obj.reviewedPaths, files.map((f) => f.newPath ?? f.oldPath!)) ||
+              obj.findings.some((f: unknown) => !f || typeof f !== 'object' || !files.some((file) => (file.newPath ?? file.oldPath) === (f as { path?: unknown }).path))) {
+            throw new IncompleteResponseError(providerName, 'Incomplete review response; no review was published.');
+          }
+          let findings: Finding[];
+          try {
+            findings = files.flatMap((file) => parseFindings(JSON.stringify({
+              findings: (obj.findings as Array<{ path?: string } | null>).filter((f) => f?.path === (file.newPath ?? file.oldPath)),
+            }), file));
+          } catch (err) {
+            throw new IncompleteResponseError(providerName, errMessage(err));
+          }
+          return { findings };
+        };
+        if (complementaryDiscovery) {
+          await assertHeadUnchanged();
+          const complementaryReq: CompleteRequest = { ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT };
+          const combinedEstimate = discoverySize(req) + discoverySize(complementaryReq);
+          if (combinedEstimate > discoveryBudget) {
+            throw new Error(subscription ? 'Combined discovery passes exceed the private broker input allowance; no review was published.'
+              : `Combined discovery passes exceed the $0.50 review budget; estimated $${combinedEstimate.toFixed(6)}; no review was published.`);
+          }
+          // Reserve both worst-case calls before either provider starts.
+          if (budgeted) reservedUsd += combinedEstimate;
+          const sequentialDiscovery = async () => {
+            const first = await completeCall(req, activeLlm, true);
+            if (first.failed) throw first.error;
+            return [first, await completeCall(complementaryReq, llm, true)] as const;
+          };
+          // The shared account runs one turn at a time. Start the second IPC
+          // timeout after the first completes instead of while it waits in queue.
+          const [localCall, contractCall] = await (subscription ? sequentialDiscovery() : Promise.all([
+            completeCall(req, activeLlm, true),
+            completeCall(complementaryReq, llm, true),
+          ]));
+          if (localCall.failed) throw localCall.error;
+          if (contractCall.failed) throw contractCall.error;
+          let local: { findings: Finding[] };
+          let contract: { findings: Finding[] };
+          try { local = parseBatchResponse(localCall.raw!, activeLlm.name); }
+          catch (err) { markTraceValidation(localCall.traceIndex, err); throw err; }
+          try { contract = parseBatchResponse(contractCall.raw!, llm.name); }
+          catch (err) { markTraceValidation(contractCall.traceIndex, err); throw err; }
+          const findings = [...local.findings, ...contract.findings]
+            .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.path.localeCompare(b.path) || a.line - b.line);
+          batch = { findings };
+        } else for (let attempt = 0; ; attempt++) {
+          await assertHeadUnchanged();
+          let traceIndex: number | undefined;
+          try {
+            const call = await completeCall(attemptReq);
+            traceIndex = call.traceIndex;
+            if (call.failed) throw call.error;
+            batch = parseBatchResponse(call.raw!, activeLlm.name);
+            break;
+          } catch (err) {
+            const malformed = err instanceof JsonExtractError || err instanceof IncompleteResponseError;
+            if (malformed) {
+              markTraceValidation(traceIndex, err);
+              if (!consumeRetryAllowance()) {
+                if (lastRetryError && /budget/i.test(errMessage(err))) {
+                  throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
+                }
+                throw err;
+              }
+              lastRetryError = err;
+              attemptReq = withCorrection(attemptReq, errMessage(err), allowedPathsAndLines);
+              const previous = activeLlm.model;
+              activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
+              const message = `${previous}: ${errMessage(err)}; corrective retry with ${activeLlm.model}`;
+              warnings.push(message);
+              log(`review: ${message}`);
+              continue;
+            }
+            if (subscription && err instanceof ProviderError && !(err instanceof NetworkProviderError)) throw err;
+            const retryable = err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
+            if (!retryable || !consumeRetryAllowance()) {
               if (lastRetryError && /budget/i.test(errMessage(err))) {
                 throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
               }
               throw err;
             }
             lastRetryError = err;
-            attemptReq = withCorrection(attemptReq, errMessage(err), allowedPathsAndLines);
             const previous = activeLlm.model;
             activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
-            const message = `${previous}: ${errMessage(err)}; corrective retry with ${activeLlm.model}`;
+            const message = `${previous}: ${errMessage(err)}; retry ${retryAttemptsUsed}/${maxRetries} with ${activeLlm.model}`;
             warnings.push(message);
             log(`review: ${message}`);
-            continue;
-          }
-          if (subscription && err instanceof ProviderError && !(err instanceof NetworkProviderError)) throw err;
-          const retryable = err instanceof NetworkProviderError || err instanceof ProviderError && (err.status === 408 || err.status === 429 || (err.status ?? 0) >= 500);
-          if (!retryable || !consumeRetryAllowance()) {
-            if (lastRetryError && /budget/i.test(errMessage(err))) {
-              throw new Error(`${errMessage(err)} Last retry error: ${errMessage(lastRetryError)}.`);
+            if (err instanceof ProviderError && err.status === 429) {
+              await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(
+                Math.min(60_000, 15_000 * 2 ** (retryAttemptsUsed - 1)),
+              );
             }
-            throw err;
-          }
-          lastRetryError = err;
-          const previous = activeLlm.model;
-          activeLlm = providers[Math.min(++providerIndex, providers.length - 1)]!;
-          const message = `${previous}: ${errMessage(err)}; retry ${retryAttemptsUsed}/${maxRetries} with ${activeLlm.model}`;
-          warnings.push(message);
-          log(`review: ${message}`);
-          if (err instanceof ProviderError && err.status === 429) {
-            await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(
-              Math.min(60_000, 15_000 * 2 ** (retryAttemptsUsed - 1)),
-            );
           }
         }
+        if (!batch) throw new Error('Discovery batch did not complete; no review was published.');
+        allBatchFindings.push(...batch.findings);
       }
+      batch = { findings: allBatchFindings };
     }
 
     const perFile = batch ? [batch.findings] : resumedDiscovery ? [] : await mapPool(files, llm.concurrency, async (file) => {

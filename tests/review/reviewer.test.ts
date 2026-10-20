@@ -4713,3 +4713,123 @@ describe('durable review checkpoint resume', () => {
   });
 
 });
+
+describe('bounded subscription review batches', () => {
+  function fixture(count: number, contentSize = 10, failCall = 0) {
+    const db = openDb(':memory:');
+    db.upsertRepo({ id: REPO_ID, remote: 'https://github.com/o/r.git', owner: 'o', name: 'r', branch: 'main' });
+    db.setRepoStatus(REPO_ID, 'ready', { last_commit: PR.baseSha });
+    const paths = Array.from({ length: count }, (_, i) => `src/part${i}.ts`);
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+${'x'.repeat(contentSize)}\n`).join('');
+    const gh = fakeGithub(diff);
+    const calls: CompleteRequest[] = [];
+    const llm: LLMProvider = { name: 'subscription', model: 'gpt-6.1-sol', concurrency: 1,
+      async complete(req) {
+        calls.push(req);
+        if (calls.length === failCall) throw new ProviderError('subscription', 'incomplete_output');
+        const files = (JSON.parse(req.messages[0]!.content) as { files: { path: string }[] }).files;
+        return JSON.stringify({ reviewedPaths: files.map((f) => f.path), findings: [], summary: 'Reviewed every assigned file.', verdict: 'approve' });
+      } };
+    return { db, paths, calls, gh, deps: { db, llm, github: gh.github, retrieve: retrieveOne, maxRetries: 0, statusContext: 'repolens/review' } };
+  }
+
+  it('reviews all 85 files in bounded turns before publishing one current-head result', async () => {
+    const f = fixture(85);
+    try {
+      await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
+      const groups = f.calls.map((r) => JSON.parse(r.messages[0]!.content).files.map((x: { path: string }) => x.path));
+      expect(groups.map((g) => g.length)).toEqual([40, 40, 5]);
+      expect(groups.flat()).toEqual(f.paths);
+      expect(f.gh.reviews).toHaveLength(1);
+      expect(f.gh.statuses.at(-1)?.input.state).toBe('success');
+    } finally { f.db.close(); }
+  });
+
+  it('splits by actual broker request bytes without truncating file diffs', async () => {
+    const f = fixture(6, 60_000);
+    try {
+      await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
+      expect(f.calls.length).toBeGreaterThan(1);
+      const { subscriptionRequestSize } = await import('../../src/llm/subscription.js');
+      expect(f.calls.every((r) => subscriptionRequestSize(r, 'gpt-6.1-sol') <= 256 * 1024)).toBe(true);
+      const files = f.calls.flatMap((r) => JSON.parse(r.messages[0]!.content).files);
+      expect(files.map((x) => x.path)).toEqual(f.paths);
+      expect(files.every((x) => x.diff.includes('x'.repeat(60_000)))).toBe(true);
+    } finally { f.db.close(); }
+  });
+
+  it('publishes no approval when a later batch cannot complete', async () => {
+    const f = fixture(41, 10, 2);
+    try {
+      await expect(runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('incomplete_output');
+      expect(f.calls).toHaveLength(2);
+      expect(f.gh.reviews).toHaveLength(0);
+      expect(f.gh.statuses.some((s) => s.input.state === 'success')).toBe(false);
+    } finally { f.db.close(); }
+  });
+
+  it('retains findings from every batch in the final review', async () => {
+    const f = fixture(85);
+    const complete = f.deps.llm.complete.bind(f.deps.llm);
+    f.deps.llm.complete = async (req) => {
+      const output = JSON.parse(await complete(req));
+      const path = output.reviewedPaths[0];
+      output.findings = [{ path, line: 1, severity: 'critical', category: 'security', confidence: 'high',
+        title: `Unvalidated input in ${path}`, body: 'The changed operation accepts an unvalidated request.',
+        rootCause: `The ${path} operation does not validate its input`,
+        evidence: { path, line: 1, trigger: 'An unvalidated request', consequence: 'Unauthorized mutation', rule: null } }];
+      output.verdict = 'request_changes';
+      return JSON.stringify(output);
+    };
+    try {
+      const result = await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
+      expect(result.findings.map((finding) => finding.path)).toEqual([f.paths[0], f.paths[40], f.paths[80]]);
+      expect(f.gh.reviews).toHaveLength(1);
+      expect(f.gh.statuses.at(-1)?.input.state).toBe('failure');
+    } finally { f.db.close(); }
+  });
+
+  it('rejects incomplete reviewed paths in a later batch without publishing', async () => {
+    const f = fixture(41);
+    const complete = f.deps.llm.complete.bind(f.deps.llm);
+    f.deps.llm.complete = async (req) => {
+      const output = JSON.parse(await complete(req));
+      if (f.calls.length === 2) output.reviewedPaths = [];
+      return JSON.stringify(output);
+    };
+    try {
+      await expect(runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('Incomplete review response');
+      expect(f.gh.reviews).toHaveLength(0);
+      expect(f.gh.statuses.some((s) => s.input.state === 'success')).toBe(false);
+    } finally { f.db.close(); }
+  });
+
+  it('stops before the next batch when the PR head changes', async () => {
+    const f = fixture(41);
+    f.gh.github.getPull = async () => f.calls.length ? { ...PR, headSha: 'new-head' } : PR;
+    try {
+      await expect(runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow();
+      expect(f.calls).toHaveLength(1);
+      expect(f.gh.reviews).toHaveLength(0);
+      expect(f.gh.statuses.some((s) => s.input.state === 'success')).toBe(false);
+    } finally { f.db.close(); }
+  });
+
+  it('keeps an overall finite file bound before inference', async () => {
+    const f = fixture(201);
+    try {
+      await expect(runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('file limit');
+      expect(f.calls).toHaveLength(0);
+      expect(f.gh.reviews).toHaveLength(0);
+    } finally { f.db.close(); }
+  });
+
+  it('rejects a single file exceeding the broker bound before inference', async () => {
+    const f = fixture(1, 270_000);
+    try {
+      await expect(runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('private broker input');
+      expect(f.calls).toHaveLength(0);
+      expect(f.gh.reviews).toHaveLength(0);
+    } finally { f.db.close(); }
+  });
+});
