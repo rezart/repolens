@@ -2621,7 +2621,8 @@ describe('reviewPullRequest commit statuses', () => {
 
     const second = await reviewPullRequest(d, { repoId: REPO_ID, prNumber: 42 });
     expect(gh.statuses).toHaveLength(1);
-    expect(gh.statuses[0]!.input).toMatchObject({ state: 'failure', description: '1 critical', targetUrl: PR.htmlUrl });
+    expect(gh.statuses[0]!.input).toMatchObject({ state: 'failure', description: '1 critical', targetUrl: PR.htmlUrl+'#pullrequestreview-7' });
+    expect(second.reviewUrl).toBe(PR.htmlUrl+'#pullrequestreview-7');
     expect(second.status).toEqual({ state: 'failure', description: '1 critical' });
   });
 

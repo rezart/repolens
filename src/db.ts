@@ -73,6 +73,7 @@ export interface ReviewRow {
   verdict: string | null;
   comments_json: string;
   posted: number;
+  review_url?: string | null;
   error: string | null;
   completion_json?: string | null;
   compatibility_key?: string | null;
@@ -267,6 +268,7 @@ create table if not exists reviews (
   verdict text,
   comments_json text not null default '[]',
   posted integer not null default 0,
+  review_url text,
   error text,
   completion_json text,
   compatibility_key text,
@@ -777,8 +779,8 @@ export class Db {
     return (row as { n: number }).n;
   }
 
-  markReviewPosted(id: number) {
-    this.raw.prepare(`update reviews set posted=1 where id=?`).run(id);
+  markReviewPosted(id: number, reviewUrl?: string) {
+    this.raw.prepare(`update reviews set posted=1,review_url=coalesce(?,review_url) where id=?`).run(reviewUrl ?? null, id);
   }
 
   // ---- jobs ----
@@ -890,7 +892,7 @@ export function migrate(raw: Database.Database) {
   const repoColumns = raw.pragma('table_info(repos)') as Array<{ name: string }>;
   if (!repoColumns.some((c) => c.name === 'review_context_generation')) raw.exec(`alter table repos add column review_context_generation integer not null default 0`);
   if (!reviewColumns.some((c) => c.name === 'cost_usd')) raw.exec(`alter table reviews add column cost_usd real`);
-  for (const column of ['provider', 'model', 'compatibility_key', 'base_sha'] as const) {
+  for (const column of ['provider', 'model', 'compatibility_key', 'base_sha', 'review_url'] as const) {
     if (!reviewColumns.some((c) => c.name === column)) raw.exec(`alter table reviews add column ${column} text`);
   }
   if (!reviewColumns.some((c) => c.name === 'completion_json')) raw.exec(`alter table reviews add column completion_json text`);

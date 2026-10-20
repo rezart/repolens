@@ -1408,7 +1408,7 @@ async function postReview(ctx: PostContext, result: ReviewResult): Promise<void>
         body: postedFindingBody(f),
       })),
     });
-    db.markReviewPosted(result.reviewId);
+    db.markReviewPosted(result.reviewId, created.htmlUrl);
     result.posted = true;
     result.reviewUrl = created.htmlUrl;
   } catch (err) {
@@ -1690,6 +1690,7 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         verdict: verdictForFindings(findings),
         findings,
         posted: cached.posted === 1,
+        reviewUrl: cached.review_url ?? undefined,
         skippedFiles: [],
         warnings: statusWarnings,
         riskMetadata: [],
