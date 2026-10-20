@@ -56,7 +56,7 @@ const PROMPT_DIGEST_INPUTS = [
   FOLLOWUP_BATCH_REVIEW_SYSTEM_PROMPT, ESCALATION_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, focusedVerifierSystemPrompt(),
 ] as const;
 /** Structural version of the review pipeline; bump when stage semantics change. */
-const ALGORITHM_DIGEST = 'reviewer-stages-v1';
+const ALGORITHM_DIGEST = 'reviewer-stages-v2-native-batches';
 
 export type Severity = 'critical' | 'warning' | 'nit';
 export type Verdict = 'approve' | 'comment' | 'request_changes';
@@ -2038,7 +2038,8 @@ async function runPullRequest(deps: ReviewDeps, opts: ReviewOptions): Promise<Re
         const req = makeDiscoveryRequest(files);
         // Reject the core prompt before the retrieval loop or any inference call.
         const coreCost = discoverySize(req);
-        const discoveryBudget = subscription ? 256 * 1024 : REVIEW_MAX_USD - reservedUsd;
+        const discoveryBudget = subscription ? Math.max(96 * 1024, coreCost + (complementaryDiscovery
+          ? discoverySize({ ...req, system: CONTRACT_CONCURRENCY_DISCOVERY_SYSTEM_PROMPT }) : 0)) : REVIEW_MAX_USD - reservedUsd;
         if (coreCost > discoveryBudget) {
           throw new Error(subscription ? 'Review exceeds the private broker input limit; split this pull request.' : 'Review exceeds the $0.50 budget; split this pull request into smaller reviews.');
         }

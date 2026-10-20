@@ -1,11 +1,14 @@
 /** Complete files only: never truncate a diff or approve an unreviewed remainder. */
 export function subscriptionBatches<T>(files: T[], requestBytes: (files: T[]) => number,
-  maxFiles = 40, maxBytes = 256 * 1024): T[][] {
+): T[][] {
+  const maxFiles = 12;
+  const targetBytes = 64 * 1024;
+  const maxBytes = 256 * 1024;
   const batches: T[][] = [];
   let batch: T[] = [];
   for (const file of files) {
     const candidate = [...batch, file];
-    if (candidate.length > maxFiles || requestBytes(candidate) > maxBytes) {
+    if (candidate.length > maxFiles || requestBytes(candidate) > targetBytes) {
       if (batch.length) batches.push(batch);
       batch = [file];
       if (requestBytes(batch) > maxBytes) {

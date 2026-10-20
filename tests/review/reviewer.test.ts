@@ -4738,7 +4738,7 @@ describe('bounded subscription review batches', () => {
     try {
       await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
       const groups = f.calls.map((r) => JSON.parse(r.messages[0]!.content).files.map((x: { path: string }) => x.path));
-      expect(groups.map((g) => g.length)).toEqual([40, 40, 5]);
+      expect(groups.map((g) => g.length)).toEqual([12, 12, 12, 12, 12, 12, 12, 1]);
       expect(groups.flat()).toEqual(f.paths);
       expect(f.gh.reviews).toHaveLength(1);
       expect(f.gh.statuses.at(-1)?.input.state).toBe('success');
@@ -4751,7 +4751,7 @@ describe('bounded subscription review batches', () => {
       await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
       expect(f.calls.length).toBeGreaterThan(1);
       const { subscriptionRequestSize } = await import('../../src/llm/subscription.js');
-      expect(f.calls.every((r) => subscriptionRequestSize(r, 'gpt-6.1-sol') <= 256 * 1024)).toBe(true);
+      expect(f.calls.every((r) => subscriptionRequestSize(r, 'gpt-6.1-sol') <= 96 * 1024)).toBe(true);
       const files = f.calls.flatMap((r) => JSON.parse(r.messages[0]!.content).files);
       expect(files.map((x) => x.path)).toEqual(f.paths);
       expect(files.every((x) => x.diff.includes('x'.repeat(60_000)))).toBe(true);
@@ -4783,7 +4783,7 @@ describe('bounded subscription review batches', () => {
     };
     try {
       const result = await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
-      expect(result.findings.map((finding) => finding.path)).toEqual([f.paths[0], f.paths[40], f.paths[80]]);
+      expect(result.findings.map((finding) => finding.path)).toEqual([0, 12, 24, 36, 48, 60, 72, 84].map((i) => f.paths[i]));
       expect(f.gh.reviews).toHaveLength(1);
       expect(f.gh.statuses.at(-1)?.input.state).toBe('failure');
     } finally { f.db.close(); }
@@ -4821,6 +4821,16 @@ describe('bounded subscription review batches', () => {
       await expect(runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 })).rejects.toThrow('file limit');
       expect(f.calls).toHaveLength(0);
       expect(f.gh.reviews).toHaveLength(0);
+    } finally { f.db.close(); }
+  });
+
+  it('allows a whole file above the batching target but below the hard broker bound', async () => {
+    const f = fixture(1, 100_000);
+    try {
+      await runReviewPullRequest(f.deps, { repoId: REPO_ID, prNumber: 42 });
+      expect(f.calls).toHaveLength(1);
+      expect(JSON.parse(f.calls[0]!.messages[0]!.content).files[0].diff).toContain('x'.repeat(100_000));
+      expect(f.gh.statuses.at(-1)?.input.state).toBe('success');
     } finally { f.db.close(); }
   });
 
