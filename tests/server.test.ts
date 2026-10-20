@@ -1,3 +1,4 @@
+import { answerQuestion } from '../src/query/answer.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
@@ -703,6 +704,24 @@ describe('API', () => {
 });
 
 describe('streamAnswer', () => {
+  it('aborts the model request when an SSE write detects disconnection', async () => {
+    const stream = { writeSSE: async () => { throw new Error('disconnected'); } };
+    let cancelled = false;
+    await streamAnswer(stream, async (hooks) => {
+      return answerQuestion({
+        llm: { name: 'subscription', model: 'gpt-6.1-sol', concurrency: 1, complete: async (request) => {
+          if (!request.signal) throw new Error('missing cancellation');
+          await new Promise<void>((resolve) => {
+            request.signal!.addEventListener('abort', () => { cancelled = true; resolve(); }, { once: true });
+            if (request.signal!.aborted) { cancelled = true; resolve(); }
+          });
+          throw new Error('cancelled');
+        } }, retrieve: async () => [], repoIds: [], messages: [{ role: 'user', content: 'question' }], ...hooks,
+      });
+    });
+    expect(cancelled).toBe(true);
+  });
+
   /** A stream whose nth write rejects, as a disconnected client's would. */
   function fakeStream(failOn: number) {
     const written: string[] = [];

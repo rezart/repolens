@@ -112,11 +112,13 @@ export class SubscriptionProvider implements LLMProvider {
       }
     }
     if (typeof value.input_tokens === 'number' && typeof value.output_tokens === 'number'
-        && typeof value.cached_input_tokens === 'number' && value.cached_input_tokens <= value.input_tokens) {
+        && (value.cached_input_tokens == null || value.cached_input_tokens <= value.input_tokens)) {
       try {
         this.onUsage?.({ provider: this.name, model: this.model,
-          inputTokens: value.input_tokens - value.cached_input_tokens,
-          cachedInputTokens: value.cached_input_tokens, cacheWriteTokens: 0,
+          // Without a cache breakdown, retain the known total in the input bucket.
+          // Zero here means no separately measured cache usage, not a measured cache miss.
+          inputTokens: value.input_tokens - (value.cached_input_tokens ?? 0),
+          cachedInputTokens: value.cached_input_tokens ?? 0, cacheWriteTokens: 0,
           outputTokens: value.output_tokens, costUsd: null });
       } catch { /* A failed usage sink must not repeat inference. */ }
     }

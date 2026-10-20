@@ -207,10 +207,11 @@ export function enqueueReview(deps: AppDeps, repoId: string, prNumber: number, o
 
 /** The part of hono's SSE stream this module uses, so the pump is testable on its own. */
 export interface SSEWriter {
+  onAbort?(callback: () => void): void;
   writeSSE(message: { event: string; data: string }): Promise<void>;
 }
 
-type AnswerHooks = Pick<AnswerOptions, 'onDelta' | 'onSources'>;
+type AnswerHooks = Pick<AnswerOptions, 'onDelta' | 'onSources' | 'signal'>;
 
 /**
  * Stream one answer as SSE events. Writes are queued rather than awaited inline:
@@ -220,6 +221,8 @@ type AnswerHooks = Pick<AnswerOptions, 'onDelta' | 'onSources'>;
  * the generation.
  */
 export async function streamAnswer(stream: SSEWriter, run: (hooks: AnswerHooks) => Promise<AnswerResult>): Promise<void> {
+  const controller = new AbortController();
+  stream.onAbort?.(() => controller.abort());
   let pending: Promise<void> = Promise.resolve();
   let writeFailed = false;
   const send = (event: string, data: unknown) => {
@@ -229,10 +232,12 @@ export async function streamAnswer(stream: SSEWriter, run: (hooks: AnswerHooks) 
       .then(() => (writeFailed ? undefined : stream.writeSSE({ event, data: JSON.stringify(data) })))
       .catch(() => {
         writeFailed = true;
+        controller.abort();
       });
   };
   try {
     const result = await run({
+      signal: controller.signal,
       onSources: (sources) => send('sources', sources),
       onDelta: (text) => send('delta', { text }),
     });

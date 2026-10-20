@@ -74,6 +74,14 @@ describe('SubscriptionProvider', () => {
     }));
   });
 
+  it('records known input/output usage when the cache breakdown is unavailable', async () => {
+    const socketPath = await broker((_req, res) => res.end(JSON.stringify({ ...valid, cached_input_tokens: null })));
+    const onUsage = vi.fn();
+    const provider = new SubscriptionProvider({ socketPath, model: 'gpt-6.1-sol', timeoutMs: 1000, onUsage });
+    await provider.complete({ messages: [] });
+    expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 9, outputTokens: 3, cachedInputTokens: 0, costUsd: null }));
+  });
+
   it.each([
     { ...valid, text: '' },
     { text: 'partial' },

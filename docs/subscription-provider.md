@@ -42,8 +42,9 @@ account-authentication store, a host command socket, or a project workspace.
 This is private, single-owner automation, not a public inference endpoint.
 
 Indexing and FTS/lexical retrieval remain available with embeddings disabled.
-This mode has no semantic/vector retrieval. Token usage is recorded when the
-broker supplies actual input, output, and cache counts. The dashboard labels
+This mode has no semantic/vector retrieval. Known input/output usage is retained even when the cache breakdown is unavailable.
+In that case the known total stays in the input bucket, with no separately
+measured cached tokens; zero in that bucket does not imply measured cache misses. The dashboard labels
 the billing source **ChatGPT subscription**; monetary cost is unknown and is
 never estimated from OpenRouter prices or advertised as unlimited/free usage.
 
