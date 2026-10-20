@@ -1,6 +1,8 @@
 import { z } from 'zod';
+import path from 'node:path';
 
 const envSchema = z.object({
+  MODEL_BILLING_MODE: z.enum(['standard', 'subscription_only']).default('standard'),
   REPOLENS_DATA_DIR: z.string().default('./data'),
   REPOLENS_API_TOKEN: z.string().default(''),
   REPOLENS_PORT: z.coerce.number().int().positive().default(3000),
@@ -9,7 +11,8 @@ const envSchema = z.object({
   REPOLENS_REVISION: z.string().trim().default(''),
   TRACEWAY_WEB_CONNECTION_STRING: z.string().default(''),
 
-  LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli']).default('openrouter'),
+  LLM_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', 'subscription']).default('openrouter'),
+  SUBSCRIPTION_SOCKET_PATH: z.string().default(''),
   LLM_MODEL: z.string().default(''),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
   OPENROUTER_API_KEY: z.string().default(''),
@@ -31,7 +34,7 @@ const envSchema = z.object({
   /** Seconds between GitHub polls for new commits and pull requests. 0 disables polling. */
   REPOLENS_POLL_INTERVAL: z.coerce.number().int().min(0).default(300),
   /** Provider and model used for chat answers; blank = same as LLM_PROVIDER / LLM_MODEL. */
-  CHAT_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', '']).default(''),
+  CHAT_PROVIDER: z.enum(['openrouter', 'claude-cli', 'codex-cli', 'subscription', '']).default(''),
   CHAT_MODEL: z.string().default(''),
   /** Reasoning effort for the review provider (codex: model_reasoning_effort; openrouter: reasoning.effort). Blank = provider default. */
   LLM_REASONING_EFFORT: z.enum(['low', 'medium', 'high', '']).default(''),
@@ -68,9 +71,10 @@ const envSchema = z.object({
   REVIEW_SETTLE_SECONDS: z.coerce.number().int().min(0).default(30),
 });
 
-export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli';
+export type LLMProviderName = 'openrouter' | 'claude-cli' | 'codex-cli' | 'subscription';
 
 export interface Config {
+  billingMode?: 'standard' | 'subscription_only';
   dataDir: string;
   apiToken: string;
   port: number;
@@ -80,6 +84,7 @@ export interface Config {
   tracewayWebConnectionString?: string;
   llm: {
     provider: LLMProviderName;
+    subscriptionSocketPath?: string;
     model: string;
     timeoutMs: number;
     openrouterApiKey: string;
@@ -99,12 +104,46 @@ export interface Config {
 
 export class ConfigError extends Error {}
 
+export const SUBSCRIPTION_MODEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** Recheck normalized config at construction boundaries, including manual callers. */
+export function assertSubscriptionOnlyConfig(config: Config): void {
+  if (config.billingMode !== 'subscription_only') return;
+  if (config.llm.provider !== 'subscription' || (config.chatProvider || config.llm.provider) !== 'subscription'
+      || config.llm.openrouterApiKey || config.embedding || config.review.fallbackModels?.length) {
+    throw new ConfigError('Subscription-only mode rejects paid providers, credentials, embeddings, and fallbacks');
+  }
+  if (!config.review.verifierModel || !config.review.arbiterModel) {
+    throw new ConfigError('Subscription-only mode requires independent verification and arbitration');
+  }
+  for (const model of [config.llm.model, config.chatModel || config.llm.model,
+    config.review.verifierModel, config.review.arbiterModel, config.review.escalationModel].filter(Boolean)) {
+    if (!SUBSCRIPTION_MODEL.test(model!)) throw new ConfigError('Subscription-only mode requires native subscription model IDs');
+  }
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
+  if (env.MODEL_BILLING_MODE === 'subscription_only') {
+    if (env.REVIEW_DISCOVERY_MAX_OUTPUT !== undefined) {
+      throw new ConfigError('Subscription inference cannot enforce REVIEW_DISCOVERY_MAX_OUTPUT; remove this token-route override');
+    }
+    const forbidden = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
+      'AZURE_OPENAI_API_KEY', 'EMBEDDING_API_KEY', 'EMBEDDING_MODEL', 'EMBEDDING_BASE_URL', 'OPENROUTER_BASE_URL'];
+    if (forbidden.some((key) => env[key])) {
+      throw new ConfigError('Subscription-only mode rejects paid credentials and embedding/provider overrides');
+    }
+    const defined = Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined));
+    env = { LLM_PROVIDER: 'subscription', LLM_MODEL: 'gpt-6.1-sol', CHAT_PROVIDER: 'subscription',
+      CHAT_MODEL: 'gpt-6.1-sol', REVIEW_VERIFIER_MODEL: 'gpt-6.1-sol', REVIEW_ARBITER_MODEL: 'gpt-6-astra', ...defined };
+  }
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) {
     throw new ConfigError(`Invalid configuration: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   }
   const e = parsed.data;
+  if (e.MODEL_BILLING_MODE === 'subscription_only' && e.LLM_TIMEOUT_MS > 300_000) {
+    throw new ConfigError('Subscription broker timeout cannot exceed 300000ms');
+  }
   if (e.LLM_PROVIDER === 'codex-cli' || e.CHAT_PROVIDER === 'codex-cli') {
     throw new ConfigError('codex-cli is temporarily disabled for security; use claude-cli or openrouter');
   }
@@ -123,13 +162,23 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
   // Chat may run on a different backend; validate the effective chat provider the same way.
   const chatProvider = e.CHAT_PROVIDER || e.LLM_PROVIDER;
+  if ([e.LLM_PROVIDER, chatProvider].includes('subscription')) {
+    if (!path.isAbsolute(e.SUBSCRIPTION_SOCKET_PATH)) {
+      throw new ConfigError('SUBSCRIPTION_SOCKET_PATH must be an absolute private Unix socket path');
+    }
+    if ((e.LLM_PROVIDER === 'subscription' && !e.LLM_MODEL)
+        || (chatProvider === 'subscription' && !(e.CHAT_MODEL || e.LLM_MODEL))) {
+      throw new ConfigError('A subscription model must be explicitly configured');
+    }
+  }
   if (chatProvider === 'openrouter' && !e.OPENROUTER_API_KEY) {
     throw new ConfigError('OPENROUTER_API_KEY is required when chat runs on OpenRouter (CHAT_PROVIDER=openrouter)');
   }
   if (chatProvider === 'openrouter' && !(e.CHAT_MODEL || e.LLM_MODEL)) {
     throw new ConfigError('CHAT_MODEL (or LLM_MODEL) is required when chat runs on OpenRouter');
   }
-  return {
+  const config: Config = {
+    billingMode: e.MODEL_BILLING_MODE,
     dataDir: e.REPOLENS_DATA_DIR,
     apiToken: e.REPOLENS_API_TOKEN,
     port: e.REPOLENS_PORT,
@@ -139,6 +188,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     tracewayWebConnectionString: e.TRACEWAY_WEB_CONNECTION_STRING,
     llm: {
       provider: e.LLM_PROVIDER,
+      subscriptionSocketPath: e.SUBSCRIPTION_SOCKET_PATH,
       model: e.LLM_MODEL,
       timeoutMs: e.LLM_TIMEOUT_MS,
       openrouterApiKey: e.OPENROUTER_API_KEY,
@@ -162,4 +212,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       botHandle: e.REVIEW_BOT_HANDLE,
     },
   };
+  assertSubscriptionOnlyConfig(config);
+  return config;
 }

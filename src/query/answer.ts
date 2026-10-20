@@ -18,6 +18,7 @@ export interface AnswerOptions {
   extraContext?: string;
   /** Receives the answer incrementally when the provider can stream. */
   onDelta?: OnDelta;
+  signal?: AbortSignal;
   /** Called as soon as retrieval finishes, before the (slow) generation step. */
   onSources?: (sources: Source[]) => void;
 }
@@ -99,10 +100,12 @@ export async function answerQuestion(opts: AnswerOptions): Promise<AnswerResult>
   const sources = chunksToSources(chunks);
   onSources?.(sources);
 
+  opts.signal?.throwIfAborted();
   const request = {
+    signal: opts.signal,
     system: ANSWER_SYSTEM_PROMPT,
     messages: [...prior, { role: 'user' as const, content: buildAnswerUserMessage(question, context) }],
-    maxTokens: ANSWER_MAX_TOKENS,
+    ...(llm.name === 'subscription' ? {} : { maxTokens: ANSWER_MAX_TOKENS }),
   };
   const message = onDelta
     ? await completeStreaming(llm, request, onDelta)

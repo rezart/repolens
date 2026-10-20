@@ -3,3 +3,6 @@ data/
 node_modules/
 .git/
 *.db
+
+.git
+.superpowers/

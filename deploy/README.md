@@ -19,7 +19,7 @@ launchctl unload ~/Library/LaunchAgents/com.repolens.server.plist
 rm ~/Library/LaunchAgents/com.repolens.server.plist
 ```
 
-Because it runs as your user, the Claude CLI login in your keychain is available. The Codex backend is temporarily disabled; select `claude-cli` or `openrouter` for reviews and chat before upgrading.
+Because it runs as your user, the Claude CLI login in your keychain is available. The legacy Codex CLI adapter remains disabled. For private subscription operation use the separate inference-only broker described in [subscription provider operations](../docs/subscription-provider.md).
 
 ## Linux (systemd user unit)
 
@@ -42,7 +42,7 @@ Save as `~/.config/systemd/user/repolens.service`, then `systemctl --user enable
 
 ## Docker
 
-`docker compose up -d` (OpenRouter backend only; Claude CLI needs a logged-in `claude` on the host).
+`docker compose up -d` supports OpenRouter or the private subscription broker. Claude CLI requires a logged-in `claude` on the host. The production definition selects subscription-only mode and mounts only a private broker socket directory.
 
 The server requires a non-placeholder `REPOLENS_API_TOKEN`. Host installs bind to `127.0.0.1` by default. Compose publishes `127.0.0.1:3000`, while setting `REPOLENS_HOST=0.0.0.0` inside the container. Use a reverse proxy with HTTPS for remote access.
 

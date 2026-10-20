@@ -1,6 +1,8 @@
 import type { Config, LLMProviderName } from '../config.js';
+import { assertSubscriptionOnlyConfig, SUBSCRIPTION_MODEL } from '../config.js';
 import { OpenRouterProvider } from './openrouter.js';
 import { ClaudeCliProvider } from './claude-cli.js';
+import { SubscriptionProvider } from './subscription.js';
 import type { LLMProvider } from './types.js';
 import type { ReasoningEffort } from './claude-cli.js';
 import type { UsageSink } from '../usage/types.js';
@@ -9,6 +11,7 @@ export { OpenRouterProvider } from './openrouter.js';
 export { ClaudeCliProvider, flattenMessages, withJsonInstruction, JSON_INSTRUCTION } from './claude-cli.js';
 export type { CliProviderOptions, ReasoningEffort } from './claude-cli.js';
 export { CodexCliProvider } from './codex-cli.js';
+export { SubscriptionProvider } from './subscription.js';
 export { ProviderError, completeStreaming } from './types.js';
 export type { ChatMessage, CompleteRequest, JsonSchema, LLMProvider, OnDelta, Role } from './types.js';
 export { extractJson, JsonExtractError } from './json.js';
@@ -31,6 +34,11 @@ export interface CreateProviderOptions {
  * different provider/model than reviews without a second Config object.
  */
 export function createProvider(config: Config, opts: CreateProviderOptions = {}): LLMProvider {
+  assertSubscriptionOnlyConfig(config);
+  if (config.billingMode === 'subscription_only' && ((opts.provider && opts.provider !== 'subscription')
+      || (opts.model && !SUBSCRIPTION_MODEL.test(opts.model)) || opts.fallbackModels?.length)) {
+    throw new Error('Subscription-only mode rejects provider/model fallback overrides');
+  }
   const llm = config.llm;
   const provider = opts.provider ?? llm.provider;
   if (provider === 'codex-cli') {
@@ -42,6 +50,11 @@ export function createProvider(config: Config, opts: CreateProviderOptions = {})
   const reasoningEffort = opts.reasoningEffort ?? llm.reasoningEffort;
 
   switch (provider) {
+    case 'subscription':
+      return new SubscriptionProvider({
+        socketPath: llm.subscriptionSocketPath ?? '', model,
+        timeoutMs: llm.timeoutMs, reasoningEffort, onUsage: opts.onUsage,
+      });
     case 'openrouter':
       if (!llm.openrouterApiKey) {
         throw new Error('OPENROUTER_API_KEY is required to use the openrouter provider');

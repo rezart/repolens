@@ -1268,7 +1268,7 @@ function usageTable(rows) {
     ]));
     for (const row of group) {
       body.push(h('tr', {}, [
-        h('td', { text: row.provider || '—' }),
+        h('td', { text: row.billingSource || row.provider || '—' }),
         h('td', { class: 'mono', text: row.model || '—' }),
         h('td', {}, [h('span', { class: 'pill', text: row.role || '—' })]),
         h('td', { class: 'num mono', text: fmtCount(row.calls) }),

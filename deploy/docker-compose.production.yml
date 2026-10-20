@@ -2,19 +2,23 @@ name: repolens
 
 services:
   repolens:
-    image: ghcr.io/rezart/repolens:main
+    image: ${REPOLENS_IMAGE:-ghcr.io/rezart/repolens:main}
     pull_policy: always
     container_name: repolens
     restart: unless-stopped
     env_file:
-      - /opt/repolens/.env
+      - /opt/repolens/subscription.env
     environment:
       REPOLENS_HOST: 0.0.0.0
+      MODEL_BILLING_MODE: subscription_only
+      LLM_PROVIDER: subscription
+      SUBSCRIPTION_SOCKET_PATH: /run/software-factory/complete.sock
     ports:
       - '192.168.7.195:3010:3000'
     volumes:
-      - /opt/repolens/.env:/app/.env:ro
+      - /opt/repolens/subscription.env:/app/.env:ro
       - repolens-data:/data
+      - /run/software-factory-review:/run/software-factory:ro
     labels:
       com.centurylinklabs.watchtower.enable: 'false'
     healthcheck:

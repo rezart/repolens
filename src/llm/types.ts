@@ -8,6 +8,8 @@ export interface ChatMessage {
 export type JsonSchema = Record<string, unknown>;
 
 export interface CompleteRequest {
+  /** Subscription IPC cancellation; providers that cannot cancel ignore it. */
+  signal?: AbortSignal;
   system?: string;
   messages: ChatMessage[];
   /** Ask the model for a single JSON object. Callers parse with extractJson(). */
