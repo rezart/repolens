@@ -53,3 +53,49 @@ the generation sandbox tests. Existing current-head GitHub/RepoLens gates
 remain required. Migration PRs must not be opened while an existing paid
 reviewer can automatically pick them up. Rollback must stop inference rather
 than restore a paid provider implicitly.
+
+
+## Private two-host deployment
+
+Generation and the account-authenticated broker run on `codex-work`. The
+existing RepoLens API/index remains on `external-docker`. A trusted SSH service
+forwards a root-only Unix listener at
+`/run/software-factory-review/complete.sock` on `external-docker` to
+`/run/software-factory/complete.sock` on `codex-work`. The production Compose
+file mounts only that remote socket directory read-only. There is no public
+inference listener, account mount, workspace mount or native command socket.
+Socket-directory mounting allows forwarding/broker restarts to replace socket
+inodes without replacing the RepoLens container.
+
+Use `deploy/subscription.example.env` as the inference portion of a new private
+`/opt/repolens/subscription.env`. Preserve existing API authentication, GitHub
+App identity, webhook secret, observability, severity/status policy, independent
+passes and retry settings. Remove all paid-provider/API/embedding credentials,
+provider URLs and `REVIEW_DISCOVERY_MAX_OUTPUT`; an empty credential override is
+not a substitute for removing old process configuration. Preserve the original
+file only as a protected backup for inspection, never as an active fallback.
+
+Before opening migration PRs, independently review the complete boundary code,
+back up the live database/index and prepare an isolated instance from tested
+source and a consistent snapshot. Verify all model/effort combinations with
+completed live subscription turns. Stop the old paid consumer before routing
+webhooks or polls to the replacement, and preserve/reconcile queued and running
+jobs. Do not run two publishers against the same live database. API health and
+configuration validation alone are not evidence of a successful review.
+
+The controlled instance must use the existing authenticated review API, GitHub
+App publishing path, review history and latest-head status. It must actually
+complete model review; do not write substitute passing statuses. A missing,
+failed or stale review blocks merging. After each migration PR passes current
+checks, review and applicable approvals, deploy the merged revision, recheck
+subscription-only configuration and restart persistence, then enable calendar
+generation. Rollback stops work and keeps paid routes disabled.
+
+The deterministic factory boundary suite exercises the actual pinned Codex
+binary with synthetic TLS/auth endpoints and forged native calls; RepoLens's
+Unix-socket/provider and complete multi-role pipeline suites exercise strict
+text/schema framing, blocked tools/config, capacity failures and retained FTS
+retrieval. Reuse these tests instead of maintaining a second copy of Codex
+protocol fixtures in this repository. A real-broker integration smoke and live
+role review remain rollout checks; neither may be skipped or treated as passing
+because a synthetic suite passed.
