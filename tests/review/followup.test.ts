@@ -83,4 +83,17 @@ describe('follow-up reconciliation', () => {
     const invalid = input([{ ...resolved, status: 'remaining', findingIndex: null }]);
     expect(() => reconcileFollowup(invalid, lineage, [warning], head)).toThrow('previous[0] remaining status requires a findingIndex mapping');
   });
+
+  it('requires an empty previous array when the earlier review had no findings', () => {
+    const cleanLineage = { ...lineage, previous: { ...lineage.previous!, findings: [] } };
+    expect(() => reconcileFollowup(input(), cleanLineage, [warning], head))
+      .toThrow('previous must be an empty array because no previous findings were supplied');
+    expect(reconcileFollowup(input([], [decision]), cleanLineage, [warning], head).findings).toEqual([]);
+  });
+
+  it('requires an empty candidates array when there are no current findings', () => {
+    expect(() => reconcileFollowup(input(), lineage, [], head))
+      .toThrow('candidates must be an empty array because no current candidates were supplied');
+    expect(reconcileFollowup(input([resolved], []), lineage, [], head).summary).toContain('Resolved: Public config');
+  });
 });

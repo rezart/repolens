@@ -9,7 +9,7 @@ For EVERY previous finding, return its id and status: remaining (link findingInd
 For EVERY current candidate, return id, introduced, reason, and evidence. introduced=true requires a concrete causal explanation and a citation to an added or removed delta line proving this new change causes the failure, even when the candidate is in an unchanged caller. Merely citing any delta line is insufficient. Unrelated older issues get introduced=false. Candidates linked to remaining findings need not be introduced again. If delta is null, incremental comparison is unavailable: assess new candidates against head code instead, and never claim a previous issue was resolved.
 API-misuse or API-availability allegations require evidence from the repository's declared dependency version, not model recollection. Lack of dependency evidence cannot establish an API is invalid.
 Evidence is {path,line,side:"new"|"old"}; new means head line numbers, old means previous-head line numbers in the delta. Use null evidence only for unconfirmed or introduced=false. Reasons must explain the concrete evidence in one sentence. Do not infer a fix from a commit message.
-Return JSON only: {"previous":[{"id":0,"status":"remaining|resolved|retracted|unconfirmed","findingIndex":null,"reason":"...","evidence":{"path":"...","line":1,"side":"new"}}],"candidates":[{"id":0,"introduced":false,"reason":"...","evidence":null}]}. Include every supplied id exactly once. Never invent a candidate or id.`;
+Return JSON only: {"previous":[{"id":0,"status":"remaining|resolved|retracted|unconfirmed","findingIndex":null,"reason":"...","evidence":{"path":"...","line":1,"side":"new"}}],"candidates":[{"id":0,"introduced":false,"reason":"...","evidence":null}]}. This example shows the entry shapes, not required entries. Include every supplied id exactly once. If the input previous array is empty, return "previous":[]; if the input candidates array is empty, return "candidates":[]. Never invent a candidate or id.`;
 
 const citation = z.object({ path: z.string(), line: z.number().int().positive(), side: z.enum(['new', 'old']) });
 const response = z.object({
@@ -44,8 +44,12 @@ export function reconcileFollowup(raw: string, lineage: Lineage, findings: Findi
   }
   const result = parsed.data;
   const exactIds = (items: Array<{ id: number }>, count: number): boolean => items.length === count && new Set(items.map((item) => item.id)).size === count && items.every((item) => item.id < count);
-  if (!exactIds(result.previous, previous.findings.length)) return fail(`previous IDs must be exactly one each of 0..${Math.max(0, previous.findings.length - 1)}`);
-  if (!exactIds(result.candidates, findings.length)) return fail(`candidate IDs must be exactly one each of 0..${Math.max(0, findings.length - 1)}`);
+  if (!exactIds(result.previous, previous.findings.length)) return fail(previous.findings.length
+    ? `previous IDs must be exactly one each of 0..${previous.findings.length - 1}`
+    : 'previous must be an empty array because no previous findings were supplied');
+  if (!exactIds(result.candidates, findings.length)) return fail(findings.length
+    ? `candidate IDs must be exactly one each of 0..${findings.length - 1}`
+    : 'candidates must be an empty array because no current candidates were supplied');
   const inHead = (ref: Citation | null): boolean => !!ref && ref.side === 'new' && head.some((file) => file.path === ref.path && file.lines.some((line) => line.line === ref.line));
   const inDelta = (ref: Citation | null): boolean => !!ref && !!previous.delta?.some((file) =>
     (ref.side === 'new' ? file.newPath : file.oldPath) === ref.path && file.hunks.some((hunk) => hunk.lines.some((line) =>
