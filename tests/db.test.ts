@@ -94,7 +94,8 @@ describe('Db', () => {
       comments_json: '[]', posted: 0, error: null,
     });
     expect(db.findReview('github:o/n', 7, 'h')?.id).toBe(review.id);
-    db.markReviewPosted(review.id);
+    db.markReviewPosted(review.id, 'https://github.com/o/r/pull/1#pullrequestreview-7');
+    expect(db.getReview(review.id)?.review_url).toBe('https://github.com/o/r/pull/1#pullrequestreview-7');
     expect(db.getReview(review.id)?.posted).toBe(1);
   });
 
@@ -153,6 +154,19 @@ describe('Db', () => {
     // running it again on an up-to-date database is a no-op
     migrate(db.raw);
     expect(hasPrNumber()).toBe(true);
+  });
+
+  it('adds posted review URLs without losing old history and preserves them on repeated migration', () => {
+    const row = db.insertReview({ repo_id: 'github:o/n', pr_number: 7, head_sha: 'old', status: 'done', summary: 'Existing review', verdict: null, comments_json: '[]', posted: 1, error: null });
+    db.raw.exec('alter table reviews drop column review_url');
+    migrate(db.raw);
+    expect(db.getReview(row.id)).toMatchObject({ summary: 'Existing review', posted: 1, review_url: null });
+    const url = 'https://github.com/o/n/pull/7#pullrequestreview-1';
+    db.markReviewPosted(row.id, url);
+    migrate(db.raw);
+    expect(db.getReview(row.id)?.review_url).toBe(url);
+    db.markReviewPosted(row.id);
+    expect(db.getReview(row.id)?.review_url).toBe(url);
   });
 });
 
