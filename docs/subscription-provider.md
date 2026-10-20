@@ -104,10 +104,11 @@ because a synthetic suite passed.
 ### Large pull requests
 
 Subscription reviews accept at most 200 reviewable files by default and inspect
-all of them in sequential discovery batches. Each batch contains at most 40
-complete file diffs and must fit the existing 256 KiB private broker request
-bound, including its schema and required PR context. A single oversized file
-still blocks review. Explicit lower `maxFiles` limits remain enforced.
+all of them in sequential discovery batches. Each batch targets at most 12
+complete file diffs and 64 KiB of required request context. Optional context is
+bounded to a 96 KiB request target. A single complete file may exceed these
+scheduling targets but must still fit the existing 256 KiB private broker bound,
+including its schema and required PR context; larger files still block review. Explicit lower `maxFiles` limits remain enforced.
 
 The planner includes both discovery passes when enabled. Findings from every
 batch enter the existing verification, arbitration and posting pipeline. Each
@@ -116,3 +117,8 @@ batch, or a changed PR head, prevents the final approval and commit success stat
 There are no partial passing statuses or omitted remainder files. Per-call native
 subscription deadlines and retry allowances remain unchanged. API-provider reviews
 retain their existing file and monetary limits.
+
+The smaller scheduling targets keep review turns within the existing five-minute
+native deadline. They do not truncate diffs or increase deadlines; a failure in
+any turn still blocks the complete review. Stage compatibility is versioned when
+the batching strategy changes.
